@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 from pathlib import Path
-from .diffusion import IMUCondGaussianDiffusion
+from .diffusion import IMUCondGaussianDiffusion, SinusoidalPosEmb
 from .transformer import (
     CondDiffusionTransformer, 
     IMUEncoder, 
-    BPSEncoder,
-    SinusoidalPosEmb
+    BPSEncoder
 )
 
 class IMUPoseGenerationModel(nn.Module):

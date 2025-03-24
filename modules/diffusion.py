@@ -215,17 +215,30 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'未知的损失类型: {self.loss_type}')
         
+        # 计算未加权损失
         if padding_mask is not None:
-            loss = loss_fn(x_recon, x_start, reduction='none')
+            # 逐元素损失
+            element_wise_loss = loss_fn(x_recon, x_start, reduction='none')
+            
             # 应用padding_mask（扩展维度以匹配loss的形状）
-            loss = loss * padding_mask.unsqueeze(-1)
-            # 对非padding部分取平均
-            loss = torch.sum(loss) / torch.sum(padding_mask)
+            masked_loss = element_wise_loss * padding_mask.unsqueeze(-1)
+            
+            # 提取对应时间步的p2权重并应用到损失上
+            p2_weight = extract(self.p2_loss_weight, t, element_wise_loss.shape)
+            weighted_loss = masked_loss * p2_weight
+            
+            # 对非padding部分取平均得到标量损失
+            loss = torch.sum(weighted_loss) / torch.sum(padding_mask)
         else:
-            loss = loss_fn(x_recon, x_start)
-        
-        # 应用p2权重
-        loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+            # 逐元素损失
+            element_wise_loss = loss_fn(x_recon, x_start, reduction='none')
+            
+            # 提取对应时间步的p2权重并应用到损失上
+            p2_weight = extract(self.p2_loss_weight, t, element_wise_loss.shape)
+            weighted_loss = element_wise_loss * p2_weight
+            
+            # 对所有元素取平均得到标量损失
+            loss = weighted_loss.mean()
         
         return loss
     
@@ -251,8 +264,9 @@ class IMUCondGaussianDiffusion(GaussianDiffusion):
         p2_loss_weight_gamma=0.,
         p2_loss_weight_k=1
     ):
+        # 调用父类初始化，但暂时不传递denoise_fn
         super().__init__(
-            None,  # 替换为自定义denoise_fn
+            None,  # 临时为None，稍后会设置
             timesteps=timesteps,
             loss_type=loss_type,
             beta_schedule=beta_schedule,
@@ -260,13 +274,22 @@ class IMUCondGaussianDiffusion(GaussianDiffusion):
             p2_loss_weight_k=p2_loss_weight_k
         )
         
+        # 设置模型组件
         self.transformer_model = transformer_model
         self.imu_encoder = imu_encoder
         self.bps_encoder = bps_encoder
+        
+        # 创建一个包装函数作为denoise_fn
+        # 我们不能直接使用实例方法作为denoise_fn，因为它需要self参数
+        def wrapped_denoise_fn(x, t, cond, padding_mask=None):
+            return self._denoise_function(x, t, cond, padding_mask)
+        
+        # 将这个函数设置为denoise_fn
+        self.denoise_fn = wrapped_denoise_fn
     
-    def denoise_fn(self, x, t, cond, padding_mask=None):
+    def _denoise_function(self, x, t, cond, padding_mask=None):
         """
-        自定义去噪函数
+        自定义去噪函数的实际实现
         
         参数:
             x: 带噪声的人体姿态 [B, T, D]
@@ -285,7 +308,7 @@ class IMUCondGaussianDiffusion(GaussianDiffusion):
         
         # 处理物体数据(如果存在)
         obj_features = None
-        if "obj_trans" in cond:
+        if "obj_trans" in cond and self.bps_encoder is not None:
             obj_trans = cond["obj_trans"]  # [B, T, 3]
             obj_bps = cond["obj_bps"]  # [B, 3072]
             

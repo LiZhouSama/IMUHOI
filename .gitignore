@@ -110,6 +110,7 @@ SAGE/
 omomo/
 checkpoints/
 logs/
+TransPose/
 *.pt
 *.pth
 output/
