@@ -1,115 +1,98 @@
-# EgoIMU: 基于IMU的全身姿态估计
+# EgoIMU: IMU到全身姿态的Diffusion模型
 
-EgoIMU是一个利用少量IMU传感器来估计全身姿态的深度学习框架。该框架使用扩散模型和Transformer架构，从IMU数据中直接生成SMPL模型的全身姿态参数。
-
-## 功能特点
-
-- 利用少量IMU传感器数据（仅7个关节点）合成全身动作
-- 使用单阶段扩散模型直接生成高质量人体姿态
-- 支持物体交互场景，通过优化的BPS (Basis Point Set) 特征表示物体
-- 模块化设计，易于扩展和定制
-- 高效的数据处理和批量训练
+本项目使用Diffusion模型从IMU传感器数据生成全身人体姿态。该模型直接从IMU数据中学习全身姿态，无需额外的VQVAE中间表示。
 
 ## 项目结构
 
 ```
-EgoIMU/
-├── train.py             # 主训练脚本
-├── eval.py              # 评估脚本
-├── modules/
-│   ├── diffusion.py     # 扩散模型定义
-│   ├── transformer.py   # Transformer模型定义
-│   ├── model.py         # 完整模型架构
-├── utils/
-│   ├── data_utils.py    # 数据处理工具
-│   ├── trainer.py       # 训练器
-├── datasets/
-│   ├── imu_dataset.py   # 数据集定义
-└── configs/
-    └── default.yaml     # 默认配置文件
+├── config_diffusion/          # Diffusion模型配置
+│   └── imu.yaml               # IMU到全身姿态的配置
+├── dataloader/                # 数据加载
+│   └── dataloader.py          # 数据集和数据加载器实现
+├── diffusion_stage/           # Diffusion模型实现
+│   ├── do_train_imu.py        # IMU训练过程
+│   ├── parser_util.py         # 配置解析工具
+│   └── wrap_model.py          # Diffusion模型封装
+├── preprocessed_data_0324/    # 预处理数据
+│   ├── train/                 # 训练数据
+│   ├── test/                  # 测试数据
+│   └── bps_features/          # BPS特征
+├── omomo/                     # 原始数据处理代码
+│   └── preprocess.py          # 数据预处理
+├── outputs/                   # 训练输出
+│   └── imu/                   # 模型保存和可视化
+├── test_imu.py                # 测试脚本
+├── train_imu_diffusion.py     # 训练脚本
+└── README.md                  # 项目说明
 ```
 
-## 安装依赖
+## 数据预处理
+
+在训练前，需要先对原始数据进行预处理，生成IMU数据和BPS特征：
 
 ```bash
-pip install torch numpy pytorch3d tqdm pyyaml
+python omomo/preprocess.py --data_path dataset/train.p --save_dir preprocessed_data_0324/train --obj_mesh_dir dataset/objects --n_bps_points 1024 --num_workers 8
+python omomo/preprocess.py --data_path dataset/test.p --save_dir preprocessed_data_0324/test --obj_mesh_dir dataset/objects --n_bps_points 1024 --num_workers 8
 ```
 
-## 数据准备
-
-在开始训练之前，需要使用预处理脚本将原始数据转换为训练所需的`.pt`文件：
-
-```bash
-python preprocess.py --data_path dataset/train_diffusion_manip_seq_joints24.p --save_dir processed_data_0322/train
-```
+预处理步骤包括：
+1. 计算关节的IMU数据（加速度和角速度）
+2. 归一化IMU数据到头部坐标系
+3. 计算物体的BPS特征和IMU数据
+4. 保存为PT文件
 
 ## 训练模型
 
-### 使用默认配置训练：
+训练IMU到全身姿态的Diffusion模型：
 
 ```bash
-python train.py --train_dir processed_data_0322/train --val_dir processed_data_0322/val --output_dir output
+python train_imu_diffusion.py --cfg config_diffusion/imu.yaml --batch_size 32
 ```
 
-### 使用配置文件训练：
+训练过程将自动：
+1. 加载预处理的数据
+2. 创建Diffusion模型
+3. 训练并定期保存模型
+4. 每5个epoch进行一次测试评估
+
+## 测试模型
 
 ```bash
-python train.py --config configs/default.yaml
+python test_imu.py --cfg config_diffusion/imu.yaml
 ```
 
-### 恢复训练：
+测试脚本将：
+1. 加载最佳模型
+2. 在测试集上评估性能
+3. 计算MPJPE（平均关节位置误差）
+4. 生成姿态可视化
 
-```bash
-python train.py --config configs/default.yaml --resume output/checkpoints/model_epoch_50.pt
-```
+## 主要特点
 
-## 评估模型
+- **直接预测**：从IMU数据直接生成全身姿态，无需中间表示
+- **高效训练**：使用加速器和混合精度训练
+- **BPS特征**：支持物体BPS特征增强IMU数据
+- **可视化**：自动生成骨架可视化结果
 
-```bash
-python eval.py --test_dir processed_data_0322/test --checkpoint output/checkpoints/model_best.pt --config output/config.yaml --output_dir evaluation_results
-```
+## 环境要求
 
-## 主要参数
-
-### 训练参数
-
-- `--train_dir`: 训练数据目录
-- `--val_dir`: 验证数据目录
-- `--window_size`: 序列窗口大小（默认120帧）
-- `--batch_size`: 批次大小
-- `--num_epochs`: 训练轮次
-- `--lr`: 学习率
-- `--use_object`: 是否使用物体信息
-
-### 模型参数
-
-- `--hidden_dim`: 隐藏层维度
-- `--num_layers`: Transformer层数
-- `--diffusion_steps`: 扩散步数
-
-## 数据格式
-
-输入的`.pt`文件应包含以下键：
-
-- `seq_name`: 序列名称
-- `body_parms_list`: 人体SMPL参数
-- `imu_global_full_gt`: 全局IMU数据
-- `rotation_local_full_gt_list`: 局部旋转数据
-- `position_global_full_gt_world`: 全局位置数据
-- `obj_trans`, `obj_rot`, `obj_com_pos`: 物体信息（如有）
-- `framerate`, `gender`: 元数据
+- Python 3.8+
+- PyTorch 1.10+
+- SMPL模型
+- diffusers
+- accelerate
+- matplotlib
+- tqdm
+- easydict
 
 ## 引用
 
-如果您在研究中使用了本项目，请引用：
-
+项目基于SAGE框架改进：
 ```
-@misc{EgoIMU2023,
-  author = {Your Name},
-  title = {EgoIMU: Full-body Motion Estimation from Sparse IMU Data},
-  year = {2023},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/yourusername/EgoIMU}}
+@inproceedings{jiang2023sage,
+  title={SAGE: Generating VR Hands from Head and Hand Motions for Interactive Mobile Immersion},
+  author={Jiang, Feifei and Liu, Weiwei and Zou, Difei and Zhang, Qi and Cai, Zhongyu and Yao, Aishan and Zheng, Fang and Chen, Jian and Yu, Tianyi and Wang, Caiming},
+  booktitle={ACM SIGGRAPH},
+  year={2023}
 }
 ``` 

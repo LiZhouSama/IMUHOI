@@ -535,7 +535,7 @@ def main(args):
     print(f"数据集加载完成，共有{len(data_dict)}个序列")
     
     # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
     # 设置SMPL模型
@@ -553,7 +553,7 @@ def main(args):
     print("开始处理序列...")
     
     for seq_key in tqdm(data_dict, desc="处理序列"):
-        process_sequence(data_dict[seq_key], seq_key, args.save_dir, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir, args=args)
+        process_sequence(data_dict[seq_key], seq_key, args.save_dir, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
     
     print(f"所有序列处理完成，结果保存在：{args.save_dir}")
 

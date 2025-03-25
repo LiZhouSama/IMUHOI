@@ -1,0 +1,133 @@
+import os
+import time
+import warnings
+from collections import defaultdict
+
+import numpy as np
+import torch
+import random
+from torch.utils.data import DataLoader
+from datetime import datetime
+
+from dataloader.dataloader import IMUDataset
+from diffusion_stage.do_train_imu import do_train_imu
+from utils.parser_util import get_args, merge_file
+
+
+def main():
+    """
+    主训练函数：解析参数、准备数据集、初始化训练
+    """
+    # 解析命令行参数
+    cfg_args = get_args()
+    args = merge_file(cfg_args)
+    
+    # 设置随机种子以确保可重复性
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    
+    # 设置CUDA和确定性算法
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    
+    # 从args中获取配置
+    cfg = args  # 使用合并后的配置
+    
+    # 设置保存目录
+    time_stamp = datetime.now().strftime("%m%d%H%M")
+    save_dir = os.path.join(cfg.save_dir, f"imu_{time_stamp}")
+    cfg.save_dir = save_dir
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 打印训练配置
+    print(f"批次大小: {cfg.batch_size}")
+    print(f"训练帧窗口大小: {cfg.train.window}")
+    print(f"测试帧窗口大小: {cfg.test.window}")
+    print(f"训练窗口步长: {cfg.train.window_stride}")
+    print(f"保存目录: {save_dir}")
+    
+    # 设置数据集路径 - 使用绝对路径
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 检查是否使用小型数据集进行快速测试
+    use_small_dataset = os.path.exists(os.path.join(base_dir, "processed_data_0324/train_small")) and args.debug
+    
+    if use_small_dataset:
+        print("使用小型测试数据集进行快速开发...")
+        train_path = os.path.join(base_dir, "processed_data_0324/train_small")
+        test_path = os.path.join(base_dir, "processed_data_0324/train_small")  # 使用相同数据进行测试
+    else:
+        train_path = os.path.join(base_dir, cfg.train.data_path)
+        test_path = os.path.join(base_dir, cfg.test.data_path) if hasattr(cfg.test, 'data_path') else None
+    
+    print(f"训练数据路径: {train_path}")
+    if test_path:
+        print(f"测试数据路径: {test_path}")
+    
+    # 加载训练数据集
+    print("准备训练数据集...")
+    train_dataset = IMUDataset(
+        data_dir=train_path,
+        window_size=cfg.train.window,
+        window_stride=cfg.train.window_stride,
+        normalize=cfg.train.normalize,
+        normalize_style=cfg.train.normalize_style,
+        debug=args.debug
+    )
+    
+    # 如果数据集为空，则无法继续
+    if len(train_dataset) == 0:
+        print("错误: 训练数据集为空，无法继续训练。请检查数据路径和数据格式。")
+        return
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    print(f"训练数据集大小: {len(train_dataset)}")
+    print(f"每批次数据大小: {cfg.batch_size}")
+    print(f"训练批次数量: {len(train_loader)}")
+    
+    # 加载测试数据集（如果有）
+    test_loader = None
+    if test_path:
+        print("准备测试数据集...")
+        test_dataset = IMUDataset(
+            data_dir=test_path,
+            window_size=cfg.test.window,
+            window_stride=cfg.test.window_stride,
+            normalize=cfg.test.normalize,
+            normalize_style=cfg.test.normalize_style,
+            debug=args.debug
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        print(f"测试数据集大小: {len(test_dataset)}")
+        print(f"测试批次数量: {len(test_loader)}")
+    
+    # 开始训练
+    print("开始训练过程...")
+    model, optimizer = do_train_imu(cfg, train_loader, test_loader)
+    
+    print(f"训练完成！模型已保存到 {save_dir}")
+    return
+
+
+if __name__ == "__main__":
+    main() 
