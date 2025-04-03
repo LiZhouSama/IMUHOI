@@ -3,15 +3,15 @@ model_name: imu_diffusion
 
 # 训练参数
 seed: 10
-batch_size: 80
-lr: 0.0002
-milestones: [20, 30]
-gamma: 0.25
-weight_decay: 0.0001
-epoch: 200
+batch_size: 300
+lr: 0.0001
+milestones: [300, 600, 900]
+gamma: 0.5
+weight_decay: 0.01
+epoch: 1000
 num_workers: 8
 gpus: [0]
-use_wandb: False
+use_wandb: False  
 save_dir: outputs
 
 # 数据路径
@@ -29,16 +29,16 @@ test:
   normalize: True
 
 # 掩码训练
-mask_training: True
-mask_num: 2
+mask_training: False
+mask_num: 3
 
 # 模型参数
 model:
-  num_layers: 24
+  num_layers: 6
   d_model: 512
   n_heads: 8
   dim_feedforward: 2048
-  dropout: 0.
+  dropout: 0.1
   activation: gelu
   classifier_free_guidance_scale: 2.0
 
@@ -47,8 +47,8 @@ scheduler:
   type: ddim
   params:
     num_train_timesteps: 1000
-    beta_start: 0.00085
-    beta_end: 0.012
+    beta_start: 0.0001
+    beta_end: 0.02
     beta_schedule: "linear"
     prediction_type: epsilon
   num_inference_timesteps: 50
@@ -67,5 +67,5 @@ bps:
 diffusion:
   timesteps: 1000
   beta_schedule: linear
-  beta_start: 0.00085
-  beta_end: 0.012 
+  beta_start: 0.0001
+  beta_end: 0.02 

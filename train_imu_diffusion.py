@@ -53,12 +53,12 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 检查是否使用小型数据集进行快速测试
-    use_small_dataset = os.path.exists(os.path.join(base_dir, "processed_data_0324/train_small")) and args.debug
+    use_small_dataset = os.path.exists(os.path.join(base_dir, cfg.train.debug_data_path)) and args.debug
     
     if use_small_dataset:
         print("使用小型测试数据集进行快速开发...")
-        train_path = os.path.join(base_dir, "processed_data_0324/train_small")
-        test_path = os.path.join(base_dir, "processed_data_0324/train_small")  # 使用相同数据进行测试
+        train_path = os.path.join(base_dir, cfg.train.debug_data_path)
+        test_path = os.path.join(base_dir, cfg.train.debug_data_path)  # 使用相同数据进行测试
     else:
         train_path = os.path.join(base_dir, cfg.train.data_path)
         test_path = os.path.join(base_dir, cfg.test.data_path) if hasattr(cfg.test, 'data_path') else None
@@ -74,7 +74,6 @@ def main():
         window_size=cfg.train.window,
         window_stride=cfg.train.window_stride,
         normalize=cfg.train.normalize,
-        normalize_style=cfg.train.normalize_style,
         debug=args.debug
     )
     
@@ -105,7 +104,6 @@ def main():
             window_size=cfg.test.window,
             window_stride=cfg.test.window_stride,
             normalize=cfg.test.normalize,
-            normalize_style=cfg.test.normalize_style,
             debug=args.debug
         )
         

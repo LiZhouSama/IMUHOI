@@ -103,7 +103,7 @@ def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     
     return imu_data
 
-def normalize_to_head_frame(imu_data):
+def normalize_to_head_frame(imu_data, head_imu_data):
     """
     将IMU数据归一化到头部坐标系
     
@@ -122,8 +122,8 @@ def normalize_to_head_frame(imu_data):
     }
     
     # 获取头部IMU数据
-    head_accel = norm_imu_data['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
-    head_gyro = norm_imu_data['angular_velocities'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
+    head_accel = head_imu_data[0]  # [T, 1, 3]
+    head_gyro = head_imu_data[1]  # [T, 1, 3]
     
     # 所有IMU数据相对于头部IMU
     norm_imu_data['accelerations'] = norm_imu_data['accelerations'] - head_accel
@@ -327,8 +327,8 @@ def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
     
     # 返回物体IMU数据
     return {
-        'accelerations': obj_accel,  # [T, 3]
-        'angular_velocities': obj_angular_vel  # [T, 3]
+        'accelerations': obj_accel.reshape(T, 1, 3),  # [T, 1, 3]
+        'angular_velocities': obj_angular_vel.reshape(T, 1, 3)  # [T, 1, 3]
     }
 
 def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=None, bps_points=None, obj_mesh_dir=None):
@@ -368,7 +368,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     
     # 计算6D表示
     rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat)
-    rotation_local_full_gt_list = rotation_local_6d[1:].reshape(bdata_poses.shape[0] - 1, -1)
+    rotation_local_full_gt_list = rotation_local_6d.reshape(bdata_poses.shape[0], -1)
     
     # 只使用前22个关节的层次结构
     kintree_table = bm.kintree_table[0].long()[:22]  # 只取前22个关节的父子关系
@@ -392,7 +392,6 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     head_global_trans = torch.eye(4, device=device).repeat(position_head_world.shape[0], 1, 1)
     head_global_trans[:, :3, :3] = head_rotation_global_matrot.squeeze()
     head_global_trans[:, :3, 3] = position_head_world
-    head_global_trans_list = head_global_trans[1:]
     
     # 计算IMU数据
     imu_global_full_gt = compute_imu_data(
@@ -403,7 +402,9 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     )
     
     # 归一化IMU数据到头部坐标系
-    norm_imu_global_full_gt = normalize_to_head_frame(imu_global_full_gt)
+    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
+    head_gyro = imu_global_full_gt['angular_velocities'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
+    norm_imu_global_full_gt = normalize_to_head_frame(imu_global_full_gt, head_imu_data=(head_accel, head_gyro))
     
     # 提取物体相关信息(如果存在)
     obj_data = {}
@@ -419,9 +420,10 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         
         # 计算物体的IMU数据
         obj_imu_data = compute_object_imu(obj_trans, obj_rot)
+        obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_gyro))
         
-        # # 提取物体名称
-        # object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
+        # 提取物体名称
+        object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
         
         # # 计算BPS特征 (如果提供了物体网格目录)
         # bps_save_path = os.path.join(bps_dir, f"{seq_name}_{seq_key}.npy")
@@ -484,13 +486,14 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         
         # 构建物体数据字典
         obj_data = {
+            "obj_name": object_name,
             "obj_scale": obj_scale.cpu(),
             "obj_trans": obj_trans.cpu(),
             "obj_rot": obj_rot.cpu(),
             "obj_com_pos": obj_com_pos.cpu(),
             "obj_imu": {
-                "accelerations": obj_imu_data["accelerations"].cpu(),
-                "angular_velocities": obj_imu_data["angular_velocities"].cpu()
+                "accelerations": obj_imu_data["accelerations"].cpu(),    # [T, 1, 3]
+                "angular_velocities": obj_imu_data["angular_velocities"].cpu()  # [T, 1, 3]
             },
             # "bps_file": f"{seq_name}_{seq_key}.npy"  # 存储BPS文件路径的相对引用
         }
@@ -500,11 +503,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         "seq_name": seq_name,
         "body_parms_list": {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in body_parms.items()},
         "rotation_local_full_gt_list": rotation_local_full_gt_list.cpu(),
-        "head_global_trans_list": head_global_trans_list.cpu(),
-        "position_global_full_gt_world": position_global_full_gt_world[1:].float(),
+        "head_global_trans": head_global_trans.cpu(),
+        "position_global_full_gt_world": position_global_full_gt_world.float(),
         "imu_global_full_gt": {
-            "accelerations": norm_imu_global_full_gt["accelerations"].cpu(),
-            "angular_velocities": norm_imu_global_full_gt["angular_velocities"].cpu()
+            "accelerations": norm_imu_global_full_gt["accelerations"].cpu(),    # [T,num_imus, 3]
+            "angular_velocities": norm_imu_global_full_gt["angular_velocities"].cpu()  # [T,num_imus, 3]
         },
         "framerate": FRAME_RATE,
         "gender": subject_gender
@@ -562,7 +565,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="处理人体动作数据集")
     parser.add_argument("--data_path", type=str, default="dataset/train_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir", type=str, default="processed_data_0324/train",
+    parser.add_argument("--save_dir", type=str, default="processed_data_0330/train",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
