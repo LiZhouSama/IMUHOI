@@ -1,0 +1,73 @@
+# IMU到全身姿态和物体变换的Diffusion模型配置
+model_name: imu_diffusion
+
+# 训练参数
+seed: 10
+batch_size: 450
+lr: 0.0002
+milestones: [20, 30]
+gamma: 0.25
+weight_decay: 0.0001
+epoch: 200
+num_workers: 12
+gpus: [0]
+use_wandb: True
+save_dir: outputs
+
+# 数据路径
+train:
+  data_path: processed_data_0405/train
+  debug_data_path: processed_data_0405/debug
+  window: 120  # 序列长度
+  window_stride: 15
+  normalize: True
+  
+test:
+  data_path: processed_data_0405/test
+  window: 120  # 序列长度
+  window_stride: 60
+  normalize: True
+
+# 掩码训练
+mask_training: True
+mask_num: 2
+
+# 模型参数
+model:
+  num_layers: 4
+  d_model: 512
+  n_heads: 4
+  d_k: 256
+  d_v: 256
+  dim_feedforward: 2048
+  dropout: 0.
+  activation: gelu
+  classifier_free_guidance_scale: 2.0
+
+# Diffusion模型配置
+scheduler:
+  type: ddim
+  params:
+    num_train_timesteps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "linear"
+    prediction_type: epsilon
+  num_inference_timesteps: 100
+  eta: 0.0
+
+# 初始噪声参数
+init_noise_sigma: 1.0
+
+# BPS特征配置（可选）
+bps:
+  use_bps: False
+  n_bps_points: 1024
+  bps_radius: 0.5
+
+# 扩散过程参数
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear
+  beta_start: 0.00085
+  beta_end: 0.012 

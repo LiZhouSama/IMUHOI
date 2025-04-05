@@ -11,12 +11,13 @@ from torch import optim
 from tqdm import tqdm
 
 from utils.utils import tensor2numpy
-from diffusion_stage.wrap_model import MotionDiffusion
+# from diffusion_stage.wrap_model import MotionDiffusion # Comment out old import
+from diffusion_stage.DiT_model import MotionDiffusion # Import the new model
 
 
 def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
     """
-    训练IMU到全身姿态及物体变换的Diffusion模型
+    训练IMU到全身姿态及物体变换的Diffusion模型 (Using DiT_model)
     
     Args:
         cfg: 配置信息
@@ -28,20 +29,21 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
     device = torch.device(f'cuda:{cfg.gpus[0]}' if torch.cuda.is_available() else 'cpu')
     model_name = cfg.model_name
     use_wandb = cfg.use_wandb
-    pose_rep = 'rot6d'
+    pose_rep = 'rot6d' # This might be implicitly defined by the target_feature_dim
     max_epoch = cfg.epoch
     save_dir = cfg.save_dir
 
     # 打印训练配置
-    print(f'Training: {model_name}, pose_rep: {pose_rep}')
+    print(f'Training: {model_name} (using DiT_model), pose_rep: {pose_rep}') # Indicate new model
     print(f'use_wandb: {use_wandb}, device: {device}')
     print(f'max_epoch: {max_epoch}')
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # 初始化Diffusion模型
+    # 初始化Diffusion模型 (Using DiT_model's MotionDiffusion)
     input_length = cfg.train.window
-    model = MotionDiffusion(cfg, input_length, cfg.model.num_layers, imu_input=True)
+    # Pass cfg directly, the new MotionDiffusion init handles parameter extraction
+    model = MotionDiffusion(cfg, input_length, imu_input=True) 
     model = model.to(device)
 
     # 设置优化器
@@ -52,9 +54,9 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
 
     # 如果使用wandb，初始化
     if use_wandb:
-        wandb.init(project="imu_diff", name=model_name, config=cfg)
+        wandb.init(project="imu_diff_dit", name=model_name, config=cfg) # Maybe new project name
 
-    # 训练循环
+    # 训练循环 (Logic remains the same as the last version)
     best_loss = float('inf')
     train_losses = defaultdict(list)
     test_losses = defaultdict(list)
@@ -72,12 +74,12 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
             root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]
             motion = batch["motion"].to(device)  # [bs, seq, 132]
             human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 6]
-            # obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
-            # obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
-            # obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
-            obj_imu = None
-            obj_trans = None
-            obj_rot = None
+            obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
+            obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
+            obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
+            # obj_imu = None
+            # obj_trans = None
+            # obj_rot = None
             bps_features = batch["bps_features"].to(device) if "bps_features" in batch else None
             
             # 如果没有物体数据，使用零张量代替以保持训练稳定
@@ -87,7 +89,6 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                 obj_trans = torch.zeros((bs, seq, 3), device=device)
                 obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
             
-            # 准备输入数据字典
             data_dict = {
                 "human_imu": human_imu,
                 "obj_imu": obj_imu,
@@ -102,10 +103,13 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
             
             # 前向传播 - 获取预测噪声和真实噪声
             optimizer.zero_grad()
+            # Call the forward method of the new MotionDiffusion model
             predicted_noise, noise = model(data_dict)
             
             # 计算损失 (MSE between predicted noise and actual noise)
-            loss = torch.nn.functional.mse_loss(predicted_noise[..., :135], noise[..., :135])
+            # Consider slicing if object prediction is less important or noisy initially
+            loss = torch.nn.functional.mse_loss(predicted_noise, noise)
+            # loss = torch.nn.functional.mse_loss(predicted_noise[..., :135], noise[..., :135]) # Only human
             
             # 反向传播和优化
             loss.backward()
@@ -128,9 +132,7 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
 
         # 计算平均训练损失
         train_loss /= len(train_loader)
-        
         train_losses['loss'].append(train_loss)
-
         print(f'Epoch {epoch}, Train Loss: {train_loss:.6f}')
 
         # 每5个epoch进行一次测试和保存
@@ -150,12 +152,12 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                     root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]
                     motion = batch["motion"].to(device)  # [bs, seq, 132]
                     human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 6]
-                    # obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
-                    # obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
-                    # obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
-                    obj_imu = None
-                    obj_trans = None
-                    obj_rot = None
+                    obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
+                    obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
+                    obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
+                    # obj_imu = None
+                    # obj_trans = None
+                    # obj_rot = None
                     bps_features = batch["bps_features"].to(device) if "bps_features" in batch else None
                     
                     if obj_imu is None:
@@ -164,46 +166,60 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                         obj_trans = torch.zeros((bs, seq, 3), device=device)
                         obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
                     
-                    data_dict = {
+                    data_dict_eval = {
                         "human_imu": human_imu,
                         "obj_imu": obj_imu
                         # 注意：diffusion_reverse 不需要 GT 数据
                     }
                     
                     if bps_features is not None:
-                        data_dict["bps_features"] = bps_features
+                        data_dict_eval["bps_features"] = bps_features
                     
-                    # 生成预测 (diffusion_reverse 返回最终去噪结果)
-                    pred_dict = model.diffusion_reverse(data_dict)
+                    # 生成预测
+                    pred_dict = model.diffusion_reverse(data_dict_eval)
                     
-                    # --- 测试阶段计算评估指标 (与之前相同) --- 
-                    root_pos_pred = pred_dict["root_pos"]
+                    # # 计算评估指标
+                    # root_pos_pred = pred_dict["root_pos"]
+                    # motion_pred = pred_dict["motion"]
+                    # obj_trans_pred = pred_dict["obj_trans"]
+                    # obj_rot_pred = pred_dict["obj_rot"]
+                    
+                    # loss_rot = torch.nn.functional.mse_loss(motion_pred, motion)
+                    # loss_root_pos = torch.nn.functional.mse_loss(root_pos_pred, root_pos)
+                    # loss_obj_trans = torch.nn.functional.mse_loss(obj_trans_pred, obj_trans)
+                    # loss_obj_rot = torch.nn.functional.mse_loss(obj_rot_pred, obj_rot)
+                    
+                    # # 使用一个综合指标或分别报告
+                    # test_metric = loss_rot + 0.1 * loss_root_pos + 0.1 * loss_obj_trans + 0.1 * loss_obj_rot
+                    # # test_metric = loss_rot + 0.1 * loss_root_pos # 只关注人体
+                    
+                    # # 记录损失 (评估指标)
+                    # test_loss += test_metric.item()
+                    # test_loss_rot += loss_rot.item()
+                    # test_loss_root_pos += loss_root_pos.item()
+                    # test_loss_obj_trans += loss_obj_trans.item()
+                    # test_loss_obj_rot += loss_obj_rot.item()
+
                     motion_pred = pred_dict["motion"]
-                    obj_trans_pred = pred_dict["obj_trans"]
                     obj_rot_pred = pred_dict["obj_rot"]
-                    
                     loss_rot = torch.nn.functional.mse_loss(motion_pred, motion)
-                    loss_root_pos = torch.nn.functional.mse_loss(root_pos_pred, root_pos)
-                    loss_obj_trans = torch.nn.functional.mse_loss(obj_trans_pred, obj_trans)
                     loss_obj_rot = torch.nn.functional.mse_loss(obj_rot_pred, obj_rot)
-                    
-                    # 使用一个综合指标或分别报告
-                    test_metric = loss_rot + 0.1 * loss_root_pos + 0.1 * loss_obj_trans + 0.1 * loss_obj_rot
-                    # test_metric = loss_rot + 0.1 * loss_root_pos # 只关注人体
-                    
-                    # 记录损失 (评估指标)
+                    test_metric = loss_rot + loss_obj_rot
                     test_loss += test_metric.item()
                     test_loss_rot += loss_rot.item()
-                    test_loss_root_pos += loss_root_pos.item()
-                    test_loss_obj_trans += loss_obj_trans.item()
                     test_loss_obj_rot += loss_obj_rot.item()
                     
-                    # 更新tqdm描述
+                    # # 更新tqdm描述
+                    # test_iter.set_postfix({
+                    #     'test_metric': test_metric.item(),
+                    #     'loss_rot': loss_rot.item(),
+                    #     'loss_root_pos': loss_root_pos.item(),
+                    #     'loss_obj': loss_obj_trans.item() + loss_obj_rot.item()
+                    # })
                     test_iter.set_postfix({
                         'test_metric': test_metric.item(),
-                        'loss_rot': loss_rot.item(),
-                        'loss_root_pos': loss_root_pos.item(),
-                        'loss_obj': loss_obj_trans.item() + loss_obj_rot.item()
+                        'loss_motion': loss_rot.item(),
+                        'loss_obj_rot': loss_obj_rot.item()
                     })
             
             # 计算平均测试损失 (评估指标)
@@ -213,7 +229,7 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
             test_loss_obj_trans /= len(test_loader)
             test_loss_obj_rot /= len(test_loader)
             
-            test_losses['loss'].append(test_loss) # test_losses['loss'] 现在存储的是评估指标
+            test_losses['loss'].append(test_loss)
             test_losses['loss_rot'].append(test_loss_rot)
             test_losses['loss_root_pos'].append(test_loss_root_pos)
             test_losses['loss_obj_trans'].append(test_loss_obj_trans)
@@ -225,12 +241,19 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                   f'Obj Trans Loss: {test_loss_obj_trans:.6f}, '
                   f'Obj Rot Loss: {test_loss_obj_rot:.6f}')    
             
+            # if use_wandb:
+            #     log_dict = {
+            #         'test_metric': test_loss,
+            #         'test_loss_rot': test_loss_rot,
+            #         'test_loss_root_pos': test_loss_root_pos,
+            #         'test_loss_obj_trans': test_loss_obj_trans,
+            #         'test_loss_obj_rot': test_loss_obj_rot
+            #     }
+            #     wandb.log(log_dict, step=n_iter)
             if use_wandb:
                 log_dict = {
                     'test_metric': test_loss,
                     'test_loss_rot': test_loss_rot,
-                    'test_loss_root_pos': test_loss_root_pos,
-                    'test_loss_obj_trans': test_loss_obj_trans,
                     'test_loss_obj_rot': test_loss_obj_rot
                 }
                 wandb.log(log_dict, step=n_iter)

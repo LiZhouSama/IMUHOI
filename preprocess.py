@@ -404,7 +404,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     # 归一化IMU数据到头部坐标系
     head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
     head_gyro = imu_global_full_gt['angular_velocities'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
-    norm_imu_global_full_gt = normalize_to_head_frame(imu_global_full_gt, head_imu_data=(head_accel, head_gyro))
+    mask = torch.ones(len(IMU_JOINTS), dtype=bool)
+    mask[HEAD_IDX] = False
+    imu_global_exp_head_gt = {k: v[:, mask, :] for k, v in imu_global_full_gt.items()}
+    # norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_gyro))
+    norm_imu_global_full_gt = imu_global_full_gt
     
     # 提取物体相关信息(如果存在)
     obj_data = {}
@@ -420,8 +424,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         
         # 计算物体的IMU数据
         obj_imu_data = compute_object_imu(obj_trans, obj_rot)
-        obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_gyro))
-        
+        # norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_gyro))
+        norm_obj_imu_data = obj_imu_data
         # 提取物体名称
         object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
         
@@ -492,8 +496,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
             "obj_rot": obj_rot.cpu(),
             "obj_com_pos": obj_com_pos.cpu(),
             "obj_imu": {
-                "accelerations": obj_imu_data["accelerations"].cpu(),    # [T, 1, 3]
-                "angular_velocities": obj_imu_data["angular_velocities"].cpu()  # [T, 1, 3]
+                "accelerations": norm_obj_imu_data["accelerations"].cpu(),    # [T, 1, 3]
+                "angular_velocities": norm_obj_imu_data["angular_velocities"].cpu()  # [T, 1, 3]
             },
             # "bps_file": f"{seq_name}_{seq_key}.npy"  # 存储BPS文件路径的相对引用
         }
@@ -522,21 +526,6 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     return 1
 
 def main(args):
-    # 创建输出目录
-    os.makedirs(args.save_dir, exist_ok=True)
-    
-    # # 创建BPS目录
-    # bps_dir = os.path.join(args.save_dir, "bps_features")
-    # os.makedirs(bps_dir, exist_ok=True)
-    # 准备BPS基础点云
-    # print("准备BPS基础点云...")
-    # bps_points = prep_bps_data(n_bps_points=args.n_bps_points, radius=args.bps_radius, device=device)
-    
-    # 加载数据集
-    print(f"正在加载数据集：{args.data_path}")
-    data_dict = joblib.load(args.data_path)
-    print(f"数据集加载完成，共有{len(data_dict)}个序列")
-    
     # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
@@ -550,22 +539,50 @@ def main(args):
         bm_fname=bm_fname_male,
         num_betas=num_betas,
     ).to(device)
+
+    # 创建输出目录
+    os.makedirs(args.save_dir_train, exist_ok=True)
+    os.makedirs(args.save_dir_test, exist_ok=True)
     
+    # # 创建BPS目录
+    # bps_dir = os.path.join(args.save_dir, "bps_features")
+    # os.makedirs(bps_dir, exist_ok=True)
+    # 准备BPS基础点云
+    # print("准备BPS基础点云...")
+    # bps_points = prep_bps_data(n_bps_points=args.n_bps_points, radius=args.bps_radius, device=device)
+    
+    # 加载数据集
+    print(f"正在加载数据集：{args.data_path_train}")
+    data_dict_train = joblib.load(args.data_path_train)
+    print(f"数据集加载完成，共有{len(data_dict_train)}个序列")
+    
+    print(f"正在加载数据集：{args.data_path_test}")
+    data_dict_test = joblib.load(args.data_path_test)
+    print(f"数据集加载完成，共有{len(data_dict_test)}个序列")
     
     # 处理所有序列
     print("开始处理序列...")
     
-    for seq_key in tqdm(data_dict, desc="处理序列"):
-        process_sequence(data_dict[seq_key], seq_key, args.save_dir, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+    for seq_key in tqdm(data_dict_train, desc="处理序列"):
+        process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
     
-    print(f"所有序列处理完成，结果保存在：{args.save_dir}")
+    print(f"所有序列处理完成，结果保存在：{args.save_dir_train}")
+
+    for seq_key in tqdm(data_dict_test, desc="处理序列"):
+        process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+    
+    print(f"所有序列处理完成，结果保存在：{args.save_dir_test}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="处理人体动作数据集")
-    parser.add_argument("--data_path", type=str, default="dataset/train_diffusion_manip_seq_joints24.p",
+    parser.add_argument("--data_path_train", type=str, default="dataset/train_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir", type=str, default="processed_data_0330/train",
+    parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
+                        help="输入数据集路径(.p文件)")
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0405/train",
+                        help="输出数据保存目录")
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0405/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")

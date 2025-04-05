@@ -170,18 +170,18 @@ class IMUDataset(Dataset):
                 # 对imu归一化(输入)
                 norm_human_imu = self._imu_TN(human_imu)
                 norm_obj_imu = self._imu_TN(obj_imu)
-                head_global_pos_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, 3]
-                head_global_rot_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, :3]
-                head_rot_invert = head_global_rot_start.swapaxes(-2,-1)
-                # 对motion归一化(输出)
-                norm_motion = motion.clone()
-                root_rot = transforms.rotation_6d_to_matrix(norm_motion[:, :6])
-                norm_root_rot = head_rot_invert @ root_rot
-                norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
-                norm_root_pos = root_pos - head_global_pos_start
-                # 对obj归一化(输出)
-                norm_obj_trans = obj_trans - head_global_pos_start
-                norm_obj_rot = head_rot_invert @ obj_rot
+                # head_global_pos_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, 3]
+                # head_global_rot_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, :3]
+                # head_rot_invert = head_global_rot_start.swapaxes(-2,-1)
+                # # 对motion归一化(输出)
+                # norm_motion = motion.clone()
+                # root_rot = transforms.rotation_6d_to_matrix(norm_motion[:, :6])
+                # norm_root_rot = head_rot_invert @ root_rot
+                # norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
+                # norm_root_pos = root_pos - head_global_pos_start
+                # # 对obj归一化(输出)
+                # norm_obj_trans = obj_trans - head_global_pos_start
+                # norm_obj_rot = head_rot_invert @ obj_rot
 
 
             
@@ -203,14 +203,24 @@ class IMUDataset(Dataset):
                             print(f"无法加载BPS特征 {bps_path}: {e}")
             
             # 构建结果字典
+            # result = {
+            #     "root_pos": norm_root_pos.float(),
+            #     "motion": norm_motion.float(),  # [seq, 132]
+            #     "head_global_trans": seq_data["head_global_trans"][start_idx:end_idx],    # [seq, 4, 4]
+            #     "human_imu": norm_human_imu.float(),  # [seq, num_imus, 6]
+            #     "obj_imu": norm_obj_imu.float(),  # [seq, 1, 6]
+            #     "obj_trans": norm_obj_trans.float(),  # [seq, 3]
+            #     "obj_rot": norm_obj_rot.float(),  # [seq, 3, 3]
+            #     "obj_name": obj_name,
+            #     "has_object": has_object,
+            # }
             result = {
-                "root_pos": norm_root_pos.float(),
-                "motion": norm_motion.float(),  # [seq, 132]
-                "head_global_trans": seq_data["head_global_trans"][start_idx:end_idx],    # [seq, 4, 4]
+                "root_pos": root_pos.float(),
+                "motion": motion.float(),  # [seq, 132]
                 "human_imu": norm_human_imu.float(),  # [seq, num_imus, 6]
                 "obj_imu": norm_obj_imu.float(),  # [seq, 1, 6]
-                "obj_trans": norm_obj_trans.float(),  # [seq, 3]
-                "obj_rot": norm_obj_rot.float(),  # [seq, 3, 3]
+                "obj_trans": obj_trans.float(),  # [seq, 3]
+                "obj_rot": obj_rot.float(),  # [seq, 3, 3]
                 "obj_name": obj_name,
                 "has_object": has_object,
             }
