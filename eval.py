@@ -3,7 +3,7 @@ import torch
 import yaml
 import numpy as np
 from torch.utils.data import DataLoader
-from diffusion_stage.DiT_model import MotionDiffusion
+from models.DiT_model import MotionDiffusion
 from dataloader.dataloader import IMUDataset
 from easydict import EasyDict as edict
 from human_body_prior.body_model.body_model import BodyModel
@@ -33,7 +33,7 @@ def load_model(model_path, config, device):
         model = MotionDiffusion(config, input_length=input_length).to(device)
     else:
         print("Loading wrap_model...")
-        from diffusion_stage.wrap_model import MotionDiffusion as WrapMotionDiffusion
+        from models.wrap_model import MotionDiffusion as WrapMotionDiffusion
         model = WrapMotionDiffusion(config, input_length=input_length).to(device)
 
     checkpoint = torch.load(model_path, map_location=device)
@@ -77,12 +77,9 @@ def evaluate_model(model, smpl_model, data_loader, device):
                  continue
 
             has_object = gt_obj_imu is not None
-            if has_object:
-                 if gt_obj_trans is None or gt_obj_rot is None:
-                     print(f"Warning: Batch {batch_idx}: Object IMU present but trans/rot missing, skipping object eval.")
-                     has_object = False
-            else:
-                 gt_obj_imu = torch.zeros((bs, seq_len, 1, 6), device=device)
+            if not has_object:
+                bs, seq_len = gt_human_imu.shape[:2]
+                gt_obj_imu = torch.zeros((bs, seq_len, 1, 12), device=device)  # 注意：现在是12D
 
             data_dict = {
                 "human_imu": gt_human_imu,
@@ -181,15 +178,19 @@ def main():
     print(f"Loading SMPL model from: {smpl_model_path}")
     smpl_model = load_smpl_model(smpl_model_path, device)
 
-    model_path = config.get('eval_model_path', 'outputs/imu_04051926/epoch_185_best.pt')
-    if not os.path.exists(model_path):
-        print(f"Error: Evaluation model path not found: {model_path}")
+    model_path = config.get('model_path', None)
+    if model_path is None:
+        print("Error: Evaluation model path not found in the config.")
         print("Please provide the correct path to your trained model checkpoint in the config (eval_model_path) or script.")
         return
     print(f"Loading trained model from: {model_path}")
     model = load_model(model_path, config, device)
 
-    test_data_dir = config['test'].get('data_dir', 'processed_data_0405/test')
+    test_data_dir = config['test'].get('data_path', None)
+    if not os.path.exists(test_data_dir):
+        print(f"Error: Test dataset path not found: {test_data_dir}")
+        print("Please provide the correct path to your test dataset in the config (test.data_path).")
+        return
     print(f"Loading test dataset from: {test_data_dir}")
     test_dataset = IMUDataset(
             data_dir=test_data_dir,

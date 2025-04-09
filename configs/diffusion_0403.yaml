@@ -3,27 +3,29 @@ model_name: imu_diffusion
 
 # 训练参数
 seed: 10
-batch_size: 450
+batch_size: 420
 lr: 0.0002
-milestones: [20, 30]
+milestones: [50, 100, 150, 200, 250, 300, 350]
 gamma: 0.25
 weight_decay: 0.0001
-epoch: 200
-num_workers: 12
+epoch: 400
+num_workers: 16
 gpus: [0]
 use_wandb: True
 save_dir: outputs
+bm_path: body_models/smplh/male/model.npz
+model_path: outputs/imu_04081303/epoch_50_best.pt
 
 # 数据路径
 train:
-  data_path: processed_data_0405/train
-  debug_data_path: processed_data_0405/debug
+  data_path: processed_data_0407/train
+  debug_data_path: processed_data_0407/debug
   window: 120  # 序列长度
   window_stride: 15
   normalize: True
   
 test:
-  data_path: processed_data_0405/test
+  data_path: processed_data_0407/test
   window: 120  # 序列长度
   window_stride: 60
   normalize: True

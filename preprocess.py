@@ -21,10 +21,10 @@ except ImportError:
     print("警告: bps_torch库未安装，请安装后再运行")
 
 # IMU关节索引，可以根据需要修改
-IMU_JOINTS = [20, 21, 15, 7, 8, 0]  # 左手、右手、头部、左脚、右脚、髋部
-IMU_JOINT_NAMES = ['left_hand', 'right_hand', 'head', 'left_foot', 'right_foot', 'hip']
-HEAD_IDX = 2  # 头部在IMU_JOINTS列表中的索引
-FRAME_RATE = 60  # 帧率
+IMU_JOINTS = [20, 21, 7, 8, 0, 15]  # 左手、右手、左脚、右脚、髋部、头部
+IMU_JOINT_NAMES = ['left_hand', 'right_hand', 'left_foot', 'right_foot', 'hip', 'head']
+HEAD_IDX = 5  # 头部在IMU_JOINTS列表中的索引
+FRAME_RATE = 1  # 帧率
 
 # 生成加速度数据，使用二阶差分计算
 def _syn_acc(v, smooth_n=4):
@@ -44,7 +44,7 @@ def _syn_acc(v, smooth_n=4):
 
 def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     """
-    计算特定关节的IMU数据（只包括加速度和角速度），使用矩阵运算优化
+    计算特定关节的IMU数据（加速度和方向）
     
     参数:
         position_global: 全局关节位置 [T, J, 3]
@@ -53,13 +53,13 @@ def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
         smooth_n: 平滑窗口大小
     
     返回:
-        IMU数据字典，仅包含加速度和角速度信息
+        IMU数据字典，包含加速度和方向信息
     """
     device = position_global.device
     
     # 提取指定关节的位置和旋转
     imu_positions = position_global[:, imu_joints, :]  # [T, num_imus, 3]
-    imu_rotations = rotation_global[:, imu_joints, :, :]  # [T, num_imus, 3, 3]
+    imu_orientations = rotation_global[:, imu_joints, :, :]  # [T, num_imus, 3, 3]
     
     T = imu_positions.shape[0]
     num_imus = len(imu_joints)
@@ -69,36 +69,23 @@ def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     imu_accelerations = torch.zeros_like(imu_positions)
     for i in range(num_imus):
         imu_accelerations[:, i, :] = _syn_acc(imu_positions[:, i, :], smooth_n=4)
-    
-    # 计算角速度 - 使用矩阵运算优化
-    angular_velocities = torch.zeros_like(imu_positions)
-    delta_t = 1.0 / FRAME_RATE  # 假设60帧每秒
-    
-    if T > 1:
-        # 构建t和t-1时刻的旋转矩阵
-        rot_t = imu_rotations[1:].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
-        rot_tm1 = imu_rotations[:-1].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
-        
-        # 计算相对旋转: R_rel = R_t * R_(t-1)^(-1)
-        rot_tm1_inv = torch.inverse(rot_tm1)  # [(T-1)*num_imus, 3, 3]
-        rel_rot = torch.bmm(rot_t, rot_tm1_inv)  # [(T-1)*num_imus, 3, 3]
-        
-        # 将旋转矩阵转换为轴角表示
-        axis_angle = transforms.matrix_to_axis_angle(rel_rot)  # [(T-1)*num_imus, 3]
-        
-        # 角速度 = 轴角 / 时间间隔
-        angular_vel = axis_angle / delta_t  # [(T-1)*num_imus, 3]
-        
-        # 重新整形为 [T-1, num_imus, 3]
-        angular_vel = angular_vel.reshape(T-1, num_imus, 3)
-        
-        # 将计算结果填入输出张量的对应位置
-        angular_velocities[1:] = angular_vel
-    
-    # 返回IMU数据字典，只包含加速度和角速度
+    # # 计算角速度 - 使用矩阵运算优化
+    # angular_velocities = torch.zeros_like(imu_positions)
+    # delta_t = 1.0 / FRAME_RATE  # 假设60帧每秒
+    # if T > 1:
+    #     # 构建t和t-1时刻的旋转矩阵
+    #     rot_t = imu_rotations[1:].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
+    #     rot_tm1 = imu_rotations[:-1].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
+    #     rot_tm1_inv = torch.inverse(rot_tm1)  # [(T-1)*num_imus, 3, 3]
+    #     rel_rot = torch.bmm(rot_t, rot_tm1_inv)  # [(T-1)*num_imus, 3, 3]
+    #     axis_angle = transforms.matrix_to_axis_angle(rel_rot)  # [(T-1)*num_imus, 3]
+    #     angular_vel = axis_angle / delta_t  # [(T-1)*num_imus, 3]
+    #     angular_vel = angular_vel.reshape(T-1, num_imus, 3)
+    #     angular_velocities[1:] = angular_vel
+    # 返回IMU数据字典，包含加速度和方向
     imu_data = {
         'accelerations': imu_accelerations,  # [T, num_imus, 3]
-        'angular_velocities': angular_velocities  # [T, num_imus, 3]
+        'orientations': imu_orientations   # [T, num_imus, 3, 3]
     }
     
     return imu_data
@@ -108,9 +95,9 @@ def normalize_to_head_frame(imu_data, head_imu_data):
     将IMU数据归一化到头部坐标系
     
     参数:
-        imu_data: 包含加速度和角速度的字典
+        imu_data: 包含加速度和方向的字典
             - accelerations: [T, num_imus, 3]
-            - angular_velocities: [T, num_imus, 3]
+            - orientations: [T, num_imus, 3, 3]
     
     返回:
         归一化后的IMU数据字典
@@ -118,16 +105,16 @@ def normalize_to_head_frame(imu_data, head_imu_data):
     # 复制数据以避免修改原始数据
     norm_imu_data = {
         'accelerations': imu_data['accelerations'].clone(),
-        'angular_velocities': imu_data['angular_velocities'].clone()
+        'orientations': imu_data['orientations'].clone()
     }
     
     # 获取头部IMU数据
     head_accel = head_imu_data[0]  # [T, 1, 3]
-    head_gyro = head_imu_data[1]  # [T, 1, 3]
+    head_orient = head_imu_data[1]  # [T, 1, 3, 3]
     
     # 所有IMU数据相对于头部IMU
     norm_imu_data['accelerations'] = norm_imu_data['accelerations'] - head_accel
-    norm_imu_data['angular_velocities'] = norm_imu_data['angular_velocities'] - head_gyro
+    norm_imu_data['orientations'] = torch.matmul(torch.inverse(head_orient), norm_imu_data['orientations'])
     
     return norm_imu_data
 
@@ -291,7 +278,7 @@ def apply_transformation_to_obj(obj_verts, obj_scale, obj_rot, obj_trans):
 
 def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
     """
-    计算物体的IMU数据（加速度和角速度），使用矩阵运算优化
+    计算物体的IMU数据（加速度和方向）
     
     参数:
         obj_trans: 物体位置 [T, 3]
@@ -307,28 +294,21 @@ def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
     
     # 计算物体加速度
     obj_accel = _syn_acc(obj_trans, smooth_n=4)  # [T, 3]
-    
-    # 计算角速度 - 使用矩阵运算
-    obj_angular_vel = torch.zeros_like(obj_trans)
-    delta_t = 1.0 / FRAME_RATE  # 假设60帧每秒
-    
-    if T > 1:
-        # 计算相对旋转
-        rot_t = obj_rot_mat[1:]  # [T-1, 3, 3]
-        rot_tm1 = obj_rot_mat[:-1]  # [T-1, 3, 3]
-        rot_tm1_inv = torch.inverse(rot_tm1)  # [T-1, 3, 3]
-        rel_rot = torch.bmm(rot_t, rot_tm1_inv)  # [T-1, 3, 3]
-        
-        # 将旋转矩阵转换为轴角表示
-        axis_angle = transforms.matrix_to_axis_angle(rel_rot)  # [T-1, 3]
-        
-        # 角速度 = 轴角 / 时间间隔
-        obj_angular_vel[1:] = axis_angle / delta_t  # [T-1, 3]
-    
+    # # 计算角速度 - 使用矩阵运算
+    # obj_angular_vel = torch.zeros_like(obj_trans)
+    # delta_t = 1.0 / FRAME_RATE  # 假设60帧每秒
+    # if T > 1:
+    #     # 计算相对旋转
+    #     rot_t = obj_rot_mat[1:]  # [T-1, 3, 3]
+    #     rot_tm1 = obj_rot_mat[:-1]  # [T-1, 3, 3]
+    #     rot_tm1_inv = torch.inverse(rot_tm1)  # [T-1, 3, 3]
+    #     rel_rot = torch.bmm(rot_t, rot_tm1_inv)  # [T-1, 3, 3]
+    #     axis_angle = transforms.matrix_to_axis_angle(rel_rot)  # [T-1, 3]
+    #     obj_angular_vel[1:] = axis_angle / delta_t  # [T-1, 3]
     # 返回物体IMU数据
     return {
         'accelerations': obj_accel.reshape(T, 1, 3),  # [T, 1, 3]
-        'angular_velocities': obj_angular_vel.reshape(T, 1, 3)  # [T, 1, 3]
+        'orientations': obj_rot_mat.reshape(T, 1, 3, 3)  # [T, 1, 3, 3]
     }
 
 def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=None, bps_points=None, obj_mesh_dir=None):
@@ -372,10 +352,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     
     # 只使用前22个关节的层次结构
     kintree_table = bm.kintree_table[0].long()[:22]  # 只取前22个关节的父子关系
+    kintree_table[0] = -1
     
     # 计算全局旋转矩阵
     rotation_global_matrot = local2global_pose(
-        local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9)[:, :22], kintree_table
+        local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9), kintree_table
     )
     
     # 重塑全局旋转矩阵为标准形状 [T, J, 3, 3]
@@ -393,23 +374,29 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     head_global_trans[:, :3, :3] = head_rotation_global_matrot.squeeze()
     head_global_trans[:, :3, 3] = position_head_world
     
-    # 计算IMU数据
+    # 计算IMU数据 (现在是加速度和方向)
     imu_global_full_gt = compute_imu_data(
         position_global_full_gt_world.to(device), 
         rotation_global_matrot_reshaped.to(device),
         IMU_JOINTS,
         smooth_n=4
     )
-    
     # 归一化IMU数据到头部坐标系
-    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
-    head_gyro = imu_global_full_gt['angular_velocities'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
-    mask = torch.ones(len(IMU_JOINTS), dtype=bool)
-    mask[HEAD_IDX] = False
-    imu_global_exp_head_gt = {k: v[:, mask, :] for k, v in imu_global_full_gt.items()}
-    # norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_gyro))
-    norm_imu_global_full_gt = imu_global_full_gt
-    
+    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:]  # [T, 1, 3]
+    head_ori = imu_global_full_gt['orientations'][:, HEAD_IDX:]  # [T, 1, 3, 3]
+    imu_global_exp_head_gt = {k: v[:, :HEAD_IDX] for k, v in imu_global_full_gt.items()}
+    norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_ori))
+    norm_imu_acc = torch.cat([norm_imu_global_full_gt['accelerations'], head_accel], dim=1).bmm(head_ori[:, -1])
+    norm_imu_ori = torch.cat([norm_imu_global_full_gt['orientations'], head_ori], dim=1)
+    processed_imu_global_full_gt = {
+        'accelerations': norm_imu_acc,
+        'orientations': norm_imu_ori
+    }
+
+    # --- 或者，如果不进行归一化，直接使用全局数据 ---
+    # processed_imu_global_full_gt = imu_global_full_gt # 使用未归一化的数据
+    # -------------------------------------------------
+
     # 提取物体相关信息(如果存在)
     obj_data = {}
     if 'obj_scale' in seq_data:
@@ -422,10 +409,15 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         obj_rot = torch.tensor(seq_data['obj_rot'], device=device).float()
         obj_com_pos = torch.tensor(seq_data['obj_com_pos'], device=device).float()
         
-        # 计算物体的IMU数据
+        # 计算物体的IMU数据 (现在是加速度和方向)
         obj_imu_data = compute_object_imu(obj_trans, obj_rot)
-        # norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_gyro))
-        norm_obj_imu_data = obj_imu_data
+        norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_ori))
+        norm_obj_imu_data['accelerations'] = norm_obj_imu_data['accelerations'].bmm(head_ori[:, -1])
+        processed_obj_imu_data = norm_obj_imu_data
+        # --- 或者，如果不进行归一化，直接使用全局数据 ---
+        # processed_obj_imu_data = obj_imu_data # 使用未归一化的数据
+        # -------------------------------------------------
+
         # 提取物体名称
         object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
         
@@ -496,8 +488,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
             "obj_rot": obj_rot.cpu(),
             "obj_com_pos": obj_com_pos.cpu(),
             "obj_imu": {
-                "accelerations": norm_obj_imu_data["accelerations"].cpu(),    # [T, 1, 3]
-                "angular_velocities": norm_obj_imu_data["angular_velocities"].cpu()  # [T, 1, 3]
+                "accelerations": processed_obj_imu_data["accelerations"].cpu(),    # [T, 1, 3]
+                "orientations": processed_obj_imu_data["orientations"].cpu()  # [T, 1, 3, 3]
             },
             # "bps_file": f"{seq_name}_{seq_key}.npy"  # 存储BPS文件路径的相对引用
         }
@@ -510,8 +502,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         "head_global_trans": head_global_trans.cpu(),
         "position_global_full_gt_world": position_global_full_gt_world.float(),
         "imu_global_full_gt": {
-            "accelerations": norm_imu_global_full_gt["accelerations"].cpu(),    # [T,num_imus, 3]
-            "angular_velocities": norm_imu_global_full_gt["angular_velocities"].cpu()  # [T,num_imus, 3]
+            "accelerations": processed_imu_global_full_gt["accelerations"].cpu(),    # [T, num_imus, 3]
+            "orientations": processed_imu_global_full_gt["orientations"].cpu()  # [T, num_imus, 3, 3]
         },
         "framerate": FRAME_RATE,
         "gender": subject_gender
@@ -580,9 +572,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0405/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0408/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0405/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0408/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")

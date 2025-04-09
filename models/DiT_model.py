@@ -182,6 +182,60 @@ class TimestepEmbedder(nn.Module):
 # ==============================================================================
 # Main MotionDiffusion Model using OMOMO Decoder
 # ==============================================================================
+class IMUEncoder(nn.Module):
+    """高级IMU编码器，分别处理加速度和方向数据"""
+    def __init__(self, acc_dim=3, ori_dim=6, hidden_dim=64, output_dim=32, dropout=0.1):
+        super().__init__()
+        
+        # 加速度处理分支
+        self.acc_encoder = nn.Sequential(
+            nn.Linear(acc_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2)
+        )
+        
+        # 6D旋转表示处理分支
+        self.ori_encoder = nn.Sequential(
+            nn.Linear(ori_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2)
+        )
+        
+        # 融合层
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.SiLU()
+        )
+        
+    def forward(self, x):
+        """
+        参数:
+            x: IMU数据 [..., 9]，前3维是加速度，后6维是6D旋转表示
+        
+        返回:
+            编码特征 [..., output_dim]
+        """
+        # 分离加速度和方向数据
+        acc = x[..., :3]
+        ori = x[..., 3:]
+        
+        # 分别编码
+        acc_feat = self.acc_encoder(acc)
+        ori_feat = self.ori_encoder(ori)
+        
+        # 拼接并融合
+        combined = torch.cat([acc_feat, ori_feat], dim=-1)
+        return self.fusion(combined)
+
 class MotionDiffusion(nn.Module):
     def __init__(self, cfg, input_length, imu_input=True):
         super(MotionDiffusion, self).__init__()
@@ -203,30 +257,50 @@ class MotionDiffusion(nn.Module):
         self.mask_training = cfg.get('mask_training', False)
         self.mask_num = cfg.get('mask_num', 2)  
 
-        # --- Input Encoders ---
-        # IMU Encoders (remains the same)
-        self.human_imu_encoder = nn.Sequential(
-            nn.Linear(6, 16), nn.SiLU(), nn.Linear(16, 32)
+        # --- 改进的IMU编码器 ---
+        # 人体IMU编码器 - 处理6个IMU传感器
+        self.human_imu_encoder = IMUEncoder(
+            acc_dim=3, 
+            ori_dim=6, 
+            hidden_dim=64, 
+            output_dim=32, 
+            dropout=self.dropout
         )
-        self.obj_imu_encoder = nn.Sequential(
-            nn.Linear(6, 16), nn.SiLU(), nn.Linear(16, 32)
+        
+        # 物体IMU编码器 - 处理1个IMU传感器
+        self.obj_imu_encoder = IMUEncoder(
+            acc_dim=3, 
+            ori_dim=6, 
+            hidden_dim=64, 
+            output_dim=32, 
+            dropout=self.dropout
         )
-        num_total_imus_features = 32 * 6 + 32 * 1 
-        # Combined IMU Feature Projection (projects raw IMU features to latent_dim)
-        self.imu_condition_encoder = nn.Linear(num_total_imus_features, self.latent_dim) 
+        
+        # 各IMU传感器之间的注意力机制 (可选，但可以帮助捕捉IMU之间的关系)
+        self.imu_attention = nn.MultiheadAttention(
+            embed_dim=32,
+            num_heads=4,
+            dropout=self.dropout,
+            batch_first=True
+        )
+        
+        # 特征聚合
+        num_total_imus_features = 32 * 6 + 32 * 1  # 6个人体IMU + 1个物体IMU
+        self.imu_condition_encoder = nn.Sequential(
+            nn.Linear(num_total_imus_features, self.latent_dim),
+            nn.LayerNorm(self.latent_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout)
+        )
         
         # Target Data Projection (projects target pose/obj data to latent_dim)
-        self.target_feature_dim = 141 # 147 # 3(root) + 132(pose) + 3(obj_t) + 9(obj_r)
+        self.target_feature_dim = 138 # 132 (motion) + 6 (obj_rot)
         self.input_projection = nn.Linear(self.target_feature_dim, self.latent_dim)
 
         # --- Timestep Embedding ---
         self.embed_timestep = TimestepEmbedder(self.latent_dim)
 
-        # --- Denoiser Network (Using OMOMO Decoder) ---
-        # The OMOMO decoder's d_input_feats needs clarification. 
-        # Based on their code, it seems to be the dimension *before* the `start_conv` (input_proj).
-        # Let's define the OMOMODecoder to take d_model as its primary dimension.
-        # Input projection will happen *before* calling the decoder.
+        # --- Denoiser Network ---
         self.denoiser = OMOMODenoiserWithInput(
             seq_len=input_length,
             latent_dim=self.latent_dim,
@@ -243,24 +317,57 @@ class MotionDiffusion(nn.Module):
         self.output_projection = nn.Linear(self.latent_dim, self.target_feature_dim)
 
     def _encode_imu(self, human_imu, obj_imu):
-        """ Encodes IMU data and projects to latent_dim. """
+        """ 
+        编码IMU数据并投影到latent_dim。
+        
+        参数:
+            human_imu: 人体IMU数据 [bs, seq, num_imus, 9] (9D = 加速度3D + 6D旋转表示)
+            obj_imu: 物体IMU数据 [bs, seq, 1, 9] (9D = 加速度3D + 6D旋转表示)
+            
+        返回:
+            cond_emb: 条件嵌入 [bs, seq, latent_dim]
+        """
         bs, seq, num_imus, _ = human_imu.shape
-        # Encode human IMUs
-        human_imu_features = self.human_imu_encoder(human_imu.reshape(bs * seq * num_imus, -1))
-        human_imu_features = human_imu_features.reshape(bs, seq, num_imus * 32)
-        # Apply masking if training
+        
+        # 编码人体IMU - 先打平处理每个IMU
+        human_imu_flat = human_imu.reshape(bs * seq * num_imus, -1)
+        human_imu_features = self.human_imu_encoder(human_imu_flat)
+        human_imu_features = human_imu_features.reshape(bs, seq, num_imus, -1)
+        
+        # 应用IMU间注意力机制 (可选)
+        if hasattr(self, 'imu_attention'):
+            # 对每个时间步应用注意力
+            refined_features = []
+            for t in range(seq):
+                # [bs, num_imus, hidden_dim]
+                time_features = human_imu_features[:, t]
+                # 自注意力: 每个IMU关注其他IMU
+                attn_out, _ = self.imu_attention(time_features, time_features, time_features)
+                refined_features.append(attn_out)
+            # 重新组装时序数据
+            human_imu_features = torch.stack(refined_features, dim=1)
+        
+        # 打平为每个序列的特征向量
+        human_imu_features = human_imu_features.reshape(bs, seq, -1)
+        
+        # 应用遮蔽（如果训练阶段）
         if self.training and self.mask_training:
-            human_imu_features_reshaped = human_imu_features.reshape(bs, seq, num_imus, 32)
+            # 重塑为每个IMU分开的特征
+            human_imu_features_reshaped = human_imu_features.reshape(bs, seq, num_imus, -1)
             for i in range(bs):
                 mask_index = torch.randint(0, num_imus, (self.mask_num,), device=human_imu.device)
-                human_imu_features_reshaped[i, :, mask_index] = 0.01 # Mask value
-            human_imu_features = human_imu_features_reshaped.reshape(bs, seq, num_imus * 32)
-        # Encode object IMU
-        obj_imu_features = self.obj_imu_encoder(obj_imu.reshape(bs * seq, -1))
-        obj_imu_features = obj_imu_features.reshape(bs, seq, 32)
-        # Combine and project
+                human_imu_features_reshaped[i, :, mask_index] = 0.01  # 遮蔽值
+            human_imu_features = human_imu_features_reshaped.reshape(bs, seq, -1)
+        
+        # 编码物体IMU
+        obj_imu_flat = obj_imu.reshape(bs * seq, -1)
+        obj_imu_features = self.obj_imu_encoder(obj_imu_flat)
+        obj_imu_features = obj_imu_features.reshape(bs, seq, -1)
+        
+        # 组合并投影
         combined_features = torch.cat([human_imu_features, obj_imu_features], dim=-1)
-        cond_emb = self.imu_condition_encoder(combined_features) # [bs, seq, latent_dim]
+        cond_emb = self.imu_condition_encoder(combined_features)  # [bs, seq, latent_dim]
+        
         return cond_emb
 
     def diffusion_reverse(self, data=None):
@@ -322,18 +429,12 @@ class MotionDiffusion(nn.Module):
                  raise ValueError(f"Unsupported prediction_type: {prediction_type}")
 
         # 5. Project Back to Target Dimension
-        final_output = self.output_projection(latents) # [bs, seq, 147]
+        final_output = self.output_projection(latents) # [bs, seq, 138]
         
-        # # 6. Split into components
-        # root_pos_pred = final_output[:, :, :3]
-        # motion_pred = final_output[:, :, 3:135]
-        # obj_trans_pred = final_output[:, :, 135:138]
-        # obj_rot_pred = final_output[:, :, 138:147].reshape(bs, seq, 3, 3)
-
-        # return {"root_pos": root_pos_pred, "motion": motion_pred, "obj_trans": obj_trans_pred, "obj_rot": obj_rot_pred}
+        # 6. 分离输出组件
         motion_pred = final_output[:, :, :132]
-        obj_rot_pred = final_output[:, :, 132:141].reshape(bs, seq, 3, 3)
-        
+        obj_rot_pred = final_output[:, :, 132:138]  # 直接取6D旋转表示，不需要reshape
+
         return {"motion": motion_pred, "obj_rot": obj_rot_pred}
 
     def forward(self, data=None):
@@ -344,14 +445,14 @@ class MotionDiffusion(nn.Module):
         human_imu = data["human_imu"]
         obj_imu = data["obj_imu"]
         obj_trans = data["obj_trans"]
-        obj_rot = data["obj_rot"]
+        obj_rot = data["obj_rot"]  # 现在是 [bs, seq, 6] - 6D旋转表示
         device = human_imu.device
         bs, seq = human_imu.shape[:2]
 
         # 1. Prepare Target Latents
-        obj_rot_flat = obj_rot.reshape(bs, seq, 9)
-        # target = torch.cat([root_pos, motion, obj_trans, obj_rot_flat], dim=-1)
-        target = torch.cat([motion, obj_rot_flat], dim=-1)
+        # obj_rot不再需要reshape，因为已经是扁平的6D表示
+        # 目标向量维度现在是 138 (132 + 6)
+        target = torch.cat([motion, obj_rot], dim=-1)
         target_latents = self.input_projection(target) # [bs, seq, latent_dim]
 
         # 2. Encode Condition

@@ -10,13 +10,13 @@ from torch.utils.data import DataLoader
 from datetime import datetime
 
 from dataloader.dataloader import IMUDataset
-from diffusion_stage.do_train_imu import do_train_imu
+from models.do_train_imu_TransPose import do_train_imu_TransPose, load_transpose_model
 from utils.parser_util import get_args, merge_file
 
 
 def main():
     """
-    主训练函数：解析参数、准备数据集、初始化训练
+    TransPose模型主训练函数：解析参数、准备数据集、初始化训练
     """
     # 解析命令行参数
     cfg_args = get_args()
@@ -38,16 +38,27 @@ def main():
     
     # 设置保存目录
     time_stamp = datetime.now().strftime("%m%d%H%M")
-    save_dir = os.path.join(cfg.save_dir, f"imu_{time_stamp}")
+    save_dir = os.path.join(cfg.save_dir, f"transpose_{time_stamp}")
     cfg.save_dir = save_dir
     os.makedirs(save_dir, exist_ok=True)
     
     # 打印训练配置
+    print("=" * 50)
+    print(f"模型类型: TransPose")
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练帧窗口大小: {cfg.train.window}")
     print(f"测试帧窗口大小: {cfg.test.window}")
     print(f"训练窗口步长: {cfg.train.window_stride}")
     print(f"保存目录: {save_dir}")
+    
+    # 打印损失权重信息（如果有）
+    if hasattr(cfg, 'loss_weights'):
+        print("\n损失权重配置:")
+        print(f"姿态损失权重: {cfg.loss_weights.rot}")
+        print(f"根节点位置损失权重: {cfg.loss_weights.root_pos}")
+        print(f"物体位置损失权重: {cfg.loss_weights.obj_trans}")
+        print(f"物体旋转损失权重: {cfg.loss_weights.obj_rot}")
+    print("=" * 50)
     
     # 设置数据集路径 - 使用绝对路径
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -119,11 +130,28 @@ def main():
         print(f"测试数据集大小: {len(test_dataset)}")
         print(f"测试批次数量: {len(test_loader)}")
     
-    # 开始训练
-    print("开始训练过程...")
-    model, optimizer = do_train_imu(cfg, train_loader, test_loader)
+    # 检查是否从预训练模型继续训练
+    if hasattr(cfg, 'pretrained_checkpoint') and cfg.pretrained_checkpoint:
+        pretrained_path = cfg.pretrained_checkpoint
+        print(f"从预训练模型继续训练: {pretrained_path}")
+        # 加载预训练模型
+        model = load_transpose_model(cfg, pretrained_path)
+        # 设置优化器
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        # 开始训练
+        model, optimizer = do_train_imu_TransPose(cfg, train_loader, test_loader, model=model, optimizer=optimizer)
+    else:
+        # 开始训练
+        print("开始TransPose模型训练过程...")
+        model, optimizer = do_train_imu_TransPose(cfg, train_loader, test_loader)
     
-    print(f"训练完成！模型已保存到 {save_dir}")
+    print(f"训练完成！TransPose模型已保存到 {save_dir}")
+    
+    # 保存完整配置
+    import yaml
+    with open(os.path.join(save_dir, 'training_config.yaml'), 'w') as f:
+        yaml.dump(cfg.__dict__, f)
+    
     return
 
 

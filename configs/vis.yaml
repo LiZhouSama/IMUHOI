@@ -1,11 +1,10 @@
 # 可视化配置
 
 # SMPLH模型路径
-smplh:
-  model_path: './body_models/smplh/male/model.npz'
+bm_path: body_models/smplh/male/model.npz
 
 # 测试数据路径
-work_dir: './processed_data_0324'
+data_path: processed_data_0405/test
 
 # 模型权重
-model_path: './outputs/0325/imu_03250223/final.pt' 
+model_path: outputs/imu_0405_rotLoss_stable/epoch_185_best.pt

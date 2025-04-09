@@ -41,7 +41,7 @@ class DiTBlock(nn.Module):
 
 class MotionDiffusion(nn.Module):
     def __init__(self, cfg, input_length, num_layers, imu_input=True):
-        super(MotionDiffusion, self).__init__()
+        super().__init__()
         self.cfg = cfg
         self.scheduler = diffusers.DDIMScheduler(**cfg.scheduler.get("params", dict()))
         self.latent_dim = cfg.model.d_model
@@ -54,16 +54,18 @@ class MotionDiffusion(nn.Module):
         self.mask_num = cfg.get('mask_num', 2)  # 默认掩码2个IMU传感器
         
         # IMU输入编码器
-        self.human_imu_encoder = nn.Sequential(
-            nn.Linear(6, 16),
-            nn.SiLU(),
-            nn.Linear(16, 32)
-        )
-        self.obj_imu_encoder = nn.Sequential(
-            nn.Linear(6, 16),
-            nn.SiLU(),
-            nn.Linear(16, 32)
-        )
+        # self.human_imu_encoder = nn.Sequential(
+        #     nn.Linear(6, 16),
+        #     nn.SiLU(),
+        #     nn.Linear(16, 32)
+        # )
+        # self.obj_imu_encoder = nn.Sequential(
+        #     nn.Linear(6, 16),
+        #     nn.SiLU(),
+        #     nn.Linear(16, 32)
+        # )
+        self.human_imu_encoder = nn.Linear(12, 32)  # 修改为12D
+        self.obj_imu_encoder = nn.Linear(12, 32)  # 修改为12D
         
         # 假设有6个人体IMU + 1个物体IMU
         num_total_imus_features = 32 * 6 + 32 * 1 

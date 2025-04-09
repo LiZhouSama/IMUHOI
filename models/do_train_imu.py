@@ -11,8 +11,8 @@ from torch import optim
 from tqdm import tqdm
 
 from utils.utils import tensor2numpy
-# from diffusion_stage.wrap_model import MotionDiffusion # Comment out old import
-from diffusion_stage.DiT_model import MotionDiffusion # Import the new model
+# from models.wrap_model import MotionDiffusion # Comment out old import
+from models.DiT_model import MotionDiffusion # Import the new model
 
 
 def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
@@ -73,8 +73,8 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
             # 准备数据
             root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]
             motion = batch["motion"].to(device)  # [bs, seq, 132]
-            human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 6]
-            obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
+            human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 12] - 注意：现在是12D而不是6D
+            obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 12] - 注意：现在是12D
             obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
             obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
             # obj_imu = None
@@ -85,7 +85,7 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
             # 如果没有物体数据，使用零张量代替以保持训练稳定
             if obj_imu is None:
                 bs, seq = human_imu.shape[:2]
-                obj_imu = torch.zeros((bs, seq, 1, 6), device=device)
+                obj_imu = torch.zeros((bs, seq, 1, 12), device=device)  # 注意：现在是12D
                 obj_trans = torch.zeros((bs, seq, 3), device=device)
                 obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
             
@@ -151,8 +151,8 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                     # 准备数据
                     root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]
                     motion = batch["motion"].to(device)  # [bs, seq, 132]
-                    human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 6]
-                    obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 6]
+                    human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 12] - 注意：现在是12D而不是6D
+                    obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 12] - 注意：现在是12D
                     obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
                     obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 3, 3]
                     # obj_imu = None
@@ -162,7 +162,7 @@ def do_train_imu(cfg, train_loader, test_loader=None, trial=None):
                     
                     if obj_imu is None:
                         bs, seq = human_imu.shape[:2]
-                        obj_imu = torch.zeros((bs, seq, 1, 6), device=device)
+                        obj_imu = torch.zeros((bs, seq, 1, 12), device=device)  # 注意：现在是12D
                         obj_trans = torch.zeros((bs, seq, 3), device=device)
                         obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
                     

@@ -9,7 +9,7 @@
 │   └── imu.yaml               # IMU到全身姿态的配置
 ├── dataloader/                # 数据加载
 │   └── dataloader.py          # 数据集和数据加载器实现
-├── diffusion_stage/           # Diffusion模型实现
+├── models/           # Diffusion模型实现
 │   ├── do_train_imu.py        # IMU训练过程
 │   ├── parser_util.py         # 配置解析工具
 │   └── wrap_model.py          # Diffusion模型封装

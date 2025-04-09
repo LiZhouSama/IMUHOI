@@ -1,0 +1,55 @@
+# TransPose模型训练配置文件
+
+# 基本配置
+model_name: "TransPose_IMU_v1"
+model_type: "TransPose"  # 模型类型：使用TransPose
+gpus: [0]  # 使用的GPU编号
+save_dir: "outputs/TransPose"  # 模型保存路径
+use_wandb: True  # 是否使用wandb记录训练过程
+# pretrained_checkpoint: "checkpoints/TransPose/epoch_50_best.pt"  # 预训练模型路径，如果需要从现有模型继续训练，取消注释并设置路径
+
+# 训练超参数
+epoch: 200  # 训练轮数
+batch_size: 256  # 批大小
+lr: 0.0005  # 学习率
+weight_decay: 0.0001  # 权重衰减
+milestones: [40, 80, 120, 160]  # 学习率调整节点
+gamma: 0.1  # 学习率衰减系数
+seed: 42  # 随机种子
+num_workers: 12  # 数据加载线程数
+hidden_dim_multiplier: 4  # 隐藏层维度乘数
+
+# 特征维度配置
+num_human_imus: 6  # 人体IMU数量
+imu_dim: 9  # 每个IMU的特征维度（加速度向量3维 + 6D旋转表示6维）
+num_joints: 24  # SMPL模型关节数量
+joint_dim: 6  # 使用6D旋转表示
+
+# 损失权重配置
+loss_weights:
+  rot: 1.0  # 姿态损失权重
+  root_pos: 0.1  # 根节点位置损失权重
+  obj_trans: 0.1  # 物体位置损失权重
+  obj_rot: 0.1  # 物体旋转损失权重
+
+# 训练窗口配置
+train:
+  window: 60  # 训练时使用的时间窗口长度
+  window_stride: 30  # 训练时窗口步长
+  normalize: True  # 是否归一化数据
+  data_path: "processed_data_0408/train"  # 训练数据路径
+  debug_data_path: "processed_data_0408/debug"  # 调试数据路径
+
+# 测试窗口配置
+test:
+  window: 60  # 测试时使用的时间窗口长度
+  window_stride: 60  # 测试时窗口步长
+  normalize: True  # 是否归一化数据
+  data_path: "processed_data_0408/test"  # 测试数据路径
+
+# 数据增强配置
+augmentation:
+  use_augmentation: True  # 是否使用数据增强
+  rotation_augmentation: True  # 是否使用旋转增强
+  noise_augmentation: True  # 是否使用噪声增强
+  noise_std: 0.01  # 噪声标准差 
