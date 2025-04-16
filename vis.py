@@ -19,19 +19,22 @@ from easydict import EasyDict as edict
 # from torch.utils.data import DataLoader # 不再需要
 # from dataloader.dataloader import IMUDataset # 不再需要，因为我们在本地处理
 
-# Import the correct model
+# 导入所有需要的模型
 from models.DiT_model import MotionDiffusion
+# 添加对 TransPose 模型的支持
+from models.do_train_imu_TransPose import load_transpose_model
+from models.do_train_imu_TransPose_humanOnly import load_transpose_model_humanOnly
 
 # 加载配置
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-config = load_config('configs/vis.yaml')
+vis_config = load_config('configs/vis.yaml')
 
 # 加载SMPLH模型
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-body_model = BodyModel(bm_fname=config.get('bm_path', 'body_models/smplh/neutral/model.npz'), 
+body_model = BodyModel(bm_fname=vis_config.get('bm_path', 'body_models/smplh/neutral/model.npz'), 
                        num_betas=16, model_type='smplh').to(device)
 
 # --- 定义 Z-up 到 Y-up 的旋转矩阵 ---
@@ -49,59 +52,12 @@ def find_pt_files(directory):
                 pt_files.append(os.path.join(root, file))
     return pt_files
 
-# --- 从 dataloader.py 复制的 IMU 归一化函数 ---
-def _imu_TN(imu_data):
-    """
-    对第一帧进行归一化 - 所有IMU数据相对于第一帧
-    
-    Args:
-        imu_data: IMU数据 [T, num_imus, 12]，包含加速度(3维)和方向矩阵(9维)，对于物体时，num_imus=1
-        
-    Returns:
-        norm_imu: 归一化的IMU数据 [T, num_imus, 12]
-    """
-    if imu_data is None or imu_data.nelement() == 0:
-        return imu_data # 如果输入为空则返回
-    
-    # 分离加速度和方向
-    accel = imu_data[..., :3]  # [T, num_imus, 3]
-    orient_flat = imu_data[..., 3:]  # [T, num_imus, 9]
-    
-    T, num_imus, _ = accel.shape
-    
-    # 对加速度第一帧进行归一化
-    norm_accel = accel - accel[0:1]  # 减去第一帧 [T, num_imus, 3]
-    
-    # 对方向进行归一化 - 需要将展平的旋转矩阵重新构建为矩阵形式
-    # 然后应用相对旋转计算
-    norm_orient_flat = torch.zeros_like(orient_flat)  # [T, num_imus, 9]
-    
-    # 遍历每个IMU传感器
-    for i in range(num_imus):
-        # 重新构建旋转矩阵
-        orient_matrices = orient_flat[:, i, :].reshape(T, 3, 3)  # [T, 3, 3]
-        
-        # 获取第一帧的旋转矩阵并计算其逆
-        first_orient = orient_matrices[0]  # [3, 3]
-        first_orient_inv = torch.inverse(first_orient)  # [3, 3]
-        
-        # 计算每一帧相对于第一帧的旋转
-        rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), orient_matrices)  # [T, 3, 3]
-        
-        # 将结果重新展平
-        norm_orient_flat[:, i, :] = rel_rotations.reshape(T, 9)  # [T, 9]
-    
-    # 重新组合IMU数据
-    norm_imu = torch.cat([norm_accel, norm_orient_flat], dim=-1)  # [T, num_imus, 12]
-    
-    return norm_imu
-
 def process_loaded_data(seq_data, normalize=True):
     """
     处理从 .pt 文件直接加载的原始数据，模拟 DataLoader 的行为。
     Args:
         seq_data: 从 torch.load() 加载的原始字典。
-        normalize: 是否对 IMU 数据进行归一化。 (注意：归一化逻辑可能需要调整，因为方向的归一化与角速度不同)
+        normalize: 是否对 IMU 数据进行归一化。 
     Returns:
         处理后的数据字典。
     """
@@ -114,13 +70,14 @@ def process_loaded_data(seq_data, normalize=True):
     # 提取基本数据
     processed["root_pos"] = seq_data.get("position_global_full_gt_world", torch.zeros(seq_len, 1, 3))[:, 0, :] # [T, 3]
     processed["motion"] = seq_data.get("rotation_local_full_gt_list", torch.zeros(seq_len, 132)) # [T, 132]
+    processed["head_global_trans"] = seq_data["head_global_trans"] # [T, 4, 4]
 
     # 提取和组合人体 IMU
     human_imu = None
     if "imu_global_full_gt" in seq_data:
-        human_imu_acc = seq_data["imu_global_full_gt"].get("accelerations", torch.zeros(seq_len, 6, 3))
+        human_imu_acc = seq_data["imu_global_full_gt"].get("accelerations", None)
         # 修改：读取方向而不是角速度
-        human_imu_ori = seq_data["imu_global_full_gt"].get("orientations", torch.zeros(seq_len, 6, 3, 3))
+        human_imu_ori = seq_data["imu_global_full_gt"].get("orientations", None)
         # 将方向矩阵展平为 9D 向量
         human_imu_ori_flat = human_imu_ori.reshape(seq_len, -1, 9) # [T, num_imus, 9]
         # 将加速度 (3D) 和展平的方向 (9D) 拼接
@@ -129,8 +86,7 @@ def process_loaded_data(seq_data, normalize=True):
         num_imus = 6 # 假设默认 6 个 IMU
         # 修改：调整默认形状以匹配 acc (3) + ori_flat (9) = 12
         human_imu = torch.zeros(seq_len, num_imus, 12)
-    processed["human_imu"] = human_imu # 添加到处理后的字典中
-
+    
     # 处理物体数据
     has_object = "obj_trans" in seq_data and seq_data["obj_trans"] is not None
     processed["has_object"] = has_object
@@ -143,39 +99,94 @@ def process_loaded_data(seq_data, normalize=True):
         obj_rot = seq_data.get("obj_rot", None)
 
         if "obj_imu" in seq_data:
-            obj_imu_acc = seq_data["obj_imu"].get("accelerations", torch.zeros(seq_len, 1, 3))
-            # 修改：读取方向而不是角速度
-            obj_imu_ori = seq_data["obj_imu"].get("orientations", torch.zeros(seq_len, 1, 3, 3))
-            # 将方向矩阵展平为 9D 向量
-            obj_imu_ori_flat = obj_imu_ori.reshape(seq_len, 1, 9) # [T, 1, 9]
-            # 将加速度 (3D) 和展平的方向 (9D) 拼接
-            obj_imu = torch.cat([obj_imu_acc, obj_imu_ori_flat], dim=-1) # [T, 1, 12]
+            obj_imu_acc = seq_data["obj_imu"].get("accelerations", None)
+            # 获取物体IMU方向 - 应该是6D表示
+            obj_imu_ori = seq_data["obj_imu"].get("orientations", None)
+            obj_imu_ori_flat = obj_imu_ori.reshape(seq_len, -1, 9) # [T, num_imus, 9]
+            # 将加速度 (3D) 和 6D旋转表示 拼接
+            obj_imu = torch.cat([obj_imu_acc, obj_imu_ori_flat], dim=-1) # [T, num_imus, 12]
         else:
-            # 修改：调整默认形状以匹配 acc (3) + ori_flat (9) = 12
-            obj_imu = torch.zeros(seq_len, 1, 12)
+            # 修改：调整默认形状以匹配 acc (3) + ori (6) = 9
+            obj_imu = torch.zeros(seq_len, 1, 9)
 
-    processed["obj_imu"] = obj_imu
-    processed["obj_scale"] = obj_scale
-    processed["obj_trans"] = obj_trans
-    processed["obj_rot"] = obj_rot
-    processed["obj_name"] = seq_data.get("obj_name", "unknown")
-    processed["gender"] = seq_data.get("gender", "neutral") # 或其他默认值
-
-    # 注意：归一化逻辑（如果 normalize=True）可能需要更新
-    # 之前的归一化可能假设了6D IMU 数据结构
+    # 注意：归一化逻辑
     if normalize:
-        processed["human_imu"] = _imu_TN(human_imu).float()
-        processed["obj_imu"] = _imu_TN(obj_imu).float()
+        # 对人体IMU归一化 - 现在已经是9D数据(加速度3D + 旋转6D)
+        if human_imu is not None:
+            T, num_imus, _ = human_imu.shape
+            # 分离加速度和旋转
+            human_acc = human_imu[..., :3]  # [T, num_imus, 3]
+            human_ori = human_imu[..., 3:12].reshape(T, -1, 3, 3)  # [T, num_imus, 3, 3]
+            
+            # 对加速度归一化 - 减去第一帧
+            norm_human_acc = human_acc - human_acc[0:1]
+            
+            # 对于6D旋转表示，归一化方法需要先转换回矩阵，然后应用相对旋转
+            norm_human_ori = torch.zeros(T, num_imus, 6)
+            
+            for i in range(num_imus):
+                # 将6D转换为旋转矩阵
+                human_ori_mat = human_ori[:, i]  # [T, 3, 3]
+                
+                # 获取第一帧的旋转矩阵并计算其逆
+                first_orient = human_ori_mat[0]  # [3, 3]
+                first_orient_inv = torch.inverse(first_orient)  # [3, 3]
+                
+                # 计算相对旋转
+                rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), human_ori_mat)  # [T, 3, 3]
+                
+                # 转回6D表示
+                rel_rotations_6d = transforms.matrix_to_rotation_6d(rel_rotations)  # [T, 6]
+                norm_human_ori[:, i] = rel_rotations_6d
+            
+            # 重新组合IMU数据
+            processed_human_imu = torch.cat([norm_human_acc, norm_human_ori], dim=-1)  # [T, num_imus, 9]
+        else:
+            processed_human_imu = None
+            
+        # 对物体IMU做相同处理    
+        if obj_imu is not None and has_object:
+            # 分离加速度和旋转
+            obj_acc = obj_imu[..., :3]  # [T, 1, 3]
+            obj_ori = obj_imu[..., 3:12]  # [T, 1, 9]
+            
+            # 对加速度归一化
+            norm_obj_acc = obj_acc - obj_acc[0:1]
+            
+            # 对旋转归一化
+            T = obj_acc.shape[0]
+            obj_ori_mat = obj_ori.reshape(T, 3, 3)
+            first_orient = obj_ori_mat[0]  # [3, 3]
+            first_orient_inv = torch.inverse(first_orient)  # [3, 3]
+            rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), obj_ori_mat)  # [T, 3, 3]
+            rel_rotations_6d = transforms.matrix_to_rotation_6d(rel_rotations)  # [T, 6]
+            
+            # 重新组合
+            processed_obj_imu = torch.cat([norm_obj_acc, rel_rotations_6d.reshape(T, 1, 6)], dim=-1)  # [T, 1, 9]
+        else:
+            processed_obj_imu = None
     else:
-        processed["human_imu"] = human_imu.float()
-        processed["obj_imu"] = obj_imu.float()
-
-    # 转换其他字段为 float
+        processed_human_imu = human_imu.float() if human_imu is not None else None
+        processed_obj_imu = obj_imu.float() if obj_imu is not None else None
+    
+    processed["human_imu"] = processed_human_imu
     processed["root_pos"] = processed["root_pos"].float()
     processed["motion"] = processed["motion"].float()
-    processed["obj_trans"] = processed["obj_trans"].float()
-    processed["obj_rot"] = processed["obj_rot"].float()
-    processed["obj_scale"] = processed["obj_scale"].float() # 确保 scale 也是 float
+
+    if has_object:
+        processed["obj_imu"] = processed_obj_imu
+        processed["obj_scale"] = obj_scale
+        processed["obj_trans"] = obj_trans
+        processed["obj_rot"] = obj_rot
+        processed["obj_name"] = seq_data.get("obj_name", "unknown")
+        processed["gender"] = seq_data.get("gender", "neutral") # 或其他默认值
+        # 转换其他字段为 float
+        if processed["obj_trans"] is not None:
+            processed["obj_trans"] = processed["obj_trans"].float()
+        if processed["obj_rot"] is not None:
+            processed["obj_rot"] = processed["obj_rot"].float()
+        if processed["obj_scale"] is not None:
+            processed["obj_scale"] = processed["obj_scale"].float() # 确保 scale 也是 float
 
     return processed
 
@@ -348,7 +359,7 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
     return obj_mesh_verts, obj_mesh_faces
 
 # --- 修改 visualize_human_and_objects 以使用新的 scale/trans 逻辑 ---
-def visualize_human_and_objects(model, data, show_objects=True):
+def visualize_human_and_objects(args, model, data, show_objects=True):
     """
     可视化人体和物体的真值和预测值
     
@@ -400,32 +411,37 @@ def visualize_human_and_objects(model, data, show_objects=True):
         try:
             # --- 准备模型输入 (现在使用处理后的 'data' 字典) ---
             # 应该使用 process_loaded_data 返回的规范化 IMU 数据
-            human_imu_input = data['human_imu'][0].to(device)  # [T, num_imus, 6]
-            obj_imu_input = data['obj_imu'][0].to(device)      # [T, 1, 6]
-
-            # 检查并确保维度符合模型预期: [bs, seq, num_imus, 6] 和 [bs, seq, 1, 6]
-            if human_imu_input.dim() == 3: # 已经是 [T, num_imus, 6]
-                human_imu_input = human_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, num_imus, 6]
-            elif human_imu_input.dim() == 4: # 已经是 [1, T, num_imus, 6]
+            human_imu_input = data['human_imu'][0].to(device)  # [T, num_imus, 9]
+            # 检查并确保维度符合模型预期: [bs, seq, num_imus, 9] 和 [bs, seq, 1, 9]
+            if human_imu_input.dim() == 3: # 已经是 [T, num_imus, 9]
+                human_imu_input = human_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, num_imus, 9]
+            elif human_imu_input.dim() == 4: # 已经是 [1, T, num_imus, 9]
                  pass # 维度正确
             else:
                  print(f"警告：human_imu 输入维度不正确: {human_imu_input.shape}")
                  # 尝试修正或跳过预测
                  raise ValueError("human_imu 维度错误")
 
-            if obj_imu_input.dim() == 3: # 已经是 [T, 1, 6]
-                 obj_imu_input = obj_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, 1, 6]
-            elif obj_imu_input.dim() == 4: # 已经是 [1, T, 1, 6]
-                 pass # 维度正确
-            else:
-                 print(f"警告：obj_imu 输入维度不正确: {obj_imu_input.shape}")
-                 # 尝试修正或跳过预测
-                 raise ValueError("obj_imu 维度错误")
+            if data.get('has_object', [False])[0]:
+                obj_imu_input = data['obj_imu'][0].to(device)      # [T, 1, 9]
+                if obj_imu_input.dim() == 3: # 已经是 [T, 1, 9]
+                 obj_imu_input = obj_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, 1, 9]
+                elif obj_imu_input.dim() == 4: # 已经是 [1, T, 1, 9]
+                    pass # 维度正确
+                else:
+                    print(f"警告：obj_imu 输入维度不正确: {obj_imu_input.shape}")
+                    # 尝试修正或跳过预测
+                    raise ValueError("obj_imu 维度错误")
 
-            model_input = {
-                "human_imu": human_imu_input,
-                "obj_imu": obj_imu_input
-            }
+            if args.use_transpose_humanOnly_model:
+                model_input = {
+                    "human_imu": human_imu_input
+                }
+            else:
+                model_input = {
+                    "human_imu": human_imu_input,
+                    "obj_imu": obj_imu_input
+                }
             
             # 如果有BPS特征，添加到输入中 (当前省略 BPS 处理)
             # if 'bps_features' in data:
@@ -434,11 +450,22 @@ def visualize_human_and_objects(model, data, show_objects=True):
 
             # 运行模型推理
             with torch.no_grad():
-                pred_dict = model.diffusion_reverse(model_input) # Get dict output
+                # 检查模型类型并进行相应的推理
+                if hasattr(model, 'diffusion_reverse'):
+                    # DiT 模型使用 diffusion_reverse 方法
+                    pred_dict = model.diffusion_reverse(model_input)
+                else:
+                    # TransPose 模型直接前向传播
+                    pred_dict = model(model_input)
             
             # --- (提取预测结果 - 这部分逻辑不变) ---
             pred_motion = pred_dict.get("motion", None)        # [1, T, 132]
-            pred_obj_rot = pred_dict.get("obj_rot", None)      # [1, T, 3, 3]
+            pred_root_pos = pred_dict.get("root_pos", None)    # [1, T, 3]
+            pred_obj_trans = pred_dict.get("obj_trans", None)  # [T, 3]
+            if pred_obj_trans is not None:
+                pred_obj_trans = pred_obj_trans.squeeze(0).unsqueeze(-1).cpu().numpy()  # [T, 3]
+            pred_obj_rot = pred_dict.get("obj_rot", None)      # [1, T, 6] 或 [1, T, 3, 3]
+
             # --- 结束提取 ---
 
             if pred_motion is None:
@@ -446,12 +473,24 @@ def visualize_human_and_objects(model, data, show_objects=True):
             else:
                 pred_motion = pred_motion.squeeze(0).cpu() # [T, 132]
                 if pred_obj_rot is not None:
-                    pred_obj_rot = pred_obj_rot.squeeze(0).cpu() # [T, 3, 3]
+                    pred_obj_rot = pred_obj_rot.squeeze(0).cpu() # [T, 6] 或 [T, 3, 3]
+                    
+                    # 如果 obj_rot 是 6D 表示，转换为旋转矩阵
+                    if pred_obj_rot.shape[-1] == 6:
+                        pred_obj_rot = transforms.rotation_6d_to_matrix(pred_obj_rot)
 
                 pred_rot_matrices = transforms.rotation_6d_to_matrix(pred_motion.reshape(-1, 22, 6))  # [T, 22, 3, 3]
                 pred_root_orient_mat = pred_rot_matrices[:, 0, :, :].to(device)
                 pred_pose_body_mat = pred_rot_matrices[:, 1:, :, :].reshape(-1, 21, 3, 3).to(device)
+
+                head_global_trans_start = data['head_global_trans'][0, 0].to(device) # [4, 4]
+                head_global_rot_start = head_global_trans_start[:3, :3]
+                head_global_pos_start = head_global_trans_start[:3, 3]
+
+                pred_root_pos = pred_root_pos + head_global_pos_start if pred_root_pos is not None else gt_root_pos
+                pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat
                 pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat) # [T, 3]
+                # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(pred_motion.shape[0], -1) # [T, 3]
                 pred_pose_body_axis = transforms.matrix_to_axis_angle(pred_pose_body_mat.reshape(-1, 3, 3)).reshape(pred_motion.shape[0], -1) # [T, 63]
 
                 # --- DEBUG WATCH BEGIN ---
@@ -468,7 +507,7 @@ def visualize_human_and_objects(model, data, show_objects=True):
                 pred_smplh_input = {
                     'root_orient': pred_root_orient_axis,
                     'pose_body': pred_pose_body_axis,
-                    'trans': gt_root_pos.to(device)  # 使用真值的 root_pos
+                    'trans': pred_root_pos.squeeze(0).to(device)  # 使用真值的 root_pos
                 }
                 body_pose_pred = body_model(**pred_smplh_input)
                 verts_pred = body_pose_pred.v.detach().cpu()
@@ -499,10 +538,10 @@ def visualize_human_and_objects(model, data, show_objects=True):
     # 如果有预测结果，添加到场景
     if has_pred and verts_pred is not None:
         # 添加预测的人体网格 (偏移, Y轴朝上)
-        verts_pred_shifted = verts_pred + torch.tensor([1.0, 0, 0])
-        verts_pred_shifted_yup = torch.matmul(verts_pred_shifted, R_yup.T.cpu())
+        # verts_pred_shifted = verts_pred + torch.tensor([1.0, 0, 0])
+        verts_pred_yup = torch.matmul(verts_pred, R_yup.T.cpu())
         body_mesh = Meshes(
-                    verts_pred_shifted_yup.numpy(),
+                    verts_pred_yup.numpy(),
                     faces_gt, # 使用 GT 的 faces
                     is_selectable=False,
                     gui_affine=False,
@@ -556,8 +595,8 @@ def visualize_human_and_objects(model, data, show_objects=True):
             # 使用 GT trans (未缩放), GT scale, Pred rot
             pred_obj_verts, _ = load_object_geometry(
                 obj_name,
-                pred_obj_rot.numpy(), # 使用预测的旋转
-                gt_obj_trans,         # 使用GT平移 (未缩放)
+                gt_obj_rot, # 使用真值的旋转
+                pred_obj_trans,         # 使用GT平移 (未缩放)
                 obj_scale=gt_obj_scale, # 传递 GT scale
                 obj_bottom_trans=gt_obj_bottom_trans_np,
                 obj_bottom_rot=gt_obj_bottom_rot_np
@@ -565,10 +604,10 @@ def visualize_human_and_objects(model, data, show_objects=True):
             
             # --- 添加预测物体网格 (应用偏移和 Y-up) ---
             if pred_obj_verts.numel() > 3:
-                pred_obj_verts_shifted = pred_obj_verts + torch.tensor([1.0, 0, 0])
-                pred_obj_verts_shifted_yup = torch.matmul(pred_obj_verts_shifted.cpu(), R_yup.T.cpu())
+                # pred_obj_verts_shifted = pred_obj_verts + torch.tensor([1.0, 0, 0])
+                pred_obj_verts_yup = torch.matmul(pred_obj_verts.cpu(), R_yup.T.cpu())
                 pred_obj_mesh = Meshes(
-                    pred_obj_verts_shifted_yup.numpy(),
+                    pred_obj_verts_yup.numpy(),
                     obj_faces,
                     is_selectable=False,
                     gui_affine=False,
@@ -582,23 +621,29 @@ def visualize_human_and_objects(model, data, show_objects=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="人体与物体姿态可视化工具")
-    parser.add_argument('--seq_path', type=str, default=None, 
+    parser.add_argument('--seq_path', type=str, default='processed_data_0408/test/0.pt',    # processed_data_0415/test/seq_8500.pt
                         help='序列文件路径，如果不指定则从测试目录随机选择')
     parser.add_argument('--model_path', type=str, default=None,
                         help='模型路径，默认使用config中设置的路径')
     parser.add_argument('--no_objects', action='store_true', 
                         help='不显示物体')
+    parser.add_argument('--use_transpose_model', action='store_true', 
+                        help='使用TransPose模型类型')
+    parser.add_argument('--use_transpose_humanOnly_model', action='store_true', 
+                        help='使用TransPose人体姿态模型类型')
+    parser.add_argument('--use_diffusion_model', action='store_true', 
+                        help='使用Diffusion模型类型')
     # Add argument for the diffusion config to load the model correctly
-    parser.add_argument('--diffusion_config', type=str, default='configs/diffusion_0403.yaml',
-                        help='Diffusion模型配置文件路径')
+    parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml',
+                        help='模型配置文件路径')
     args = parser.parse_args()
     
-    # 加载 diffusion 配置
+    # 加载配置
     try:
-        diffusion_cfg_data = load_config(args.diffusion_config)
-        diffusion_cfg = edict(diffusion_cfg_data)
+        config_data = load_config(args.config)
+        config = edict(config_data)
     except Exception as e:
-        print(f"错误：无法加载 diffusion 配置文件 {args.diffusion_config}: {e}")
+        print(f"错误：无法加载配置文件 {args.config}: {e}")
         exit()
 
     # --- 数据加载和处理 ---
@@ -609,30 +654,30 @@ if __name__ == "__main__":
         try:
             raw_data = torch.load(seq_path)
             # --- 处理数据 (现在 process_loaded_data 分离了 scale 和 trans) ---
-            processed_data = process_loaded_data(raw_data, normalize=diffusion_cfg.test.normalize)
+            processed_data = process_loaded_data(raw_data, normalize=config.test.normalize)
             if not processed_data:
                  print("错误：处理加载的数据失败。")
                  exit()
                  
-            # --- 添加序列截断逻辑 ---
-            # 获取配置中的目标序列长度
-            target_length = diffusion_cfg.test.window
-            print(f"将序列截断到长度: {target_length}")
+            # # --- 添加序列截断逻辑 ---
+            # # 获取配置中的目标序列长度
+            # target_length = config.test.window
+            # print(f"将序列截断到长度: {target_length}")
             
-            # 获取当前序列长度
-            current_length = processed_data["motion"].shape[0]
+            # # 获取当前序列长度
+            # current_length = processed_data["motion"].shape[0]
             
-            # 如果当前序列长度超过目标长度，则截断所有相关数据
-            if current_length > target_length:
-                for key in processed_data:
-                    if isinstance(processed_data[key], torch.Tensor) and processed_data[key].dim() >= 1:
-                        # 沿着第一个维度（时间维度）截断
-                        processed_data[key] = processed_data[key][:target_length]
-                print(f"序列已从 {current_length} 帧截断到 {target_length} 帧")
-            elif current_length < target_length:
-                print(f"警告: 序列长度 ({current_length}) 小于窗长 ({target_length})，程序退出")
-                exit()
-            # --- 结束序列截断逻辑 ---
+            # # 如果当前序列长度超过目标长度，则截断所有相关数据
+            # if current_length > target_length:
+            #     for key in processed_data:
+            #         if isinstance(processed_data[key], torch.Tensor) and processed_data[key].dim() >= 1:
+            #             # 沿着第一个维度（时间维度）截断
+            #             processed_data[key] = processed_data[key][:target_length]
+            #     print(f"序列已从 {current_length} 帧截断到 {target_length} 帧")
+            # elif current_length < target_length:
+            #     print(f"警告: 序列长度 ({current_length}) 小于窗长 ({target_length})，程序退出")
+            #     exit()
+            # # --- 结束序列截断逻辑 ---
 
             # 转换为批次格式 (添加批次维度)
             batch_data = {}
@@ -662,26 +707,39 @@ if __name__ == "__main__":
 
     model = None
     model_path = args.model_path
-    if model_path is None and 'model_path' in diffusion_cfg: # 否则尝试从配置中获取
-        model_path = diffusion_cfg.model_path
+    if model_path is None and 'model_path' in config: # 否则尝试从配置中获取
+        model_path = config.model_path
 
     if model_path: # 只有在确定了 model_path 后才加载
         try:
             # 使用截断后的序列长度初始化模型
             seq_len = data['human_imu'].shape[1]
             
-            # Instantiate the DiT model
-            model = MotionDiffusion(diffusion_cfg, input_length=seq_len, imu_input=True)
+            # 检查模型类型并加载相应的模型
+            if args.use_transpose_model:
+                # 加载 TransPose 模型
+                print(f"Loading TransPose model from: {model_path}")
+                model = load_transpose_model(config, model_path)
+                model = model.to(device)
+            elif args.use_transpose_humanOnly_model:
+                # 加载 TransPose 模型
+                print(f"Loading TransPose model from: {model_path}")
+                model = load_transpose_model_humanOnly(config, model_path)
+                model = model.to(device)
+            elif args.use_diffusion_model:
+                # 加载 DiT 模型
+                print(f"Loading DiT model from: {model_path}")
+                model = MotionDiffusion(config, input_length=seq_len, imu_input=True)
+                
+                # 加载预训练权重
+                checkpoint = torch.load(model_path, map_location=device)
+                
+                state_dict = checkpoint['model_state_dict']
+                if list(state_dict.keys())[0].startswith('module.'):
+                    state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+                model.load_state_dict(state_dict)
+                model = model.to(device)
             
-            # 加载预训练权重
-            print(f"Loading checkpoint from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            state_dict = checkpoint['model_state_dict']
-            if list(state_dict.keys())[0].startswith('module.'):
-                state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-            model.load_state_dict(state_dict)
-            model = model.to(device)
             model.eval()
             print(f"成功加载模型: {model_path}")
         except Exception as e:
@@ -692,5 +750,5 @@ if __name__ == "__main__":
     else:
         print("未提供模型路径，将仅显示真值数据。")
 
-    # 传递 diffusion_cfg 给可视化函数
-    visualize_human_and_objects(model, data, not args.no_objects) 
+    # 传递配置给可视化函数
+    visualize_human_and_objects(args, model, data, not args.no_objects) 

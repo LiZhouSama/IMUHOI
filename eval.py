@@ -8,6 +8,7 @@ from dataloader.dataloader import IMUDataset
 from easydict import EasyDict as edict
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
+import argparse
 
 def load_config(config_path):
     """加载配置文件"""
@@ -25,10 +26,19 @@ def load_smpl_model(smpl_model_path, device):
     return smpl_model
 
 def load_model(model_path, config, device):
-    """加载训练好的 Diffusion 模型"""
-    input_length = config['train']['window'] if 'window' in config['train'] else config['test']['window']
+    """加载训练好的模型"""
+    input_length = config.test.get('window', config.train.get('window', 60))
 
-    if config.get('model', {}).get('use_dit_model', True):
+    # 检查模型类型并加载
+    if config.get('use_transpose_model', False):
+        print("Loading TransPose model...")
+        from models.do_train_imu_TransPose import load_transpose_model
+        model = load_transpose_model(config, model_path)
+    elif config.get('use_transpose_humanOnly_model', False):
+        print("Loading TransPose HumanOnly model...")
+        from models.do_train_imu_TransPose_humanOnly import load_transpose_model_humanOnly
+        model = load_transpose_model_humanOnly(config, model_path)
+    elif config.model.get('use_dit_model', True):
         print("Loading DiT_model...")
         model = MotionDiffusion(config, input_length=input_length).to(device)
     else:
@@ -36,188 +46,341 @@ def load_model(model_path, config, device):
         from models.wrap_model import MotionDiffusion as WrapMotionDiffusion
         model = WrapMotionDiffusion(config, input_length=input_length).to(device)
 
-    checkpoint = torch.load(model_path, map_location=device)
-    state_dict = checkpoint['model_state_dict']
-    if list(state_dict.keys())[0].startswith('module.'):
-        state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+    # 如果模型不是通过特定加载函数（如 load_transpose_model）加载的，则加载 state_dict
+    if not (config.get('use_transpose_model', False) or config.get('use_transpose_humanOnly_model', False)):
+        if os.path.exists(model_path):
+            checkpoint = torch.load(model_path, map_location=device)
+            # Handle potential keys like 'model_state_dict' or 'model'
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
+            # Remove 'module.' prefix if saved with DataParallel
+            if list(state_dict.keys())[0].startswith('module.'):
+                state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
+        else:
+             print(f"Warning: Model checkpoint not found at {model_path}. Model weights not loaded.")
+
     model.eval()
+    model.to(device)
     return model
 
-def compute_frobenius_norm(mat1, mat2):
-    """计算两个旋转矩阵批次之间的平均 Frobenius 范数"""
-    diff_norm = torch.linalg.norm(mat1 - mat2, ord='fro', dim=(-2, -1))
-    mask = ~torch.isnan(diff_norm)
-    if mask.sum() == 0:
-      return float('nan')
-    return diff_norm[mask].mean()
-
-def evaluate_model(model, smpl_model, data_loader, device):
-    """评估模型性能，计算 MPJPE, MPJRE, Object Error, Jitter (适配 SMPLH)"""
+def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True):
+    """评估模型性能，计算 MPJPE, MPJRE (角度), Object Error, Jitter (适配 SMPLH)"""
     metrics = {
-        'mpjpe': [], 'mpjre_rot': [],
-        'obj_trans_err': [], 'obj_rot_err': [], 'jitter': []
+        'mpjpe': [], 'mpjre_angle': [],
+        'obj_trans_err': [], 'obj_rot_angle': [], 'jitter': []
     }
     num_batches = 0
     num_eval_joints = 22
+    num_body_joints = 21
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(data_loader):
+            # --- Ground Truth Data ---
             gt_root_pos = batch["root_pos"].to(device)
             gt_motion = batch["motion"].to(device)
             gt_human_imu = batch["human_imu"].to(device)
-            gt_obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None
-            gt_obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None
-            gt_obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None
+            # Add check for head_global_trans - crucial for denormalization
+            if "head_global_trans_start" not in batch:
+                 print(f"Warning: Batch {batch_idx} missing 'head_global_trans_start'. Skipping batch.")
+                 continue
+            gt_head_trans_start = batch["head_global_trans_start"].to(device)
+
+            gt_obj_imu = batch.get("obj_imu", None)
+            gt_obj_trans = batch.get("obj_trans", None)
+            gt_obj_rot_6d = batch.get("obj_rot", None)
+
+            if gt_obj_imu is not None: gt_obj_imu = gt_obj_imu.to(device)
+            if gt_obj_trans is not None: gt_obj_trans = gt_obj_trans.to(device)
+            if gt_obj_rot_6d is not None: gt_obj_rot_6d = gt_obj_rot_6d.to(device)
 
             bs, seq_len, motion_dim = gt_motion.shape
-
             if motion_dim != 132:
                  print(f"Warning: Batch {batch_idx}: Expected motion dimension 132 for SMPLH (22*6D), got {motion_dim}. Skipping batch.")
                  continue
 
-            has_object = gt_obj_imu is not None
-            if not has_object:
-                bs, seq_len = gt_human_imu.shape[:2]
-                gt_obj_imu = torch.zeros((bs, seq_len, 1, 12), device=device)  # 注意：现在是12D
+            # Determine if the batch contains object data
+            has_object = gt_obj_imu is not None and gt_obj_trans is not None and gt_obj_rot_6d is not None
 
-            data_dict = {
-                "human_imu": gt_human_imu,
-                "obj_imu": gt_obj_imu
-            }
+            # Prepare dummy object IMU if needed by the model but not present in GT
+            if not has_object and (model.imu_obj_dim > 0 if hasattr(model, 'imu_obj_dim') else True):
+                obj_imu_input = torch.zeros((bs, seq_len, 1, 9), device=device)
+            elif has_object:
+                obj_imu_input = gt_obj_imu
+            else:
+                obj_imu_input = None
 
-            pred_dict = model.diffusion_reverse(data_dict)
-            # pred_root_pos = pred_dict["root_pos"]
-            pred_motion = pred_dict["motion"]
-            # pred_obj_trans = pred_dict["obj_trans"]
-            pred_obj_rot = pred_dict["obj_rot"]
+            # --- Model Prediction ---
+            # Prepare input dictionary
+            model_input = {"human_imu": gt_human_imu}
+            if obj_imu_input is not None:
+                model_input["obj_imu"] = obj_imu_input
 
-            pred_root_orient_6d = pred_motion[:, :, :6].reshape(bs * seq_len, 6)
-            pred_body_pose_6d = pred_motion[:, :, 6:].reshape(bs * seq_len, 21, 6)
+            try:
+                if hasattr(model, 'diffusion_reverse'):
+                    pred_dict = model.diffusion_reverse(model_input)
+                else:
+                    pred_dict = model(model_input)
+            except Exception as e:
+                 print(f"Error during model inference in batch {batch_idx}: {e}")
+                 continue
+
+            # --- Extract Predictions (Normalized) ---
+            pred_root_pos_norm = pred_dict.get("root_pos", None)
+            pred_motion_norm = pred_dict.get("motion", None)
+            pred_obj_trans_norm = pred_dict.get("obj_trans", None)
+            pred_obj_rot_norm = pred_dict.get("obj_rot", None)
+
+            if pred_motion_norm is None:
+                print(f"Warning: Batch {batch_idx}: Model did not output 'motion'. Skipping batch.")
+                continue
+            if pred_root_pos_norm is None:
+                 print(f"Warning: Batch {batch_idx}: Model did not output 'root_pos'. Using GT root position for evaluation.")
+
+
+            # --- Denormalize Predictions using First Frame Head Pose ---
+            head_global_rot_start = gt_head_trans_start[..., :3, :3]
+            head_global_pos_start = gt_head_trans_start[..., :3, 3]
+
+            # Denormalize root orientation
+            pred_root_orient_6d_norm = pred_motion_norm[:, :, :6]
+            pred_root_orient_mat_norm = transforms.rotation_6d_to_matrix(pred_root_orient_6d_norm)
+            # pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat_norm
+            # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(bs * seq_len, 3)
+            pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat_norm).reshape(bs * seq_len, 3)
+            
+            # Denormalize root position
+            if pred_root_pos_norm is not None:
+                pred_root_pos_relative_rotated = torch.matmul(head_global_rot_start, pred_root_pos_norm.unsqueeze(-1))
+                pred_transl = pred_root_pos_relative_rotated.squeeze(-1) + head_global_pos_start
+                pred_transl = pred_transl.reshape(bs * seq_len, 3)
+            else:
+                pred_transl = gt_root_pos.reshape(bs*seq_len, 3)
+
+            # Body pose is local, no denormalization needed
+            pred_body_pose_6d = pred_motion_norm[:, :, 6:].reshape(bs * seq_len, 21, 6)
+            pred_body_pose_mat = transforms.rotation_6d_to_matrix(pred_body_pose_6d.reshape(-1, 6)).reshape(bs * seq_len, 21, 3, 3)
+            pred_body_pose_axis = transforms.matrix_to_axis_angle(pred_body_pose_mat.reshape(-1, 3, 3)).reshape(bs * seq_len, 21 * 3)
+
+            # --- Prepare GT for SMPL and Metrics ---
             gt_root_orient_6d = gt_motion[:, :, :6].reshape(bs * seq_len, 6)
             gt_body_pose_6d = gt_motion[:, :, 6:].reshape(bs * seq_len, 21, 6)
-
-            pred_root_orient_mat = transforms.rotation_6d_to_matrix(pred_root_orient_6d)
-            pred_body_pose_mat = transforms.rotation_6d_to_matrix(pred_body_pose_6d.reshape(-1, 6)).reshape(bs * seq_len, 21, 3, 3)
             gt_root_orient_mat = transforms.rotation_6d_to_matrix(gt_root_orient_6d)
             gt_body_pose_mat = transforms.rotation_6d_to_matrix(gt_body_pose_6d.reshape(-1, 6)).reshape(bs * seq_len, 21, 3, 3)
-
-            pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat)
-            pred_body_pose_axis = transforms.matrix_to_axis_angle(pred_body_pose_mat.reshape(-1, 3, 3)).reshape(bs * seq_len, 21 * 3)
             gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat)
             gt_body_pose_axis = transforms.matrix_to_axis_angle(gt_body_pose_mat.reshape(-1, 3, 3)).reshape(bs * seq_len, 21 * 3)
+            gt_transl = gt_root_pos.reshape(bs*seq_len, 3)
 
-            # pred_transl = pred_root_pos.reshape(bs*seq_len, 3)
-            # gt_transl = gt_root_pos.reshape(bs*seq_len, 3)
+            # --- Get SMPL Joints ---
+            pred_pose_body_input = {'root_orient': pred_root_orient_axis, 'pose_body': pred_body_pose_axis, 'trans': pred_transl}
+            gt_pose_body_input = {'root_orient': gt_root_orient_axis, 'pose_body': gt_body_pose_axis, 'trans': gt_transl}
 
-            pred_pose_body_input = {'root_orient': pred_root_orient_axis, 'pose_body': pred_body_pose_axis}
-            gt_pose_body_input = {'root_orient': gt_root_orient_axis, 'pose_body': gt_body_pose_axis}
-
-            pred_smplh_out = smpl_model(**pred_pose_body_input)
-            gt_smplh_out = smpl_model(**gt_pose_body_input)
+            try:
+                pred_smplh_out = smpl_model(**pred_pose_body_input)
+                gt_smplh_out = smpl_model(**gt_pose_body_input)
+            except Exception as e:
+                print(f"Error during SMPL forward pass in batch {batch_idx}: {e}")
+                continue
 
             pred_joints_all = pred_smplh_out.Jtr.view(bs, seq_len, -1, 3)
             gt_joints_all = gt_smplh_out.Jtr.view(bs, seq_len, -1, 3)
 
+            # --- Calculate Metrics ---
+            # Select joints for evaluation (first 22 for SMPLH compatibility with SMPL eval)
             pred_joints_eval = pred_joints_all[:, :, :num_eval_joints, :]
             gt_joints_eval = gt_joints_all[:, :, :num_eval_joints, :]
 
-            pred_joints_rel = pred_joints_eval[:, :, 1:, :] - pred_joints_eval[:, :, 0:1, :]
-            gt_joints_rel = gt_joints_eval[:, :, 1:, :] - gt_joints_eval[:, :, 0:1, :]
-            mpjpe = torch.linalg.norm(pred_joints_rel - gt_joints_rel, dim=-1).mean()
-            metrics['mpjpe'].append(mpjpe.item() * 1000)
+            # MPJPE (Mean Per Joint Position Error - Absolute)
+            # Calculate Euclidean distance between absolute predicted and GT joint positions
+            # Shape of norm: [bs, seq_len, num_eval_joints]
+            joint_distances = torch.linalg.norm(pred_joints_eval - gt_joints_eval, dim=-1)
+            # Mean over batch, sequence length, and joints
+            mpjpe = joint_distances.mean()
+            metrics['mpjpe'].append(mpjpe.item() * 1000) # Convert meters to mm
 
+            # MPJRE (Mean Per Joint Rotation Error - Angle in Degrees)
+            # Reshape matrices for batch processing: [bs, seq, num_body_joints, 3, 3]
             pred_body_pose_mat_rs = pred_body_pose_mat.view(bs, seq_len, 21, 3, 3)
             gt_body_pose_mat_rs = gt_body_pose_mat.view(bs, seq_len, 21, 3, 3)
-            body_joint_rot_err = torch.linalg.norm(pred_body_pose_mat_rs - gt_body_pose_mat_rs, ord='fro', dim=(-2, -1))
-            mpjre_rot = body_joint_rot_err.mean()
-            metrics['mpjre_rot'].append(mpjre_rot.item())
+            # Calculate relative rotation: R_rel = R_gt^T @ R_pred
+            # Transpose gt: [bs, seq, num_body_joints, 3, 3]
+            rel_rot_mat = torch.matmul(gt_body_pose_mat_rs.transpose(-1, -2), pred_body_pose_mat_rs)
+            # Calculate trace: sum of diagonal elements
+            trace = torch.einsum('...ii->...', rel_rot_mat) # Shape: [bs, seq, num_body_joints]
+            # Calculate cos(theta) = (trace - 1) / 2
+            cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0) # Clamp for numerical stability
+            # Calculate angle in radians: theta = arccos(cos_theta)
+            angle_rad = torch.acos(cos_theta)
+            # Convert angle to degrees
+            angle_deg = angle_rad * (180.0 / np.pi)
+            # Calculate the mean angle error over batch, sequence, and joints
+            mpjre_angle = angle_deg.mean()
+            metrics['mpjre_angle'].append(mpjre_angle.item()) # Store mean angle in degrees
 
-            if has_object:
-                # obj_trans_err = torch.linalg.norm(pred_obj_trans - gt_obj_trans, dim=-1).mean()
-                # metrics['obj_trans_err'].append(obj_trans_err.item() * 1000)
+            # Object Metrics (Conditional)
+            if evaluate_objects and has_object:
+                 # Denormalize predicted object pose if needed
+                 if pred_obj_trans_norm is not None and pred_obj_rot_norm is not None:
+                     # Denormalize translation
+                     pred_obj_trans_relative_rotated = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_trans_norm.unsqueeze(-1))
+                     pred_obj_trans = pred_obj_trans_relative_rotated.squeeze(-1) + head_global_pos_start.unsqueeze(1)
 
-                obj_rot_err = compute_frobenius_norm(pred_obj_rot, gt_obj_rot)
-                metrics['obj_rot_err'].append(obj_rot_err.item())
-            else:
-                metrics['obj_trans_err'].append(float('nan'))
-                metrics['obj_rot_err'].append(float('nan'))
+                     # Denormalize rotation
+                     pred_obj_rot_6d_norm = pred_obj_rot_norm
+                     pred_obj_rot_mat_norm = transforms.rotation_6d_to_matrix(pred_obj_rot_6d_norm.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
+                     pred_obj_rot_mat = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_rot_mat_norm)
 
+                     # Calculate Translation Error
+                     obj_trans_err = torch.linalg.norm(pred_obj_trans - gt_obj_trans, dim=-1).mean()
+                     metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert meters to mm
+
+                     # Calculate Rotation Error (Angle in Degrees)
+                     gt_obj_rot_mat = transforms.rotation_6d_to_matrix(gt_obj_rot_6d.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
+                     # R_rel = R_gt^T @ R_pred
+                     obj_rel_rot_mat = torch.matmul(gt_obj_rot_mat.transpose(-1, -2), pred_obj_rot_mat)
+                     obj_trace = torch.einsum('...ii->...', obj_rel_rot_mat) # [bs, seq]
+                     obj_cos_theta = torch.clamp((obj_trace - 1.0) / 2.0, -1.0, 1.0)
+                     obj_angle_rad = torch.acos(obj_cos_theta)
+                     obj_angle_deg = obj_angle_rad * (180.0 / np.pi)
+                     obj_rot_angle_err = obj_angle_deg.mean()
+                     metrics['obj_rot_angle'].append(obj_rot_angle_err.item()) # Store mean angle in degrees
+                 else:
+                     print(f"Warning: Batch {batch_idx}: Missing predicted object pose for error calculation.")
+                     metrics['obj_trans_err'].append(float('nan'))
+                     metrics['obj_rot_angle'].append(float('nan'))
+            elif evaluate_objects and not has_object:
+                 metrics['obj_trans_err'].append(float('nan'))
+                 metrics['obj_rot_angle'].append(float('nan'))
+
+
+            # Jitter (Mean acceleration magnitude of joints)
             if seq_len >= 3:
+                # Use world frame joints for jitter calculation
                 pred_accel = pred_joints_eval[:, 2:] - 2 * pred_joints_eval[:, 1:-1] + pred_joints_eval[:, :-2]
                 jitter = torch.linalg.norm(pred_accel, dim=-1).mean()
-                metrics['jitter'].append(jitter.item() * 1000)
+                metrics['jitter'].append(jitter.item() * 1000) # Convert m/frame^2 to mm/frame^2
             else:
                  metrics['jitter'].append(float('nan'))
 
             num_batches += 1
+            if batch_idx % 50 == 0:
+                print(f"Processed batch {batch_idx + 1} / {len(data_loader)}")
 
     avg_metrics = {}
+    print("\nCalculating average metrics...")
     for key, values in metrics.items():
         valid_values = [v for v in values if not np.isnan(v)]
         if valid_values:
             avg_metrics[key] = np.mean(valid_values)
+            unit = ""
+            if key == 'mpjpe' or key == 'obj_trans_err': unit = "(mm)"
+            elif key == 'mpjre_angle' or key == 'obj_rot_angle': unit = "(deg)"
+            elif key == 'jitter': unit = "(mm/frame^2)"
+            print(f"  {key} {unit}: {avg_metrics[key]:.4f} (from {len(valid_values)}/{len(values)} valid samples)")
         else:
             avg_metrics[key] = float('nan')
+            print(f"  {key}: NaN (no valid samples)")
 
     return avg_metrics
 
 def main():
+    parser = argparse.ArgumentParser(description='Evaluate EgoMotion Model')
+    parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml', help='Path to the configuration file.')
+    parser.add_argument('--model_path', type=str, default=None, help='Path to the trained model checkpoint. Overrides config if provided.')
+    parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to the SMPL model file (e.g., SMPLH neutral). Overrides config if provided.')
+    parser.add_argument('--test_data_dir', type=str, default=None, help='Path to the test dataset directory. Overrides config if provided.')
+    parser.add_argument('--batch_size', type=int, default=None, help='Test batch size. Overrides config if provided.')
+    parser.add_argument('--num_workers', type=int, default=None, help='Number of dataloader workers. Overrides config if provided.')
+    parser.add_argument('--no_eval_objects', action='store_true', help='Do not evaluate object pose errors.')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    config_path = 'configs/diffusion_0403.yaml'
-    print(f"Loading config from: {config_path}")
-    config = load_config(config_path)
+    print(f"Loading config from: {args.config}")
+    config = load_config(args.config)
 
-    smpl_model_path = config.get('smpl_model_path', 'body_models/smplh/male/model.npz')
+    # Override config values with command line arguments if provided
+    if args.model_path: config.model_path = args.model_path
+    if args.smpl_model_path: config.bm_path = args.smpl_model_path
+    if args.test_data_dir: config.test.data_path = args.test_data_dir
+    if args.batch_size: config.test.batch_size = args.batch_size
+    if args.num_workers: config.num_workers = args.num_workers
+
+    # Validate paths from config
+    smpl_model_path = config.get('bm_path', 'body_models/smplh/neutral/model.npz')
     if not os.path.exists(smpl_model_path):
        print(f"Error: SMPL model path not found: {smpl_model_path}")
-       print("Please provide the correct path to your SMPL model file (e.g., SMPL_NEUTRAL.pkl) in the config or script.")
+       print("Please provide the correct path in the config (smpl_model_path) or via --smpl_model_path.")
        return
     print(f"Loading SMPL model from: {smpl_model_path}")
     smpl_model = load_smpl_model(smpl_model_path, device)
 
     model_path = config.get('model_path', None)
-    if model_path is None:
-        print("Error: Evaluation model path not found in the config.")
-        print("Please provide the correct path to your trained model checkpoint in the config (eval_model_path) or script.")
+    if model_path is None or not os.path.exists(model_path):
+        print(f"Error: Evaluation model path not found or invalid: {model_path}")
+        print("Please provide the correct path in the config (model_path) or via --model_path.")
         return
-    print(f"Loading trained model from: {model_path}")
+
+    # Determine model type for logging message (can be refined)
+    model_type_str = "Unknown"
+    if config.get('use_transpose_model', False): model_type_str = "TransPose"
+    elif config.get('use_transpose_humanOnly_model', False): model_type_str = "TransPose HumanOnly"
+    elif config.model.get('use_dit_model', True): model_type_str = "DiT"
+    print(f"Loading {model_type_str} model from: {model_path}")
     model = load_model(model_path, config, device)
 
-    test_data_dir = config['test'].get('data_path', None)
-    if not os.path.exists(test_data_dir):
-        print(f"Error: Test dataset path not found: {test_data_dir}")
-        print("Please provide the correct path to your test dataset in the config (test.data_path).")
+    test_data_dir = config.test.get('data_path', None)
+    if test_data_dir is None or not os.path.exists(test_data_dir):
+        print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
+        print("Please provide the correct path in the config (test.data_path) or via --test_data_dir.")
         return
     print(f"Loading test dataset from: {test_data_dir}")
+
+    # Use test window size from config
+    test_window_size = config.test.get('window', config.train.get('window', 60))
     test_dataset = IMUDataset(
             data_dir=test_data_dir,
-            window_size=config['test']['window'],
-            window_stride=config['test'].get('window_stride', config['test']['window']),
-            normalize=config['test'].get('normalize', False),
-            debug=False
+            window_size=test_window_size,
+            window_stride=config.test.get('window_stride', test_window_size),
+            normalize=config.test.get('normalize', True),
+            debug=config.get('debug', False)
         )
+
+    if len(test_dataset) == 0:
+         print("Error: Test dataset is empty. Check data path and dataset parameters.")
+         return
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['test'].get('batch_size', 32),
+        batch_size=config.test.get('batch_size', 32),
         shuffle=False,
         num_workers=config.get('num_workers', 4),
         pin_memory=True,
         drop_last=False
     )
 
-    print("\n开始评估模型...")
-    results = evaluate_model(model, smpl_model, test_loader, device)
+    print(f"\nDataset size: {len(test_dataset)}, Loader size: {len(test_loader)}")
+    print(f"Batch size: {config.test.get('batch_size', 32)}, Num workers: {config.get('num_workers', 4)}")
+    print(f"Evaluating objects: {not args.no_eval_objects}")
 
-    print("\n评估结果:")
-    print(f"MPJPE (mm, body joints 1-21 relative to root): {results.get('mpjpe', 'N/A'):.4f}")
-    print(f"MPJRE (Frob norm, body joints 1-21):          {results.get('mpjre_rot', 'N/A'):.4f}")
-    print(f"Obj Trans Error (mm):                         {results.get('obj_trans_err', 'N/A'):.4f}")
-    print(f"Obj Rot Error (Frob):                         {results.get('obj_rot_err', 'N/A'):.4f}")
-    print(f"Jitter (mm/frame^2, joints 0-21):             {results.get('jitter', 'N/A'):.4f}")
+    print("\nStarting model evaluation...")
+    results = evaluate_model(model, smpl_model, test_loader, device, evaluate_objects=(not args.no_eval_objects))
+
+    print("\n--- Evaluation Results ---")
+    print(f"MPJPE (mm):                                   {results.get('mpjpe', 'N/A'):.4f}")
+    print(f"MPJRE (deg):                                  {results.get('mpjre_angle', 'N/A'):.4f}")
+    if not args.no_eval_objects:
+        print(f"Obj Trans Error (mm):                         {results.get('obj_trans_err', 'N/A'):.4f}")
+        print(f"Obj Rot Error (deg):                          {results.get('obj_rot_angle', 'N/A'):.4f}")
+    else:
+         print("Object metrics skipped.")
+    print(f"Jitter (mm/frame^2):                          {results.get('jitter', 'N/A'):.4f}")
+    print("--------------------------")
 
 if __name__ == "__main__":
-    main() 
+    main()

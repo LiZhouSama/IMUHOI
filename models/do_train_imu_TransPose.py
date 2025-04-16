@@ -11,7 +11,7 @@ from torch import optim
 from tqdm import tqdm
 
 from utils.utils import tensor2numpy
-from models.TransPose_net import TransPoseNet  # 导入TransPose网络
+from models.TransPose_net_humanOnly import TransPoseNet  # 导入TransPose网络
 from torch.cuda.amp import autocast, GradScaler
 
 
@@ -122,13 +122,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             
             # 计算损失
             # 1. 姿态损失
-            if motion.dim() == 4:  # [bs, seq, 22, 6]
-                loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
-            else:  # [bs, seq, 132]
-                # 如果motion是展平的，需要重塑pred_dict["motion"]
-                bs, seq, nj, dim = pred_dict["motion"].shape
-                pred_motion_flat = pred_dict["motion"].reshape(bs, seq, -1)
-                loss_rot = torch.nn.functional.mse_loss(pred_motion_flat, motion)
+            loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
             
             # 2. 根节点位置损失
             loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
@@ -252,13 +246,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     
                     # 计算评估指标
                     # 1. 姿态损失
-                    if motion.dim() == 4:  # [bs, seq, 22, 6]
-                        loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
-                    else:  # [bs, seq, 132]
-                        # 如果motion是展平的，需要重塑pred_dict["motion"]
-                        bs, seq, nj, dim = pred_dict["motion"].shape
-                        pred_motion_flat = pred_dict["motion"].reshape(bs, seq, -1)
-                        loss_rot = torch.nn.functional.mse_loss(pred_motion_flat, motion)
+                    loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
                     
                     # 2. 根节点位置损失
                     loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
@@ -272,14 +260,14 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     # 计算总损失（加权）
                     if hasattr(cfg, 'loss_weights'):
                         w_rot = cfg.loss_weights.rot if hasattr(cfg.loss_weights, 'rot') else 1.0
-                        w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 0.1
-                        w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1
-                        w_obj_rot = cfg.loss_weights.obj_rot if hasattr(cfg.loss_weights, 'obj_rot') else 0.1
+                        w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 1.0
+                        w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 1.0
+                        w_obj_rot = cfg.loss_weights.obj_rot if hasattr(cfg.loss_weights, 'obj_rot') else 1.0
                     else:
                         w_rot = 1.0
-                        w_root_pos = 0.1
-                        w_obj_trans = 0.1
-                        w_obj_rot = 0.1
+                        w_root_pos = 1.0
+                        w_obj_trans = 1.0
+                        w_obj_rot = 1.0
                     
                     test_metric = w_rot * loss_rot + w_root_pos * loss_root_pos + w_obj_trans * loss_obj_trans + w_obj_rot * loss_obj_rot
                     
@@ -339,11 +327,6 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     'loss': best_loss,
                 }, save_path)
                 
-                # 如果使用了超参数搜索，也可以在这里记录
-                if trial is not None:
-                    trial.report(best_loss, epoch)
-                    if trial.should_prune():
-                        raise optuna.exceptions.TrialPruned()
         
         # 定期保存模型
         if epoch % 10 == 0:

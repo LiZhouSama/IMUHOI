@@ -12,6 +12,7 @@ import pytorch3d.transforms as transforms
 from scipy.spatial.transform import Rotation as R
 import torch.nn.functional as F
 import trimesh
+import glob
 
 # 导入BPS相关库，如果不存在需要安装
 try:
@@ -42,6 +43,44 @@ def _syn_acc(v, smooth_n=4):
                 for i in range(0, v.shape[0] - smooth_n * 2)])
     return acc
 
+def _syn_acc_optimized(v, smooth_n=4):
+    """使用优化的张量运算从位置生成加速度
+    
+    参数:
+        v: 位置数据 [T, 3] 或 [T, N, 3]
+        smooth_n: 平滑窗口大小
+    
+    返回:
+        acc: 加速度数据，与输入相同形状
+    """
+    # 获取维度信息
+    orig_shape = v.shape
+    if len(orig_shape) == 3:
+        # 如果是 [T, N, 3]，展平为 [T, N*3]
+        T, N, D = orig_shape
+        v_flat = v.reshape(T, -1)
+    else:
+        # 如果是 [T, 3]
+        v_flat = v
+    
+    # 构建基础差分计算
+    T = v_flat.shape[0]
+    acc = torch.zeros_like(v_flat)
+    
+    # 使用张量索引实现二阶差分
+    if T > 2:
+        acc[1:-1] = (v_flat[:-2] + v_flat[2:] - 2 * v_flat[1:-1]) * FRAME_RATE ** 2
+    
+    # 应用平滑
+    mid = smooth_n // 2
+    if mid != 0 and T > smooth_n * 2:
+        # 使用张量索引实现平滑计算
+        smooth_range = slice(smooth_n, -smooth_n)
+        acc[smooth_range] = (v_flat[:-smooth_n*2] + v_flat[smooth_n*2:] - 2 * v_flat[smooth_n:-smooth_n]) * FRAME_RATE ** 2 / smooth_n ** 2
+    
+    # 恢复原始形状
+    return acc.reshape(orig_shape)
+
 def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     """
     计算特定关节的IMU数据（加速度和方向）
@@ -66,22 +105,8 @@ def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     
     
     # 并行计算所有IMU关节的加速度
-    imu_accelerations = torch.zeros_like(imu_positions)
-    for i in range(num_imus):
-        imu_accelerations[:, i, :] = _syn_acc(imu_positions[:, i, :], smooth_n=4)
-    # # 计算角速度 - 使用矩阵运算优化
-    # angular_velocities = torch.zeros_like(imu_positions)
-    # delta_t = 1.0 / FRAME_RATE  # 假设60帧每秒
-    # if T > 1:
-    #     # 构建t和t-1时刻的旋转矩阵
-    #     rot_t = imu_rotations[1:].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
-    #     rot_tm1 = imu_rotations[:-1].reshape(-1, 3, 3)  # [(T-1)*num_imus, 3, 3]
-    #     rot_tm1_inv = torch.inverse(rot_tm1)  # [(T-1)*num_imus, 3, 3]
-    #     rel_rot = torch.bmm(rot_t, rot_tm1_inv)  # [(T-1)*num_imus, 3, 3]
-    #     axis_angle = transforms.matrix_to_axis_angle(rel_rot)  # [(T-1)*num_imus, 3]
-    #     angular_vel = axis_angle / delta_t  # [(T-1)*num_imus, 3]
-    #     angular_vel = angular_vel.reshape(T-1, num_imus, 3)
-    #     angular_velocities[1:] = angular_vel
+    imu_accelerations = _syn_acc_optimized(imu_positions, smooth_n)
+   
     # 返回IMU数据字典，包含加速度和方向
     imu_data = {
         'accelerations': imu_accelerations,  # [T, num_imus, 3]
@@ -382,8 +407,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         smooth_n=4
     )
     # 归一化IMU数据到头部坐标系
-    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:]  # [T, 1, 3]
-    head_ori = imu_global_full_gt['orientations'][:, HEAD_IDX:]  # [T, 1, 3, 3]
+    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
+    head_ori = imu_global_full_gt['orientations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3, 3]
     imu_global_exp_head_gt = {k: v[:, :HEAD_IDX] for k, v in imu_global_full_gt.items()}
     norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_ori))
     norm_imu_acc = torch.cat([norm_imu_global_full_gt['accelerations'], head_accel], dim=1).bmm(head_ori[:, -1])
@@ -517,6 +542,169 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     torch.save(data, os.path.join(save_dir, f"{seq_key}.pt"))
     return 1
 
+def preprocess_amass(args):
+    """
+    处理AMASS数据集，提取姿态、平移和IMU数据
+    
+    参数:
+        args: 命令行参数，包含数据路径和保存目录
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"处理AMASS数据集，使用设备: {device}")
+    
+    # 加载SMPL模型
+    bm_fname_male = os.path.join(args.support_dir, f"smplh/male/model.npz")
+    body_model = BodyModel(
+        bm_fname=bm_fname_male,
+        num_betas=16,
+    ).to(device)
+    
+    # 创建保存目录
+    amass_dir = args.save_dir_train
+    os.makedirs(amass_dir, exist_ok=True)
+    
+    # 定义AMASS数据集路径
+    amass_dirs = []
+    if hasattr(args, "amass_dirs") and args.amass_dirs:
+        amass_dirs = args.amass_dirs
+    else:
+        amass_dirs = ['HumanEva', 'MPI_HDM05', 'SFU', 'MPI_mosh', 'Transitions_mocap', 'SSM_synced', 'CMU',
+              'TotalCapture', 'Eyes_Japan_Dataset', 'KIT', 'BMLmovi', 'EKUT', 'TCD_handMocap', 'ACCAD',
+              'BioMotionLab_NTroje', 'BMLhandball', 'MPI_Limits', 'DFaust67']
+    
+    # 创建单独的聚合数据文件
+    sequence_index = 0
+    amass_summary = {'datasets': [], 'total_sequences': 0, 'total_frames': 0}
+    
+    # 遍历所有数据集目录
+    for ds_name in amass_dirs:
+        print(f'读取AMASS子数据集: {ds_name}')
+        ds_path = os.path.join(args.amass_dir, ds_name)
+        ds_summary = {'name': ds_name, 'sequences': 0, 'frames': 0}
+        
+        if not os.path.exists(ds_path):
+            print(f"警告: 找不到数据集 {ds_path}")
+            continue
+        
+        # 处理每个数据集中的每个文件
+        for npz_fname in tqdm(glob.glob(os.path.join(ds_path, '*/*_poses.npz'))):
+            try:
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # 加载单个文件
+                cdata = np.load(npz_fname)
+                
+                # 根据帧率调整采样
+                framerate = int(cdata['mocap_framerate'])
+                if framerate == 120: 
+                    step = 2
+                elif framerate == 60 or framerate == 59: 
+                    step = 1
+                else: 
+                    continue  # 跳过其他帧率的数据
+                
+                # 获取姿势、平移和体形参数
+                poses_data = cdata['poses'][::step].astype(np.float32)
+                trans_data = cdata['trans'][::step].astype(np.float32)
+                betas_data = cdata['betas'][:10].astype(np.float32)
+                
+                # 检查序列长度
+                seq_len = poses_data.shape[0]
+                if seq_len <= 60:
+                    print(f"\t丢弃太短的序列: {npz_fname}，长度为 {seq_len}")
+                    continue
+                
+                # 转换为PyTorch张量
+                pose = torch.tensor(poses_data, device=device).view(-1, 52, 3)
+                tran = torch.tensor(trans_data, device=device)
+                shape = torch.tensor(betas_data, device=device).unsqueeze(0)  # 添加批次维度
+                
+                # 只使用身体的22个关节，不包括手指
+                pose = pose[:, :22].clone()  # 只使用躯干
+                
+                # # 对齐AMASS全局坐标系
+                # amass_rot = torch.tensor([[[1, 0, 0], [0, 0, 1], [0, -1, 0.]]], device=device)
+                # tran = torch.matmul(amass_rot, tran.unsqueeze(-1)).squeeze(-1)
+                
+                # # 对根关节方向进行转换
+                # root_orient = pose[:, 0]
+                # root_rotmat = transforms.axis_angle_to_matrix(root_orient)
+                # aligned_root_rotmat = torch.matmul(amass_rot, root_rotmat)
+                # pose[:, 0] = transforms.matrix_to_axis_angle(aligned_root_rotmat)
+                
+                # 将轴角转换为旋转矩阵
+                pose_rotmat = transforms.axis_angle_to_matrix(pose.reshape(-1, 3)).reshape(seq_len, 22, 3, 3)
+                
+                # 通过body model计算全局关节位置和旋转
+                body_output = body_model(
+                    pose_body=pose[:, 1:22].reshape(-1, 63),  # 身体姿态
+                    root_orient=pose[:, 0],                  # 根关节方向
+                    trans=tran                               # 平移
+                )
+                
+                # 获取关节位置和全局旋转
+                joints = body_output.Jtr[:, :22, :]  # 关节位置
+                
+                # 计算全局旋转矩阵
+                kintree_table = body_model.kintree_table[0].long()[:22]
+                global_rotmat = local2global_pose(
+                    pose_rotmat.reshape(seq_len, -1, 9),  # 重塑为 [seq_len, joints, 9]
+                    kintree_table
+                ).reshape(seq_len, 22, 3, 3)
+                
+                # 计算IMU数据 (加速度和方向)
+                imu_data = compute_imu_data(
+                    joints.cpu(),                 # 关节位置
+                    global_rotmat.cpu(),          # 全局旋转
+                    IMU_JOINTS,                  # IMU关节索引
+                    smooth_n=4                    # 平滑窗口大小
+                )
+
+                # 计算头部全局变换矩阵
+                position_head_world = joints[:, 15, :].to(device)
+                head_global_trans = torch.eye(4, device=device).repeat(position_head_world.shape[0], 1, 1)
+                head_global_trans[:, :3, :3] = global_rotmat[:, 15, :, :].squeeze()
+                head_global_trans[:, :3, 3] = position_head_world
+                
+                # 创建和保存单个序列数据
+                seq_data = {
+                    "seq_name": f"amass_{ds_name}_{sequence_index}",
+                    "rotation_local_full_gt_list": transforms.matrix_to_rotation_6d(pose_rotmat.cpu()).reshape(seq_len, -1),
+                    "position_global_full_gt_world": joints.cpu(),  # 使用实际计算的关节位置
+                    "head_global_trans": head_global_trans.cpu(),
+                    "imu_global_full_gt": {
+                        "accelerations": imu_data['accelerations'],
+                        "orientations": imu_data['orientations']
+                    },
+                    "framerate": FRAME_RATE,
+                    "gender": "neutral"
+                }
+                
+                # 保存这个序列
+                seq_file = os.path.join(amass_dir, f"seq_{sequence_index}.pt")
+                torch.save(seq_data, seq_file)
+                
+                # 更新统计信息
+                sequence_index += 1
+                ds_summary['sequences'] += 1
+                ds_summary['frames'] += seq_len
+                amass_summary['total_sequences'] += 1
+                amass_summary['total_frames'] += seq_len
+                
+            except Exception as e:
+                print(f"处理文件时出错 {npz_fname}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 添加数据集摘要
+        amass_summary['datasets'].append(ds_summary)
+        print(f"完成处理数据集 {ds_name}: {ds_summary['sequences']} 个序列, {ds_summary['frames']} 帧")
+    
+    print(f"AMASS数据处理完成，共处理了 {amass_summary['total_sequences']} 个序列")
+    print(f"预处理后的AMASS数据集保存在 {amass_dir}")
+
 def main(args):
     # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -542,28 +730,33 @@ def main(args):
     # 准备BPS基础点云
     # print("准备BPS基础点云...")
     # bps_points = prep_bps_data(n_bps_points=args.n_bps_points, radius=args.bps_radius, device=device)
+
+    # 处理AMASS数据集
+    if args.process_amass:
+        preprocess_amass(args)
     
     # 加载数据集
-    print(f"正在加载数据集：{args.data_path_train}")
-    data_dict_train = joblib.load(args.data_path_train)
-    print(f"数据集加载完成，共有{len(data_dict_train)}个序列")
-    
-    print(f"正在加载数据集：{args.data_path_test}")
-    data_dict_test = joblib.load(args.data_path_test)
-    print(f"数据集加载完成，共有{len(data_dict_test)}个序列")
-    
-    # 处理所有序列
-    print("开始处理序列...")
-    
-    for seq_key in tqdm(data_dict_train, desc="处理序列"):
-        process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
-    
-    print(f"所有序列处理完成，结果保存在：{args.save_dir_train}")
+    else:
+        print(f"正在加载数据集：{args.data_path_train}")
+        data_dict_train = joblib.load(args.data_path_train)
+        print(f"数据集加载完成，共有{len(data_dict_train)}个序列")
+        
+        print(f"正在加载数据集：{args.data_path_test}")
+        data_dict_test = joblib.load(args.data_path_test)
+        print(f"数据集加载完成，共有{len(data_dict_test)}个序列")
+        
+        # 处理所有序列
+        print("开始处理序列...")
+        
+        for seq_key in tqdm(data_dict_train, desc="处理序列"):
+            process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+        
+        print(f"所有序列处理完成，结果保存在：{args.save_dir_train}")
 
-    for seq_key in tqdm(data_dict_test, desc="处理序列"):
-        process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
-    
-    print(f"所有序列处理完成，结果保存在：{args.save_dir_test}")
+        for seq_key in tqdm(data_dict_test, desc="处理序列"):
+            process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+        
+        print(f"所有序列处理完成，结果保存在：{args.save_dir_test}")
 
 
 if __name__ == "__main__":
@@ -572,9 +765,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0408/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0415/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0408/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0415/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
@@ -586,6 +779,12 @@ if __name__ == "__main__":
     #                     help="BPS点云中的点数量")
     # parser.add_argument("--bps_radius", type=float, default=1.0,
     #                     help="BPS点云的球体半径")
+    parser.add_argument("--process_amass", action="store_true",
+                        help="是否处理AMASS数据集")
+    parser.add_argument("--amass_dir", type=str, default="/mnt/d/a_WORK/Projects/PhD/datasets/AMASS_SMPL_H",
+                        help="AMASS数据集路径")
+    parser.add_argument("--amass_dirs", type=str, nargs="+",
+                        help="AMASS子数据集列表，例如CMU BMLmovi")
     
     args = parser.parse_args()
     main(args)

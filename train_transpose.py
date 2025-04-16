@@ -11,6 +11,7 @@ from datetime import datetime
 
 from dataloader.dataloader import IMUDataset
 from models.do_train_imu_TransPose import do_train_imu_TransPose, load_transpose_model
+from models.do_train_imu_TransPose_humanOnly import do_train_imu_TransPose_humanOnly, load_transpose_model_humanOnly
 from utils.parser_util import get_args, merge_file
 
 
@@ -135,15 +136,15 @@ def main():
         pretrained_path = cfg.pretrained_checkpoint
         print(f"从预训练模型继续训练: {pretrained_path}")
         # 加载预训练模型
-        model = load_transpose_model(cfg, pretrained_path)
+        model = load_transpose_model_humanOnly(cfg, pretrained_path)
         # 设置优化器
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         # 开始训练
-        model, optimizer = do_train_imu_TransPose(cfg, train_loader, test_loader, model=model, optimizer=optimizer)
+        model, optimizer = do_train_imu_TransPose_humanOnly(cfg, train_loader, test_loader, model=model, optimizer=optimizer)
     else:
         # 开始训练
         print("开始TransPose模型训练过程...")
-        model, optimizer = do_train_imu_TransPose(cfg, train_loader, test_loader)
+        model, optimizer = do_train_imu_TransPose_humanOnly(cfg, train_loader, test_loader)
     
     print(f"训练完成！TransPose模型已保存到 {save_dir}")
     
