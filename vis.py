@@ -472,13 +472,6 @@ def visualize_human_and_objects(args, model, data, show_objects=True):
                 print("模型输出缺少 'motion'")
             else:
                 pred_motion = pred_motion.squeeze(0).cpu() # [T, 132]
-                if pred_obj_rot is not None:
-                    pred_obj_rot = pred_obj_rot.squeeze(0).cpu() # [T, 6] 或 [T, 3, 3]
-                    
-                    # 如果 obj_rot 是 6D 表示，转换为旋转矩阵
-                    if pred_obj_rot.shape[-1] == 6:
-                        pred_obj_rot = transforms.rotation_6d_to_matrix(pred_obj_rot)
-
                 pred_rot_matrices = transforms.rotation_6d_to_matrix(pred_motion.reshape(-1, 22, 6))  # [T, 22, 3, 3]
                 pred_root_orient_mat = pred_rot_matrices[:, 0, :, :].to(device)
                 pred_pose_body_mat = pred_rot_matrices[:, 1:, :, :].reshape(-1, 21, 3, 3).to(device)
@@ -513,6 +506,14 @@ def visualize_human_and_objects(args, model, data, show_objects=True):
                 verts_pred = body_pose_pred.v.detach().cpu()
                 # --- 结束预测 SMPLH 输入准备 ---
                 has_pred = True # 只有在成功生成顶点后才设置为 True
+
+                if pred_obj_rot is not None:
+                    pred_obj_rot = pred_obj_rot.squeeze(0).cpu() # [T, 6] 或 [T, 3, 3]
+                    # 如果 obj_rot 是 6D 表示，转换为旋转矩阵
+                    if pred_obj_rot.shape[-1] == 6:
+                        pred_obj_rot = transforms.rotation_6d_to_matrix(pred_obj_rot)
+                    pred_obj_rot = head_global_rot_start @ pred_obj_rot
+
 
         except Exception as e:
             print(f"模型预测失败: {e}")
@@ -595,8 +596,8 @@ def visualize_human_and_objects(args, model, data, show_objects=True):
             # 使用 GT trans (未缩放), GT scale, Pred rot
             pred_obj_verts, _ = load_object_geometry(
                 obj_name,
-                gt_obj_rot, # 使用真值的旋转
-                pred_obj_trans,         # 使用GT平移 (未缩放)
+                pred_obj_rot, # 使用真值的旋转
+                gt_obj_trans,         # 使用GT平移 (未缩放)
                 obj_scale=gt_obj_scale, # 传递 GT scale
                 obj_bottom_trans=gt_obj_bottom_trans_np,
                 obj_bottom_rot=gt_obj_bottom_rot_np

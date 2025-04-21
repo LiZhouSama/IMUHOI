@@ -232,13 +232,26 @@ class IMUDataset(Dataset):
                 # 如果没有物体数据，使用上面定义的默认值
                 pass
 
-            # 对IMU数据进行归一化（如果需要）
+            # 对数据进行归一化（如果需要）
             norm_human_imu = human_imu.float()
             norm_obj_imu = obj_imu.float()
-            if self.normalize:
+            if self.normalize:      
+                # TODO: 需要验证
                 # 对imu归一化(输入)
-                norm_human_imu = self._imu_TN(human_imu)
-                norm_obj_imu = self._imu_TN(obj_imu) if has_object else obj_imu.float()
+                # norm_human_imu = self._imu_TN(human_imu)
+                # norm_obj_imu = self._imu_TN(obj_imu) if has_object else obj_imu.float()
+
+                head_imu_acc_start = human_imu_acc[0, HEAD_IDX] # [3]
+                head_imu_ori_start = human_imu_ori_flat[0, HEAD_IDX] # [3, 3]
+                head_imu_ori_start_inv = torch.inverse(head_imu_ori_start)
+                norm_human_imu_acc = head_imu_ori_start_inv @ torch.cat([human_imu_acc[:,:5] - head_imu_acc_start, human_imu_acc[:,5:]], dim=1).unsqueeze(-1)
+                norm_human_imu_acc = norm_human_imu_acc.squeeze(-1)
+                norm_human_imu_ori = torch.cat((head_imu_ori_start_inv @ human_imu_ori_flat[:, :5], human_imu_ori_flat[:, 5:]), dim=1) 
+                norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
+                norm_obj_acc = head_imu_ori_start_inv @ (obj_imu_acc - head_imu_acc_start).unsqueeze(-1)
+                norm_obj_acc = norm_obj_acc.squeeze(-1)
+                norm_obj_ori = head_imu_ori_start_inv @ obj_imu_ori
+                norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
                 
                 # 对motion归一化(输出)
                 head_global_pos_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, 3]
@@ -248,12 +261,14 @@ class IMUDataset(Dataset):
                 root_rot = transforms.rotation_6d_to_matrix(norm_motion[:, :6]) # 每一帧
                 norm_root_rot = head_rot_invert @ root_rot
                 norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
-                norm_root_pos = root_pos - head_global_pos_start
+                norm_root_pos = head_rot_invert @ (root_pos - head_global_pos_start).unsqueeze(-1)
+                norm_root_pos = norm_root_pos.squeeze(-1)
                 if has_object:
                     # 对obj归一化(输出)
-                    norm_obj_trans = obj_trans - head_global_pos_start
+                    norm_obj_trans = head_rot_invert @ (obj_trans - head_global_pos_start).unsqueeze(-1)
+                    norm_obj_trans = norm_obj_trans.squeeze(-1)
                     norm_obj_rot = head_rot_invert @ obj_rot
-
+                    norm_obj_rot = transforms.matrix_to_rotation_6d(norm_obj_rot)
 
             # 加载BPS特征（如果有）
             bps_features = None
@@ -284,8 +299,8 @@ class IMUDataset(Dataset):
                     "head_global_trans_start": seq_data["head_global_trans"][start_idx:start_idx+1].float(),  # [1, 4, 4]
                     "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
                     "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
-                    "obj_trans": obj_trans.float() ,  # [seq, 3] (未缩放)
-                    "obj_rot": transforms.matrix_to_rotation_6d(obj_rot).float() ,  # [seq, 6]
+                    "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
+                    "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
                     "obj_scale": obj_scale.float() , # [seq] (单独返回)
                     "obj_name": obj_name,
                     "has_object": has_object,

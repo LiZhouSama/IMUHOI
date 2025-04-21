@@ -4,7 +4,7 @@
 model_name: "TransPose_IMU_v1"
 model_type: "TransPose"  # 模型类型：使用TransPose
 gpus: [0]  # 使用的GPU编号
-save_dir: "outputs/TransPose_humanOnly"  # 模型保存路径
+save_dir: "outputs/TransPose"  # 模型保存路径
 use_wandb: True  # 是否使用wandb记录训练过程
 # pretrained_checkpoint: "checkpoints/TransPose/epoch_50_best.pt"  # 预训练模型路径，如果需要从现有模型继续训练，取消注释并设置路径
 bm_path: body_models/smplh/male/model.npz
@@ -13,14 +13,14 @@ use_transpose_model: True
 
 # 训练超参数
 epoch: 400  # 训练轮数
-batch_size: 512  # 批大小
+batch_size: 200  # 批大小
 lr: 0.0005  # 学习率
 weight_decay: 0.0001  # 权重衰减
 milestones: [150,200,300,400]  # 学习率调整节点
 gamma: 0.1  # 学习率衰减系数
 seed: 42  # 随机种子
-num_workers: 12  # 数据加载线程数
-hidden_dim_multiplier: 2  # 隐藏层维度乘数
+num_workers: 0  # 数据加载线程数
+hidden_dim_multiplier: 4  # 隐藏层维度乘数
 
 # 特征维度配置
 num_human_imus: 6  # 人体IMU数量
@@ -40,15 +40,15 @@ train:
   window: 120  # 训练时使用的时间窗口长度
   window_stride: 60  # 训练时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0408/train"  # 训练数据路径
-  debug_data_path: "processed_data_0408/debug"  # 调试数据路径
+  data_path: "processed_data_0417/train"  # 训练数据路径
+  debug_data_path: "processed_data_0417/debug"  # 调试数据路径
 
 # 测试窗口配置
 test:
   window: 120  # 测试时使用的时间窗口长度
   window_stride: 120  # 测试时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0408/test"  # 测试数据路径
+  data_path: "processed_data_0417/test"  # 测试数据路径
 
 # 数据增强配置
 augmentation:

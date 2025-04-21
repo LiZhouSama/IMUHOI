@@ -107,9 +107,7 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             has_object = gt_obj_imu is not None and gt_obj_trans is not None and gt_obj_rot_6d is not None
 
             # Prepare dummy object IMU if needed by the model but not present in GT
-            if not has_object and (model.imu_obj_dim > 0 if hasattr(model, 'imu_obj_dim') else True):
-                obj_imu_input = torch.zeros((bs, seq_len, 1, 9), device=device)
-            elif has_object:
+            if has_object:
                 obj_imu_input = gt_obj_imu
             else:
                 obj_imu_input = None
@@ -139,24 +137,23 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 print(f"Warning: Batch {batch_idx}: Model did not output 'motion'. Skipping batch.")
                 continue
             if pred_root_pos_norm is None:
-                 print(f"Warning: Batch {batch_idx}: Model did not output 'root_pos'. Using GT root position for evaluation.")
+                print(f"Warning: Batch {batch_idx}: Model did not output 'root_pos'. Using GT root position for evaluation.")
 
 
             # --- Denormalize Predictions using First Frame Head Pose ---
             head_global_rot_start = gt_head_trans_start[..., :3, :3]
             head_global_pos_start = gt_head_trans_start[..., :3, 3]
 
-            # Denormalize root orientation
+            # Denormalize root orientation， 不再需要denormalize
             pred_root_orient_6d_norm = pred_motion_norm[:, :, :6]
             pred_root_orient_mat_norm = transforms.rotation_6d_to_matrix(pred_root_orient_6d_norm)
             # pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat_norm
             # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(bs * seq_len, 3)
             pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat_norm).reshape(bs * seq_len, 3)
             
-            # Denormalize root position
             if pred_root_pos_norm is not None:
-                pred_root_pos_relative_rotated = torch.matmul(head_global_rot_start, pred_root_pos_norm.unsqueeze(-1))
-                pred_transl = pred_root_pos_relative_rotated.squeeze(-1) + head_global_pos_start
+                # pred_root_pos_relative_rotated = torch.matmul(head_global_rot_start, pred_root_pos_norm.unsqueeze(-1))
+                # pred_transl = pred_root_pos_relative_rotated.squeeze(-1) @ head_global_rot_start.transpose(-1, -2) + head_global_pos_start
                 pred_transl = pred_transl.reshape(bs * seq_len, 3)
             else:
                 pred_transl = gt_root_pos.reshape(bs*seq_len, 3)
@@ -223,35 +220,33 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
 
             # Object Metrics (Conditional)
             if evaluate_objects and has_object:
-                 # Denormalize predicted object pose if needed
-                 if pred_obj_trans_norm is not None and pred_obj_rot_norm is not None:
-                     # Denormalize translation
-                     pred_obj_trans_relative_rotated = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_trans_norm.unsqueeze(-1))
-                     pred_obj_trans = pred_obj_trans_relative_rotated.squeeze(-1) + head_global_pos_start.unsqueeze(1)
-
-                     # Denormalize rotation
-                     pred_obj_rot_6d_norm = pred_obj_rot_norm
-                     pred_obj_rot_mat_norm = transforms.rotation_6d_to_matrix(pred_obj_rot_6d_norm.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
-                     pred_obj_rot_mat = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_rot_mat_norm)
-
-                     # Calculate Translation Error
-                     obj_trans_err = torch.linalg.norm(pred_obj_trans - gt_obj_trans, dim=-1).mean()
-                     metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert meters to mm
-
-                     # Calculate Rotation Error (Angle in Degrees)
-                     gt_obj_rot_mat = transforms.rotation_6d_to_matrix(gt_obj_rot_6d.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
-                     # R_rel = R_gt^T @ R_pred
-                     obj_rel_rot_mat = torch.matmul(gt_obj_rot_mat.transpose(-1, -2), pred_obj_rot_mat)
-                     obj_trace = torch.einsum('...ii->...', obj_rel_rot_mat) # [bs, seq]
-                     obj_cos_theta = torch.clamp((obj_trace - 1.0) / 2.0, -1.0, 1.0)
-                     obj_angle_rad = torch.acos(obj_cos_theta)
-                     obj_angle_deg = obj_angle_rad * (180.0 / np.pi)
-                     obj_rot_angle_err = obj_angle_deg.mean()
-                     metrics['obj_rot_angle'].append(obj_rot_angle_err.item()) # Store mean angle in degrees
-                 else:
-                     print(f"Warning: Batch {batch_idx}: Missing predicted object pose for error calculation.")
-                     metrics['obj_trans_err'].append(float('nan'))
-                     metrics['obj_rot_angle'].append(float('nan'))
+                if pred_obj_trans_norm is not None: 
+                    # pred_obj_trans_relative_rotated = pred_obj_trans_norm.unsqueeze(-1) @ head_global_rot_start.unsqueeze(1).transpose(-1, -2)
+                    # pred_obj_trans = pred_obj_trans_relative_rotated.squeeze(-1) + head_global_pos_start.unsqueeze(1)
+                    # Calculate Translation Error
+                    obj_trans_err = torch.linalg.norm(pred_obj_trans_norm - gt_obj_trans, dim=-1).mean()
+                    metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert meters to mm
+                else:
+                    print(f"Warning: Batch {batch_idx}: Missing predicted object translation for error calculation.")
+                    metrics['obj_trans_err'].append(float('nan'))
+                if pred_obj_rot_norm is not None:
+                    # Denormalize rotation
+                    pred_obj_rot_6d_norm = pred_obj_rot_norm
+                    pred_obj_rot_mat_norm = transforms.rotation_6d_to_matrix(pred_obj_rot_6d_norm.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
+                    # pred_obj_rot_mat = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_rot_mat_norm)
+                    # Calculate Rotation Error (Angle in Degrees)
+                    gt_obj_rot_mat = transforms.rotation_6d_to_matrix(gt_obj_rot_6d.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
+                    # R_rel = R_gt^T @ R_pred
+                    obj_rel_rot_mat = torch.matmul(gt_obj_rot_mat.transpose(-1, -2), pred_obj_rot_mat_norm)
+                    obj_trace = torch.einsum('...ii->...', obj_rel_rot_mat) # [bs, seq]
+                    obj_cos_theta = torch.clamp((obj_trace - 1.0) / 2.0, -1.0, 1.0)
+                    obj_angle_rad = torch.acos(obj_cos_theta)
+                    obj_angle_deg = obj_angle_rad * (180.0 / np.pi)
+                    obj_rot_angle_err = obj_angle_deg.mean()
+                    metrics['obj_rot_angle'].append(obj_rot_angle_err.item()) # Store mean angle in degrees
+                else:
+                    print(f"Warning: Batch {batch_idx}: Missing predicted object rotation for error calculation.")
+                    metrics['obj_rot_angle'].append(float('nan'))
             elif evaluate_objects and not has_object:
                  metrics['obj_trans_err'].append(float('nan'))
                  metrics['obj_rot_angle'].append(float('nan'))

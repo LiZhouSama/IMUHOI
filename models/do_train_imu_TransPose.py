@@ -9,9 +9,10 @@ import torch
 import wandb
 from torch import optim
 from tqdm import tqdm
+from datetime import datetime
 
 from utils.utils import tensor2numpy
-from models.TransPose_net_humanOnly import TransPoseNet  # 导入TransPose网络
+from models.TransPose_net import TransPoseNet  # 导入TransPose网络
 from torch.cuda.amp import autocast, GradScaler
 
 
@@ -66,7 +67,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     # 如果使用wandb，初始化
     if use_wandb:
         wandb_project = "imu_transpose"
-        wandb.init(project=wandb_project, name=model_name, config=cfg)
+        wandb.init(project=wandb_project, name=datetime.now().strftime("%m%d%H%M"), config=cfg)
 
     # 训练循环
     best_loss = float('inf')
@@ -79,19 +80,19 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         model.train()
         train_loss = 0
         train_loss_rot = 0
-        train_loss_root_pos = 0
-        train_loss_obj_trans = 0
+        # train_loss_root_pos = 0  # 已注释：模型不再预测根节点位置
+        # train_loss_obj_trans = 0  # 已注释：模型不再预测物体平移
         train_loss_obj_rot = 0
         
         train_iter = tqdm(train_loader, desc=f'Epoch {epoch}')
         
         for batch in train_iter:
             # 准备数据
-            root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]
+            # root_pos = batch["root_pos"].to(device)  # [bs, seq, 3]  # 已注释：不需要根节点位置
             motion = batch["motion"].to(device)  # [bs, seq, 22, 6] 或 [bs, seq, 132]
             human_imu = batch["human_imu"].to(device)  # [bs, seq, num_imus, 9]
             obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None  # [bs, seq, 1, 9]
-            obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]
+            # obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # [bs, seq, 3]  # 已注释：不需要物体平移
             obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None  # [bs, seq, 6]
             bps_features = batch["bps_features"].to(device) if "bps_features" in batch else None
             
@@ -99,16 +100,12 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             if obj_imu is None:
                 bs, seq = human_imu.shape[:2]
                 obj_imu = torch.zeros((bs, seq, 1, 9), device=device)
-                obj_trans = torch.zeros((bs, seq, 3), device=device)
-                obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
+                # obj_trans = torch.zeros((bs, seq, 3), device=device)  # 已注释：不需要物体平移
+                obj_rot = torch.zeros((bs, seq, 6), device=device) if obj_rot is None else obj_rot
             
             data_dict = {
                 "human_imu": human_imu,
-                "obj_imu": obj_imu,
-                "root_pos": root_pos,
-                "motion": motion,
-                "obj_trans": obj_trans,
-                "obj_rot": obj_rot
+                "obj_imu": obj_imu
             }
             
             if bps_features is not None:
@@ -124,11 +121,11 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             # 1. 姿态损失
             loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
             
-            # 2. 根节点位置损失
-            loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+            # # 2. 根节点位置损失  # 已注释：模型不再预测根节点位置
+            # loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
             
-            # 3. 物体位置损失
-            loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["obj_trans"], obj_trans)
+            # # 3. 物体位置损失  # 已注释：模型不再预测物体平移
+            # loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["obj_trans"], obj_trans)
             
             # 4. 物体旋转损失
             loss_obj_rot = torch.nn.functional.mse_loss(pred_dict["obj_rot"], obj_rot)
@@ -137,17 +134,18 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             if hasattr(cfg, 'loss_weights'):
                 # 从配置中获取损失权重
                 w_rot = cfg.loss_weights.rot if hasattr(cfg.loss_weights, 'rot') else 1.0
-                w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 0.1
-                w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1
+                # w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 0.1  # 已注释：不需要这个权重
+                # w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1  # 已注释：不需要这个权重
                 w_obj_rot = cfg.loss_weights.obj_rot if hasattr(cfg.loss_weights, 'obj_rot') else 0.1
             else:
                 # 默认权重
                 w_rot = 1.0
-                w_root_pos = 0.1
-                w_obj_trans = 0.1
-                w_obj_rot = 0.1
+                # w_root_pos = 0.1  # 已注释：不需要这个权重
+                # w_obj_trans = 0.1  # 已注释：不需要这个权重
+                w_obj_rot = 1
             
-            loss = w_rot * loss_rot + w_root_pos * loss_root_pos + w_obj_trans * loss_obj_trans + w_obj_rot * loss_obj_rot
+            # loss = w_rot * loss_rot + w_root_pos * loss_root_pos + w_obj_trans * loss_obj_trans + w_obj_rot * loss_obj_rot  # 已注释：完整的损失计算
+            loss = w_rot * loss_rot + w_obj_rot * loss_obj_rot  # 更新后的损失计算，只包含人体姿态和物体旋转
             
             # 反向传播和优化
             # loss.backward()
@@ -161,16 +159,17 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             # 记录损失
             train_loss += loss.item()
             train_loss_rot += loss_rot.item()
-            train_loss_root_pos += loss_root_pos.item()
-            train_loss_obj_trans += loss_obj_trans.item()
+            # train_loss_root_pos += loss_root_pos.item()  # 已注释：不需要累加这个损失
+            # train_loss_obj_trans += loss_obj_trans.item()  # 已注释：不需要累加这个损失
             train_loss_obj_rot += loss_obj_rot.item()
             
             # 更新tqdm描述
             train_iter.set_postfix({
                 'loss': loss.item(),
                 'rot': loss_rot.item(), 
-                'root_pos': loss_root_pos.item(),
-                'obj': loss_obj_trans.item() + loss_obj_rot.item()
+                # 'root_pos': loss_root_pos.item(),  # 已注释：不显示这个损失
+                # 'obj': loss_obj_trans.item() + loss_obj_rot.item()  # 已注释：不需要显示物体平移损失
+                'obj_rot': loss_obj_rot.item()  # 更新：只显示物体旋转损失
             })
             
             # 记录wandb
@@ -178,8 +177,8 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 log_dict = {
                     'train_loss': loss.item(),
                     'train_loss_rot': loss_rot.item(),
-                    'train_loss_root_pos': loss_root_pos.item(),
-                    'train_loss_obj_trans': loss_obj_trans.item(),
+                    # 'train_loss_root_pos': loss_root_pos.item(),  # 已注释：不记录这个损失
+                    # 'train_loss_obj_trans': loss_obj_trans.item(),  # 已注释：不记录这个损失
                     'train_loss_obj_rot': loss_obj_rot.item()
                 }
                 wandb.log(log_dict, step=n_iter)
@@ -189,20 +188,20 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         # 计算平均训练损失
         train_loss /= len(train_loader)
         train_loss_rot /= len(train_loader)
-        train_loss_root_pos /= len(train_loader)
-        train_loss_obj_trans /= len(train_loader)
+        # train_loss_root_pos /= len(train_loader)  # 已注释：不计算这个平均损失
+        # train_loss_obj_trans /= len(train_loader)  # 已注释：不计算这个平均损失
         train_loss_obj_rot /= len(train_loader)
         
         train_losses['loss'].append(train_loss)
         train_losses['loss_rot'].append(train_loss_rot)
-        train_losses['loss_root_pos'].append(train_loss_root_pos)
-        train_losses['loss_obj_trans'].append(train_loss_obj_trans)
+        # train_losses['loss_root_pos'].append(train_loss_root_pos)  # 已注释：不记录这个损失历史
+        # train_losses['loss_obj_trans'].append(train_loss_obj_trans)  # 已注释：不记录这个损失历史
         train_losses['loss_obj_rot'].append(train_loss_obj_rot)
         
         print(f'Epoch {epoch}, Train Loss: {train_loss:.6f}, '
               f'Rot Loss: {train_loss_rot:.6f}, '
-              f'Root Pos Loss: {train_loss_root_pos:.6f}, '
-              f'Obj Trans Loss: {train_loss_obj_trans:.6f}, '
+              # f'Root Pos Loss: {train_loss_root_pos:.6f}, '  # 已注释：不打印这个损失
+              # f'Obj Trans Loss: {train_loss_obj_trans:.6f}, '  # 已注释：不打印这个损失
               f'Obj Rot Loss: {train_loss_obj_rot:.6f}')
 
         # 每5个epoch进行一次测试和保存
@@ -211,27 +210,27 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             model.eval()
             test_loss = 0
             test_loss_rot = 0
-            test_loss_root_pos = 0
-            test_loss_obj_trans = 0
+            # test_loss_root_pos = 0  # 已注释：不需要跟踪这个测试损失
+            # test_loss_obj_trans = 0  # 已注释：不需要跟踪这个测试损失
             test_loss_obj_rot = 0
             
             with torch.no_grad():
                 test_iter = tqdm(test_loader, desc=f'Test Epoch {epoch}')
                 for batch in test_iter:
                     # 准备数据
-                    root_pos = batch["root_pos"].to(device)
+                    # root_pos = batch["root_pos"].to(device)  # 已注释：不需要根节点位置
                     motion = batch["motion"].to(device)
                     human_imu = batch["human_imu"].to(device)
                     obj_imu = batch["obj_imu"].to(device) if "obj_imu" in batch else None
-                    obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None
+                    # obj_trans = batch["obj_trans"].to(device) if "obj_trans" in batch else None  # 已注释：不需要物体平移
                     obj_rot = batch["obj_rot"].to(device) if "obj_rot" in batch else None
                     bps_features = batch["bps_features"].to(device) if "bps_features" in batch else None
                     
                     if obj_imu is None:
                         bs, seq = human_imu.shape[:2]
                         obj_imu = torch.zeros((bs, seq, 1, 9), device=device)
-                        obj_trans = torch.zeros((bs, seq, 3), device=device)
-                        obj_rot = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).expand(bs, seq, -1, -1)
+                        # obj_trans = torch.zeros((bs, seq, 3), device=device)  # 已注释：不需要物体平移
+                        obj_rot = torch.zeros((bs, seq, 6), device=device) if obj_rot is None else obj_rot
                     
                     data_dict_eval = {
                         "human_imu": human_imu,
@@ -248,11 +247,11 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     # 1. 姿态损失
                     loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
                     
-                    # 2. 根节点位置损失
-                    loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+                    # # 2. 根节点位置损失  # 已注释：不计算这个损失
+                    # loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
                     
-                    # 3. 物体位置损失
-                    loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["obj_trans"], obj_trans)
+                    # # 3. 物体位置损失  # 已注释：不计算这个损失
+                    # loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["obj_trans"], obj_trans)
                     
                     # 4. 物体旋转损失
                     loss_obj_rot = torch.nn.functional.mse_loss(pred_dict["obj_rot"], obj_rot)
@@ -260,57 +259,59 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     # 计算总损失（加权）
                     if hasattr(cfg, 'loss_weights'):
                         w_rot = cfg.loss_weights.rot if hasattr(cfg.loss_weights, 'rot') else 1.0
-                        w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 1.0
-                        w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 1.0
+                        # w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 1.0  # 已注释：不需要这个权重
+                        # w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 1.0  # 已注释：不需要这个权重
                         w_obj_rot = cfg.loss_weights.obj_rot if hasattr(cfg.loss_weights, 'obj_rot') else 1.0
                     else:
                         w_rot = 1.0
-                        w_root_pos = 1.0
-                        w_obj_trans = 1.0
+                        # w_root_pos = 1.0  # 已注释：不需要这个权重
+                        # w_obj_trans = 1.0  # 已注释：不需要这个权重
                         w_obj_rot = 1.0
                     
-                    test_metric = w_rot * loss_rot + w_root_pos * loss_root_pos + w_obj_trans * loss_obj_trans + w_obj_rot * loss_obj_rot
+                    # test_metric = w_rot * loss_rot + w_root_pos * loss_root_pos + w_obj_trans * loss_obj_trans + w_obj_rot * loss_obj_rot  # 已注释：完整的测试指标计算
+                    test_metric = w_rot * loss_rot + w_obj_rot * loss_obj_rot  # 更新后的测试指标，只包含人体姿态和物体旋转
                     
                     # 记录损失
                     test_loss += test_metric.item()
                     test_loss_rot += loss_rot.item()
-                    test_loss_root_pos += loss_root_pos.item()
-                    test_loss_obj_trans += loss_obj_trans.item()
+                    # test_loss_root_pos += loss_root_pos.item()  # 已注释：不累加这个损失
+                    # test_loss_obj_trans += loss_obj_trans.item()  # 已注释：不累加这个损失
                     test_loss_obj_rot += loss_obj_rot.item()
                     
                     # 更新tqdm描述
                     test_iter.set_postfix({
                         'test_metric': test_metric.item(),
                         'loss_rot': loss_rot.item(),
-                        'loss_root_pos': loss_root_pos.item(),
-                        'loss_obj': loss_obj_trans.item() + loss_obj_rot.item()
+                        # 'loss_root_pos': loss_root_pos.item(),  # 已注释：不显示这个损失
+                        # 'loss_obj': loss_obj_trans.item() + loss_obj_rot.item()  # 已注释：不显示物体平移损失
+                        'loss_obj_rot': loss_obj_rot.item()  # 更新：只显示物体旋转损失
                     })
             
             # 计算平均测试损失
             test_loss /= len(test_loader)
             test_loss_rot /= len(test_loader)
-            test_loss_root_pos /= len(test_loader)
-            test_loss_obj_trans /= len(test_loader)
+            # test_loss_root_pos /= len(test_loader)  # 已注释：不计算这个平均损失
+            # test_loss_obj_trans /= len(test_loader)  # 已注释：不计算这个平均损失
             test_loss_obj_rot /= len(test_loader)
             
             test_losses['loss'].append(test_loss)
             test_losses['loss_rot'].append(test_loss_rot)
-            test_losses['loss_root_pos'].append(test_loss_root_pos)
-            test_losses['loss_obj_trans'].append(test_loss_obj_trans)
+            # test_losses['loss_root_pos'].append(test_loss_root_pos)  # 已注释：不记录这个损失历史
+            # test_losses['loss_obj_trans'].append(test_loss_obj_trans)  # 已注释：不记录这个损失历史
             test_losses['loss_obj_rot'].append(test_loss_obj_rot)
             
             print(f'Epoch {epoch}, Test Metric: {test_loss:.6f}, ' 
                   f'Rot Loss: {test_loss_rot:.6f}, '             
-                  f'Root Pos Loss: {test_loss_root_pos:.6f}, '  
-                  f'Obj Trans Loss: {test_loss_obj_trans:.6f}, '
+                  # f'Root Pos Loss: {test_loss_root_pos:.6f}, '  # 已注释：不打印这个损失
+                  # f'Obj Trans Loss: {test_loss_obj_trans:.6f}, '  # 已注释：不打印这个损失
                   f'Obj Rot Loss: {test_loss_obj_rot:.6f}')    
             
             if use_wandb:
                 log_dict = {
                     'test_metric': test_loss,
                     'test_loss_rot': test_loss_rot,
-                    'test_loss_root_pos': test_loss_root_pos,
-                    'test_loss_obj_trans': test_loss_obj_trans,
+                    # 'test_loss_root_pos': test_loss_root_pos,  # 已注释：不记录这个损失
+                    # 'test_loss_obj_trans': test_loss_obj_trans,  # 已注释：不记录这个损失
                     'test_loss_obj_rot': test_loss_obj_rot
                 }
                 wandb.log(log_dict, step=n_iter)

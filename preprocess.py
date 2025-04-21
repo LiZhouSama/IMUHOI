@@ -407,19 +407,19 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         smooth_n=4
     )
     # 归一化IMU数据到头部坐标系
-    head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
-    head_ori = imu_global_full_gt['orientations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3, 3]
-    imu_global_exp_head_gt = {k: v[:, :HEAD_IDX] for k, v in imu_global_full_gt.items()}
-    norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_ori))
-    norm_imu_acc = torch.cat([norm_imu_global_full_gt['accelerations'], head_accel], dim=1).bmm(head_ori[:, -1])
-    norm_imu_ori = torch.cat([norm_imu_global_full_gt['orientations'], head_ori], dim=1)
-    processed_imu_global_full_gt = {
-        'accelerations': norm_imu_acc,
-        'orientations': norm_imu_ori
-    }
+    # head_accel = imu_global_full_gt['accelerations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3]
+    # head_ori = imu_global_full_gt['orientations'][:, HEAD_IDX:HEAD_IDX+1]  # [T, 1, 3, 3]
+    # imu_global_exp_head_gt = {k: v[:, :HEAD_IDX] for k, v in imu_global_full_gt.items()}
+    # norm_imu_global_full_gt = normalize_to_head_frame(imu_global_exp_head_gt, head_imu_data=(head_accel, head_ori))
+    # norm_imu_acc = torch.cat([norm_imu_global_full_gt['accelerations'], head_accel], dim=1).bmm(head_ori[:, -1])
+    # norm_imu_ori = torch.cat([norm_imu_global_full_gt['orientations'], head_ori], dim=1)
+    # processed_imu_global_full_gt = {
+    #     'accelerations': norm_imu_acc,
+    #     'orientations': norm_imu_ori
+    # }
 
     # --- 或者，如果不进行归一化，直接使用全局数据 ---
-    # processed_imu_global_full_gt = imu_global_full_gt # 使用未归一化的数据
+    processed_imu_global_full_gt = imu_global_full_gt # 使用未归一化的数据
     # -------------------------------------------------
 
     # 提取物体相关信息(如果存在)
@@ -436,11 +436,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         
         # 计算物体的IMU数据 (现在是加速度和方向)
         obj_imu_data = compute_object_imu(obj_trans, obj_rot)
-        norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_ori))
-        norm_obj_imu_data['accelerations'] = norm_obj_imu_data['accelerations'].bmm(head_ori[:, -1])
-        processed_obj_imu_data = norm_obj_imu_data
+        # norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_ori))
+        # norm_obj_imu_data['accelerations'] = norm_obj_imu_data['accelerations'].bmm(head_ori[:, -1])
+        # processed_obj_imu_data = norm_obj_imu_data
         # --- 或者，如果不进行归一化，直接使用全局数据 ---
-        # processed_obj_imu_data = obj_imu_data # 使用未归一化的数据
+        processed_obj_imu_data = obj_imu_data # 使用未归一化的数据
         # -------------------------------------------------
 
         # 提取物体名称
@@ -765,9 +765,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0415/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0417/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0415/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0417/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
