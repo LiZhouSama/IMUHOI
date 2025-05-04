@@ -9,10 +9,11 @@ augmentation: !!python/object/new:easydict.EasyDict
     noise_std: 0.01
     rotation_augmentation: true
     use_augmentation: true
-batch_size: 200
+batch_size: 80
 bm_path: body_models/smplh/male/model.npz
 cfg_file: configs/TransPose_train.yaml
 debug: false
+device: cuda:0
 epoch: 400
 gamma: 0.1
 gpus:
@@ -37,38 +38,39 @@ milestones:
 - 200
 - 300
 - 400
-model_name: TransPose_IMU_v1
+model_name: TransPose_IMU
 model_path: outputs/TransPose/transpose_04100301/epoch_15_best.pt
 model_type: TransPose
 num_human_imus: 6
-num_joints: 24
+num_joints: 22
 num_workers: 12
-save_dir: outputs/TransPose/transpose_04170242
+save_dir: outputs/TransPose/transpose_04282012
 seed: 10
 test: !!python/object/new:easydict.EasyDict
   dictitems:
-    data_path: processed_data_0408/test
+    data_path: processed_data_0417/test
     normalize: true
     window: 120
     window_stride: 120
   state:
-    data_path: processed_data_0408/test
+    data_path: processed_data_0417/test
     normalize: true
     window: 120
     window_stride: 120
 train: !!python/object/new:easydict.EasyDict
   dictitems:
-    data_path: processed_data_0408/train
-    debug_data_path: processed_data_0408/debug
+    data_path: processed_data_0417/train
+    debug_data_path: processed_data_0417/debug
     normalize: true
     window: 120
     window_stride: 60
   state:
-    data_path: processed_data_0408/train
-    debug_data_path: processed_data_0408/debug
+    data_path: processed_data_0417/train
+    debug_data_path: processed_data_0417/debug
     normalize: true
     window: 120
     window_stride: 60
 use_transpose_model: true
 use_wandb: true
-weight_decay: 0.0001
+wandb_project_name: imu_transpose
+weight_decay: 5.0e-05

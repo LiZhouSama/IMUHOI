@@ -118,6 +118,16 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             if obj_imu_input is not None:
                 model_input["obj_imu"] = obj_imu_input
 
+            model_input = {
+                "human_imu": gt_human_imu,
+                "motion": gt_motion,             # 新增
+                "root_pos": gt_root_pos,           # 新增
+            }
+            if obj_imu_input is not None:
+                model_input["obj_imu"] = obj_imu_input # [bs, T, 1, dim]
+                model_input["obj_rot"] = gt_obj_rot_6d # [bs, T, 6]
+                model_input["obj_trans"] = gt_obj_trans # [bs, T, 3]
+
             try:
                 if hasattr(model, 'diffusion_reverse'):
                     pred_dict = model.diffusion_reverse(model_input)
@@ -154,7 +164,8 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             if pred_root_pos_norm is not None:
                 # pred_root_pos_relative_rotated = torch.matmul(head_global_rot_start, pred_root_pos_norm.unsqueeze(-1))
                 # pred_transl = pred_root_pos_relative_rotated.squeeze(-1) @ head_global_rot_start.transpose(-1, -2) + head_global_pos_start
-                pred_transl = pred_transl.reshape(bs * seq_len, 3)
+                # pred_transl = pred_transl.reshape(bs * seq_len, 3)
+                pred_transl = pred_root_pos_norm.reshape(bs*seq_len, 3)
             else:
                 pred_transl = gt_root_pos.reshape(bs*seq_len, 3)
 

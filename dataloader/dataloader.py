@@ -99,51 +99,6 @@ class IMUDataset(Dataset):
                 import traceback
                 traceback.print_exc() # 打印更详细的错误追踪
 
-    def _imu_TN(self, imu_data):
-        """
-        对第一帧进行归一化 - 所有IMU数据相对于第一帧
-        
-        Args:
-            imu_data: IMU数据 [T, num_imus, 9]，包含加速度(3维)和6D旋转表示(6维)
-            
-        Returns:
-            norm_imu: 归一化的IMU数据 [T, num_imus, 9]
-        """
-        if imu_data is None or imu_data.nelement() == 0:
-            return imu_data # 如果输入为空则返回
-
-        # 分离加速度和方向
-        accel = imu_data[..., :3]  # [T, num_imus, 3]
-        rot6d = imu_data[..., 3:]  # [T, num_imus, 6]
-
-        T, num_imus, _ = accel.shape
-
-        # 对加速度第一帧进行归一化
-        norm_accel = accel - accel[0:1]  # 减去第一帧 [T, num_imus, 3]
-
-        # 对6D旋转表示进行归一化
-        norm_rot6d = torch.zeros_like(rot6d)  # [T, num_imus, 6]
-
-        # 遍历每个IMU传感器
-        for i in range(num_imus):
-            # 将6D旋转表示转换回旋转矩阵
-            rot_matrices = transforms.rotation_6d_to_matrix(rot6d[:, i])  # [T, 3, 3]
-            
-            # 获取第一帧的旋转矩阵并计算其逆
-            first_orient = rot_matrices[0]  # [3, 3]
-            first_orient_inv = torch.inverse(first_orient)  # [3, 3]
-            
-            # 计算每一帧相对于第一帧的旋转
-            rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), rot_matrices)  # [T, 3, 3]
-
-            # 将结果转换为6D旋转表示
-            norm_rot6d[:, i, :] = transforms.matrix_to_rotation_6d(rel_rotations)  # [T, 6]
-
-        # 重新组合IMU数据
-        norm_imu = torch.cat([norm_accel, norm_rot6d], dim=-1)  # [T, num_imus, 9]
-
-        return norm_imu
-
     def __len__(self):
         # 返回独立序列的数量
         return len(self.sequence_info)
@@ -235,12 +190,7 @@ class IMUDataset(Dataset):
             # 对数据进行归一化（如果需要）
             norm_human_imu = human_imu.float()
             norm_obj_imu = obj_imu.float()
-            if self.normalize:      
-                # TODO: 需要验证
-                # 对imu归一化(输入)
-                # norm_human_imu = self._imu_TN(human_imu)
-                # norm_obj_imu = self._imu_TN(obj_imu) if has_object else obj_imu.float()
-
+            if self.normalize:  
                 head_imu_acc_start = human_imu_acc[0, HEAD_IDX] # [3]
                 head_imu_ori_start = human_imu_ori_flat[0, HEAD_IDX] # [3, 3]
                 head_imu_ori_start_inv = torch.inverse(head_imu_ori_start)

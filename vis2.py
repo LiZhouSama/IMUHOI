@@ -9,7 +9,6 @@ from aitviewer.renderables.point_clouds import PointClouds
 from aitviewer.viewer import Viewer
 from aitviewer.scene.camera import Camera
 from moderngl_window.context.base import KeyModifiers
-from moderngl_window.context.base import keys
 import pytorch3d.transforms as transforms
 import trimesh
 
@@ -24,15 +23,17 @@ from dataloader.dataloader import IMUDataset # 从 eval.py 引入
 from models.TransPose_net import TransPoseNet # 明确使用 TransPose
 from models.do_train_imu_TransPose import load_transpose_model # 或者使用这个加载函数
 
+import imgui
+
 
 # --- 定义 Z-up 到 Y-up 的旋转矩阵 ---
-# R_yup = torch.tensor([[1.0, 0.0, 0.0],
-#                       [0.0, 0.0, 1.0],
-#                       [0.0, -1.0, 0.0]], dtype=torch.float32)
-
 R_yup = torch.tensor([[1.0, 0.0, 0.0],
-                      [0.0, 1.0, 0.0],
-                      [0.0, 0.0, 1.0]], dtype=torch.float32)
+                      [0.0, 0.0, 1.0],
+                      [0.0, -1.0, 0.0]], dtype=torch.float32)
+
+# R_yup = torch.tensor([[1.0, 0.0, 0.0],
+#                       [0.0, 1.0, 0.0],
+#                       [0.0, 0.0, 1.0]], dtype=torch.float32)
 
 # === 辅助函数 (来自 eval.py 和 vis.py) ===
 
@@ -77,6 +78,7 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
 
         T = obj_trans.shape[0]
         ori_obj_verts = obj_mesh_verts[None].repeat(T, 1, 1) # T X Nv X 3
+        
 
         # --- 首先应用缩放 (如果提供) ---
         if scale is not None:
@@ -90,19 +92,19 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
                  scale_tensor = None
 
             if scale_tensor is not None:
-                 ori_obj_verts = ori_obj_verts * scale_tensor
+                ori_obj_verts = ori_obj_verts * scale_tensor
         # --- 结束缩放应用 ---
 
+        # --- 应用旋转和平移到 (可能) 已缩放的顶点 ---
         seq_rot_mat = obj_rot.float().to(device) # T X 3 X 3
         seq_trans = obj_trans.float().to(device) # T X 3 (不含缩放)
-
-        # --- 应用旋转和平移到 (可能) 已缩放的顶点 ---
         # Transpose vertices for matmul: T X 3 X Nv
         verts_rotated = torch.bmm(seq_rot_mat, ori_obj_verts.transpose(1, 2))
         # Add translation (broadcast): T X 3 X Nv + T X 3 X 1 -> T X 3 X Nv
         verts_translated = verts_rotated + seq_trans.unsqueeze(-1)
         # Transpose back: T X Nv X 3
         transformed_obj_verts = verts_translated.transpose(1, 2)
+
 
     except Exception as e:
         print(f"应用变换到物体几何体失败 for {obj_mesh_path}: {e}")
@@ -177,41 +179,33 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
 
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True):
     """ 在 aitviewer 场景中可视化单个批次的数据 (真值和预测) """
-    # --- Revised Clearing Logic (Attempt 4) ---
+    # --- Revised Clearing Logic (Attempt 5 - Using Scene.remove) ---
     try:
-        # Use collect_nodes to get all nodes in the scene
-        all_nodes = viewer.scene.collect_nodes()
-        renderables_to_remove = [
-            node for node in all_nodes
+        # Use collect_nodes to get all nodes currently managed by the scene
+        # We filter based on name to identify previously added GT/Pred meshes
+        nodes_to_remove = [
+            node for node in viewer.scene.collect_nodes()
             if hasattr(node, 'name') and node.name is not None and (node.name.startswith("GT-") or node.name.startswith("Pred-"))
         ]
 
-        # Try removing nodes using a potential 'destroy' or 'remove' method on the node itself
+        # Call viewer.scene.remove() for each identified node
         removed_count = 0
-        for node_to_remove in renderables_to_remove:
-            removed = False
-            if hasattr(node_to_remove, 'destroy'):
+        if nodes_to_remove:
+            # print(f"Attempting to remove {len(nodes_to_remove)} nodes from the scene.")
+            for node_to_remove in nodes_to_remove:
                 try:
-                    node_to_remove.destroy()
-                    removed = True
+                    # print(f"  Removing: {node_to_remove.name}")
+                    viewer.scene.remove(node_to_remove)
                     removed_count += 1
                 except Exception as e:
-                    print(f"Error calling node.destroy() for '{node_to_remove.name}': {e}")
-            elif hasattr(node_to_remove, 'remove'): # Less likely but possible
-                try:
-                    node_to_remove.remove()
-                    removed = True
-                    removed_count += 1
-                except Exception as e:
-                    print(f"Error calling node.remove() for '{node_to_remove.name}': {e}")
-            # Add more potential removal methods if needed
-
-            # if not removed:
-            #     print(f"Warning: Could not find a method to remove node '{node_to_remove.name}'")
-        # print(f"Attempted to remove {removed_count} old nodes.")
+                    # This might happen if the node was already removed or detached somehow
+                    print(f"Error removing node '{node_to_remove.name}' from scene: {e}")
+            # print(f"Successfully removed {removed_count} nodes.")
+        # else:
+            # print("No old GT/Pred nodes found to remove.")
 
     except AttributeError as e:
-        print(f"Error accessing scene nodes or methods (maybe collect_nodes doesn't exist?): {e}")
+        print(f"Error accessing scene nodes or methods (maybe collect_nodes or remove doesn't exist?): {e}")
     except Exception as e:
         print(f"Error during scene clearing: {e}")
     # --- End Revised Clearing Logic ---
@@ -221,6 +215,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         gt_root_pos = batch["root_pos"].to(device)         # [bs, T, 3]
         gt_motion = batch["motion"].to(device)           # [bs, T, 132]
         human_imu = batch["human_imu"].to(device)        # [bs, T, num_imus, 9/12]
+        head_global_rot_start = batch["head_global_trans_start"][..., :3, :3].to(device)  # [bs, 1, 3, 3]
+        head_global_pos_start = batch["head_global_trans_start"][..., :3, 3].to(device)  # [bs, 1, 3]
         obj_imu = batch.get("obj_imu", None)             # [bs, T, 1, 9/12] or None
         gt_obj_trans = batch.get("obj_trans", None)      # [bs, T, 3] or None
         gt_obj_rot_6d = batch.get("obj_rot", None)       # [bs, T, 6] or None
@@ -243,13 +239,20 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         T = gt_motion.shape[1]
         gt_root_pos_seq = gt_root_pos[bs]           # [T, 3]
         gt_motion_seq = gt_motion[bs]             # [T, 132]
+        head_global_rot_start = head_global_rot_start[bs]  # [1, 3, 3]
+        head_global_pos_start = head_global_pos_start[bs]  # [1, 3]
 
         # --- 2. 获取真值 SMPL ---
         gt_rot_matrices = transforms.rotation_6d_to_matrix(gt_motion_seq.reshape(T, 22, 6)) # [T, 22, 3, 3]
-        gt_root_orient_mat = gt_rot_matrices[:, 0]                         # [T, 3, 3]
+        gt_root_orient_mat_norm = gt_rot_matrices[:, 0]                         # [T, 3, 3]
         gt_pose_body_mat = gt_rot_matrices[:, 1:].reshape(T * 21, 3, 3)    # [T*21, 3, 3]
-        gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat) # [T, 3]
+        # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat_norm) # [T, 3]
         gt_pose_body_axis = transforms.matrix_to_axis_angle(gt_pose_body_mat).reshape(T, -1) # [T, 63]
+
+        # Denormalization
+        gt_root_orient_mat = head_global_rot_start @ gt_root_orient_mat_norm
+        gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(T, 3)
+        gt_root_pos_seq = (head_global_rot_start @ gt_root_pos_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
 
         gt_smplh_input = {
             'root_orient': gt_root_orient_axis,
@@ -264,22 +267,34 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_motion_seq = None
         pred_obj_rot_6d_seq = None
         pred_obj_trans_seq = None # TransPose 不预测
-        pred_root_pos_seq = None # TransPose 不预测
+        pred_root_pos_seq = None
 
-        model_input = {"human_imu": human_imu} # [bs, T, num_imus, dim]
+        model_input = {
+                "human_imu": human_imu,
+                "motion": gt_motion,             # 新增
+                "root_pos": gt_root_pos,           # 新增
+            }
         has_object_data_for_model = obj_imu is not None
         if has_object_data_for_model:
             model_input["obj_imu"] = obj_imu # [bs, T, 1, dim]
+            model_input["obj_rot"] = gt_obj_rot_6d # [bs, T, 6]
+            model_input["obj_trans"] = gt_obj_trans # [bs, T, 3]
 
         try:
             pred_dict = model(model_input)
             pred_motion = pred_dict.get("motion") # [bs, T, 132]
             pred_obj_rot = pred_dict.get("obj_rot") # [bs, T, 6] (TransPose 输出 6D)
+            pred_root_pos = pred_dict.get("root_pos") # [bs, T, 3]
 
             if pred_motion is not None:
                 pred_motion_seq = pred_motion[bs] # [T, 132]
             else:
                 print("警告: 模型未输出 'motion'")
+
+            if pred_root_pos is not None:
+                pred_root_pos_seq = pred_root_pos[bs] # [T, 3]
+            else:
+                print("警告: 模型未输出 'root_pos'")
 
             if pred_obj_rot is not None:
                 pred_obj_rot_6d_seq = pred_obj_rot[bs] # [T, 6]
@@ -295,16 +310,19 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         verts_pred_seq = None
         if pred_motion_seq is not None:
             pred_rot_matrices = transforms.rotation_6d_to_matrix(pred_motion_seq.reshape(T, 22, 6)) # [T, 22, 3, 3]
-            pred_root_orient_mat = pred_rot_matrices[:, 0]                         # [T, 3, 3]
+            pred_root_orient_mat_norm = pred_rot_matrices[:, 0]                         # [T, 3, 3]
             pred_pose_body_mat = pred_rot_matrices[:, 1:].reshape(T * 21, 3, 3)    # [T*21, 3, 3]
-            pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat) # [T, 3]
+            # Denormalization
+            pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat_norm
+            pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(T, 3)
             pred_pose_body_axis = transforms.matrix_to_axis_angle(pred_pose_body_mat).reshape(T, -1) # [T, 63]
 
-            # 使用真值 root_pos
+            pred_root_pos_seq = (head_global_rot_start @ pred_root_pos_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
+
             pred_smplh_input = {
                 'root_orient': pred_root_orient_axis,
                 'pose_body': pred_pose_body_axis,
-                'trans': gt_root_pos_seq # <-- 使用真值 trans
+                'trans': pred_root_pos_seq
             }
             body_pose_pred = smpl_model(**pred_smplh_input)
             verts_pred_seq = body_pose_pred.v # [T, Nv, 3]
@@ -324,6 +342,9 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             gt_obj_bottom_trans_seq = gt_obj_bottom_trans[bs] if gt_obj_bottom_trans is not None else None
             gt_obj_bottom_rot_seq = gt_obj_bottom_rot[bs] if gt_obj_bottom_rot is not None else None
 
+            # Denormalization
+            gt_obj_rot_mat_seq = head_global_rot_start @ gt_obj_rot_mat_seq
+            gt_obj_trans_seq = (head_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
 
             # 获取真值物体
             gt_obj_verts_seq, obj_faces_np = load_object_geometry(
@@ -336,6 +357,9 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             # 获取预测物体 (使用预测 rot + 真值 trans + 真值 scale)
             if pred_obj_rot_6d_seq is not None:
                 pred_obj_rot_mat_seq = transforms.rotation_6d_to_matrix(pred_obj_rot_6d_seq) # [T, 3, 3]
+                # Denormalization
+                pred_obj_rot_mat_seq = head_global_rot_start @ pred_obj_rot_mat_seq
+
                 pred_obj_verts_seq, _ = load_object_geometry(
                     obj_name, pred_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq, # <-- 使用真值 trans, scale
                     obj_bottom_trans=gt_obj_bottom_trans_seq, # Use GT bottom parts for consistency
@@ -359,7 +383,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
         # 添加预测人体 (红色, 偏移 x=1.0)
         if verts_pred_seq is not None:
-            verts_pred_shifted = verts_pred_seq + torch.tensor([1.0, 0, 0], device=device) # 偏移
+            verts_pred_shifted = verts_pred_seq + torch.tensor([0.0, 0, 0], device=device) # 偏移
             verts_pred_yup = torch.matmul(verts_pred_shifted, R_yup.T.to(device))
             pred_human_mesh = Meshes(
                 verts_pred_yup.cpu().numpy(), faces_gt_np,
@@ -378,7 +402,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
         # 添加预测物体 (红色, 偏移 x=1.0)
         if pred_obj_verts_seq is not None and obj_faces_np is not None:
-            pred_obj_verts_shifted = pred_obj_verts_seq + torch.tensor([1.0, 0, 0], device=device) # 偏移
+            pred_obj_verts_shifted = pred_obj_verts_seq + torch.tensor([0.0, 0, 0], device=device) # 偏移
             pred_obj_verts_yup = torch.matmul(pred_obj_verts_shifted, R_yup.T.to(device))
             pred_obj_mesh = Meshes(
                 pred_obj_verts_yup.cpu().numpy(), obj_faces_np,
@@ -426,21 +450,38 @@ class InteractiveViewer(Viewer):
         else:
             print("Index out of bounds.")
 
-    def key_press_event(self, key: keys, scancode: int, mods: KeyModifiers):
-        super().key_press_event(key, scancode, mods) # 调用父方法处理基本快捷键
+    # --- Rename to key_event and adjust logic --- 
+    # def key_press_event(self, key, scancode: int, mods: KeyModifiers): # Old name and signature
+    def key_event(self, key, action, modifiers):
+        # --- Call Parent First --- 
+        # Important: Call super first to allow base class and ImGui to process event
+        super().key_event(key, action, modifiers)
 
-        if key == keys.Q:
-            if self.current_index > 0:
-                self.current_index -= 1
-                self.visualize_current_sequence()
-            else:
-                print("Already at the first sequence.")
-        elif key == keys.E:
-            if self.current_index < len(self.data_list) - 1:
-                self.current_index += 1
-                self.visualize_current_sequence()
-            else:
-                print("Already at the last sequence.")
+        # --- Check if ImGui wants keyboard input --- 
+        # If ImGui is active and wants keyboard input, don't process our keys
+        io = imgui.get_io()
+        if self.render_gui and (io.want_capture_keyboard or io.want_text_input):
+             return # Let ImGui handle it
+
+        # --- Check for Key PRESS action --- 
+        is_press = action == self.wnd.keys.ACTION_PRESS
+
+        if is_press:
+            # Compare using self.wnd.keys
+            if key == self.wnd.keys.Q:
+                # print("Q key pressed!") # Optional debug
+                if self.current_index > 0:
+                    self.current_index -= 1
+                    self.visualize_current_sequence()
+                else:
+                    print("Already at the first sequence.")
+            elif key == self.wnd.keys.E:
+                # print("E key pressed!") # Optional debug
+                if self.current_index < len(self.data_list) - 1:
+                    self.current_index += 1
+                    self.visualize_current_sequence()
+                else:
+                    print("Already at the last sequence.")
 
 # === 主函数 ===
 

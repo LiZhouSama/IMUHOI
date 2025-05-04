@@ -25,7 +25,7 @@ except ImportError:
 IMU_JOINTS = [20, 21, 7, 8, 0, 15]  # 左手、右手、左脚、右脚、髋部、头部
 IMU_JOINT_NAMES = ['left_hand', 'right_hand', 'left_foot', 'right_foot', 'hip', 'head']
 HEAD_IDX = 5  # 头部在IMU_JOINTS列表中的索引
-FRAME_RATE = 1  # 帧率
+FRAME_RATE = 60  # 帧率
 
 # 生成加速度数据，使用二阶差分计算
 def _syn_acc(v, smooth_n=4):
@@ -424,6 +424,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
 
     # 提取物体相关信息(如果存在)
     obj_data = {}
+    transformed_verts = None # 初始化以备后用
     if 'obj_scale' in seq_data:
         # 将物体数据转移到设备
         obj_scale = torch.tensor(seq_data['obj_scale'], device=device).float()
@@ -433,7 +434,8 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
             obj_trans = torch.tensor(seq_data['obj_trans'], device=device).float()
         obj_rot = torch.tensor(seq_data['obj_rot'], device=device).float()
         obj_com_pos = torch.tensor(seq_data['obj_com_pos'], device=device).float()
-        
+        T = obj_trans.shape[0] # 获取时间步长
+
         # 计算物体的IMU数据 (现在是加速度和方向)
         obj_imu_data = compute_object_imu(obj_trans, obj_rot)
         # norm_obj_imu_data = normalize_to_head_frame(obj_imu_data, head_imu_data=(head_accel, head_ori))
@@ -445,66 +447,64 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
 
         # 提取物体名称
         object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
-        
-        # # 计算BPS特征 (如果提供了物体网格目录)
-        # bps_save_path = os.path.join(bps_dir, f"{seq_name}_{seq_key}.npy")
-        # if obj_mesh_dir and not os.path.exists(bps_save_path):
-        #     try:
-        #         # 加载物体网格
-        #         obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}.obj")
-        #         if not os.path.exists(obj_mesh_path):
-        #             obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}_cleaned_simplified.obj")
-                
-        #         if os.path.exists(obj_mesh_path):
-        #             # 加载网格
-        #             mesh = trimesh.load_mesh(obj_mesh_path)
-        #             obj_mesh_verts = torch.tensor(mesh.vertices, device=device).float() #物体顶点维度: torch.Size([17996, 3]), 
-        #             # 物体变换维度: 缩放=torch.Size([T]), 旋转=torch.Size([T, 3, 3]), 平移=torch.Size([T, 3, 1])
-                    
-        #             # 确保物体顶点是二维数组 [N, 3]
-        #             if obj_mesh_verts.dim() > 2:
-        #                 obj_mesh_verts = obj_mesh_verts.reshape(-1, 3)
-                    
-        #             # 确保变换维度匹配
-        #             T = obj_trans.shape[0]
-                    
-        #             # 应用变换到物体网格
-        #             transformed_verts = apply_transformation_to_obj(
-        #                 obj_mesh_verts, obj_scale, obj_rot, obj_trans
-        #             ) # [T, 17996, 3]
-                    
-        #             # 计算物体中心
-        #             center_verts = transformed_verts.mean(dim=1)  # [T, 3] [T, 3]
-                    
-        #             # 准备自定义基点 (将BPS点移动到物体中心)
-        #             custom_basis = bps_points.unsqueeze(0).repeat(T, 1, 1)
-                    
-        #             # 应用物体中心偏移 (确保广播维度正确)
-        #             custom_basis = custom_basis + center_verts.unsqueeze(1) # [T, 1024, 3]
-                    
-        #             # 计算BPS特征
-        #             bps_features = compute_object_geo_bps(transformed_verts, custom_basis, device)
-                    
-        #             # 确保特征形状一致
-        #             if bps_features.shape[0] != T:
-        #                 print(f"警告: BPS特征时间步数与原始数据不一致，调整形状 {bps_features.shape[0]} -> {T}")
-        #                 if bps_features.shape[0] > T:
-        #                     bps_features = bps_features[:T]
-        #                 else:
-        #                     # 填充缺失的时间步
-        #                     pad = torch.zeros(T - bps_features.shape[0], bps_features.shape[1], bps_features.shape[2], device=device)
-        #                     bps_features = torch.cat([bps_features, pad], dim=0)
-                    
-        #             # 保存BPS特征
-        #             np.save(bps_save_path, bps_features.cpu().numpy())
-        #             print(f"已保存BPS特征到: {bps_save_path}")
-        #         else:
-        #             print(f"警告: 未找到物体网格文件: {obj_mesh_path}")
-        #     except Exception as e:
-        #         print(f"警告: 计算BPS特征时出错: {e}")
-        #         import traceback
-        #         traceback.print_exc()
-        
+
+        # --- 添加手部-物体接触计算 ---
+        lhand_contact = torch.zeros(T, dtype=torch.bool, device=device)
+        rhand_contact = torch.zeros(T, dtype=torch.bool, device=device)
+        obj_contact = torch.zeros(T, dtype=torch.bool, device=device)
+
+        if obj_mesh_dir:
+            try:
+                # 加载物体网格
+                obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}.obj")
+                if not os.path.exists(obj_mesh_path):
+                    obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}_cleaned_simplified.obj")
+
+                if os.path.exists(obj_mesh_path):
+                    # 加载网格
+                    mesh = trimesh.load_mesh(obj_mesh_path)
+                    obj_mesh_verts = torch.tensor(mesh.vertices, device=device).float() #物体顶点维度: torch.Size([N_v, 3])
+
+                    # 确保物体顶点是二维数组 [N_v, 3]
+                    if obj_mesh_verts.dim() > 2:
+                        obj_mesh_verts = obj_mesh_verts.reshape(-1, 3)
+
+                    # 应用变换到物体网格
+                    transformed_verts = apply_transformation_to_obj(
+                        obj_mesh_verts, obj_scale, obj_rot, obj_trans
+                    ) # [T, N_v, 3]
+
+                    # 提取手部关节位置 (使用索引 20 和 21)
+                    lhand_jnt = position_global_full_gt_world[:, 20, :].to(device) # [T, 3]
+                    rhand_jnt = position_global_full_gt_world[:, 21, :].to(device) # [T, 3]
+
+                    num_obj_verts = transformed_verts.shape[1]
+
+                    # 计算距离 (可以使用更高效的 cdist)
+                    # [T, 1, 3] vs [T, N_v, 3] -> [T, 1, N_v] -> [T, N_v]
+                    lhand2obj_dist = torch.cdist(lhand_jnt.unsqueeze(1), transformed_verts).squeeze(1)
+                    rhand2obj_dist = torch.cdist(rhand_jnt.unsqueeze(1), transformed_verts).squeeze(1)
+
+                    # 找出最小距离
+                    lhand2obj_dist_min = torch.min(lhand2obj_dist, dim=1)[0] # [T]
+                    rhand2obj_dist_min = torch.min(rhand2obj_dist, dim=1)[0] # [T]
+
+                    # 设置接触阈值 (参考 evaluation_metrics.py, use_joints24=False)
+                    contact_threh = 0.10
+
+                    # 判断接触状态
+                    lhand_contact = (lhand2obj_dist_min < contact_threh)
+                    rhand_contact = (rhand2obj_dist_min < contact_threh)
+                    obj_contact = lhand_contact | rhand_contact
+
+                else:
+                    print(f"警告: 未找到物体网格文件以计算接触: {obj_mesh_path}")
+            except Exception as e:
+                print(f"警告: 计算手部-物体接触时出错: {e}")
+                import traceback
+                traceback.print_exc()
+        # --- 手部-物体接触计算结束 ---
+
         # 构建物体数据字典
         obj_data = {
             "obj_name": object_name,
@@ -517,6 +517,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
                 "orientations": processed_obj_imu_data["orientations"].cpu()  # [T, 1, 3, 3]
             },
             # "bps_file": f"{seq_name}_{seq_key}.npy"  # 存储BPS文件路径的相对引用
+            # --- 添加接触信息到obj_data ---
+            "lhand_contact": lhand_contact.cpu(), # [T] bool
+            "rhand_contact": rhand_contact.cpu(), # [T] bool
+            "obj_contact": obj_contact.cpu() # [T] bool
+            # -----------------------------
         }
     
     # 组装输出数据
@@ -765,9 +770,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0417/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0429/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0417/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0429/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
