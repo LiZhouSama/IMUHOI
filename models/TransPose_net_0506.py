@@ -1,3 +1,5 @@
+# 这个net是适配0506 preprocess和outputs/TransPose/transpose_05051705/epoch_120_best.pt 这个model的，后续要开始加接触和调整关节了
+# 另外这个net的可视化是比较好的，可以正确可视化出接触和HPE
 import sys
 import os
 sys.path.append("../")
@@ -15,8 +17,8 @@ class joint_set:
     # TransPose关节索引
     leaf = [7, 8, 12, 20, 21]
     full = list(range(1, 22))
-    reduced = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-    ignored = [0]
+    reduced = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+    ignored = [0, 10, 11]
 
     lower_body = [0, 1, 2, 4, 5, 7, 8, 10, 11]
     lower_body_parent = [None, 0, 0, 1, 2, 3, 4, 5, 6]
@@ -114,25 +116,6 @@ class TransPoseNet(torch.nn.Module):
         ).to(self.device)
 
 
-        # --- 手部接触网络相关索引 ---
-        self.lhand_imu_idx = 0 # 基于 global_config.py IMU_JOINT_NAMES
-        self.rhand_imu_idx = 1 # 基于 global_config.py IMU_JOINT_NAMES
-        # self.num_human_imus 维度中的索引
-
-        # joint_set.full 中的手腕关节索引 (原始SMPL关节20和21)
-        # joint_set.full = [1, ..., 21], 长度为21
-        # 原始关节20 -> joint_set.full.index(20) = 19
-        # 原始关节21 -> joint_set.full.index(21) = 20
-        self.lhand_jnt_idx_in_full = 19 
-        self.rhand_jnt_idx_in_full = 20
-
-        # joint_set.reduced 中的手腕关节索引 (原始SMPL关节20和21)
-        # joint_set.reduced = [1, 2, ..., 19, 20, 21] (实际值)
-        # 在这个 reduced 列表中，原始关节20是列表的第19个元素 (0-indexed)
-        # 在这个 reduced 列表中，原始关节21是列表的第20个元素 (0-indexed)
-        self.lhand_jnt_idx_in_reduced = 19
-        self.rhand_jnt_idx_in_reduced = 20
-
 
         # --- RNN 模块定义 ---
         # 姿态估计级联架构
@@ -145,18 +128,6 @@ class TransPoseNet(torch.nn.Module):
 
         # 基于运动学的速度分支预测网络 (设置为单向)
         self.trans_b2 = RNN(joint_set.n_full * 3 + n_imu, 3, 256 * hidden_dim_multiplier, bidirectional=False)
-        
-        # --- 手部接触预测网络 ---
-        # 输入: 3*imu_dim (双手IMU+物体IMU) + 2*3 (手部位置 from S2) + 2*6 (手部旋转 from S3 reduced)
-        # n_hand_contact_input = (3 * self.imu_dim) + (2 * 3) + (2 * 6)
-        n_hand_contact_input = (3 * self.imu_dim) + (2 * 3)
-        self.hand_contact_net = RNN(n_hand_contact_input, 3, 128 * hidden_dim_multiplier) # 输出3个接触概率
-
-        # --- 物体平移预测网络 ---
-        # 输入: 与 hand_contact_net 相同，再加3维接触概率
-        n_obj_trans_input = n_hand_contact_input + 3 # hand_contact_input + pred_hand_contact_prob
-        self.obj_trans_net = RNN(n_obj_trans_input, 3, 128 * hidden_dim_multiplier) # 输出3维物体平移
-
 
         # --- 用于生成初始状态的线性层 ---
         # 每个RNN需要 h_0 和 c_0
@@ -173,8 +144,6 @@ class TransPoseNet(torch.nn.Module):
         self.proj_s3_state = create_state_projection(self.pose_s3.n_hidden, self.pose_s3.n_rnn_layer, self.pose_s3.num_directions == 2)
         self.proj_contact_state = create_state_projection(self.contact_prob_net.n_hidden, self.contact_prob_net.n_rnn_layer, self.contact_prob_net.num_directions == 2)
         self.proj_trans_b2_state = create_state_projection(self.trans_b2.n_hidden, self.trans_b2.n_rnn_layer, self.trans_b2.num_directions == 2)
-        self.proj_hand_contact_state = create_state_projection(self.hand_contact_net.n_hidden, self.hand_contact_net.n_rnn_layer, self.hand_contact_net.num_directions == 2)
-        self.proj_obj_trans_state = create_state_projection(self.obj_trans_net.n_hidden, self.obj_trans_net.n_rnn_layer, self.obj_trans_net.num_directions == 2)
 
 
         # 3. SMPL Body Model for FK
@@ -227,17 +196,35 @@ class TransPoseNet(torch.nn.Module):
         obj_trans = data_dict.get("obj_trans", None) # [bs, seq, 3] or None
 
         batch_size, seq_len = human_imu.shape[:2]
+        device = human_imu.device
 
         # --- 处理 IMU 数据 ---
         human_imu_flat_seq = human_imu.reshape(batch_size, seq_len, -1) # [bs, seq, num_imus*imu_dim]
-        obj_imu_flat_seq = obj_imu.reshape(batch_size, seq_len, -1) # [bs, seq, 1*imu_dim]
+
+        if obj_imu is None:
+            # 如果没有物体IMU，用零填充
+            obj_imu_flat_seq = torch.zeros((batch_size, seq_len, 1 * self.imu_dim), device=device, dtype=human_imu.dtype)
+            print("没有物体IMU，用零填充")
+        else:
+            obj_imu_flat_seq = obj_imu.reshape(batch_size, seq_len, -1) # [bs, seq, 1*imu_dim]
+
         imu_data = torch.cat([human_imu_flat_seq, obj_imu_flat_seq], dim=2) # [bs, seq, n_imu]
 
         # --- 处理第一帧状态信息 ---
         motion_start = motion[:, 0].reshape(batch_size, -1) # [bs, num_joints * joint_dim]
         root_pos_start = root_pos[:, 0]                   # [bs, 3]
-        obj_rot_start = obj_rot[:, 0]                 # [bs, 6]
-        obj_trans_start = obj_trans[:, 0]             # [bs, 3]
+
+        if obj_rot is None:
+            obj_rot_start = torch.zeros((batch_size, 6), device=device, dtype=motion.dtype)
+            print("没有物体旋转，用零填充")
+        else:
+            obj_rot_start = obj_rot[:, 0]                 # [bs, 6]
+
+        if obj_trans is None:
+            obj_trans_start = torch.zeros((batch_size, 3), device=device, dtype=motion.dtype)
+            print("没有物体平移，用零填充")
+        else:
+            obj_trans_start = obj_trans[:, 0]             # [bs, 3]
 
         initial_state_flat = torch.cat([
             motion_start,
@@ -348,7 +335,7 @@ class TransPoseNet(torch.nn.Module):
             c_0 = h_0_c_0[1].permute(1, 0, 2).contiguous() # Shape: [num_layers * num_directions, bs, hidden_size]
             return (h_0, c_0)
 
-        # --- 获取基本 RNNs 的初始状态 ---
+        # --- 获取所有 RNNs 的初始状态 --- # <<< 新增注释
         s1_initial_state = get_initial_rnn_state(self.proj_s1_state, self.pose_s1)
         s2_initial_state = get_initial_rnn_state(self.proj_s2_state, self.pose_s2)
         s3_initial_state = get_initial_rnn_state(self.proj_s3_state, self.pose_s3)
@@ -457,70 +444,6 @@ class TransPoseNet(torch.nn.Module):
         # 如果需要绝对位置，需要加上初始位置 data_dict['root_pos'][:, 0]
         # trans = trans + data_dict['root_pos'][:, 0:1, :] # Add initial root position
 
-        # --- 手部接触预测和物体平移预测 (使用SMPL全局关节位置) ---
-        # 现在我们有了完整的人体平移和姿态，可以通过SMPL前向运动学得到准确的全局关节位置
-        
-        # 1. 准备SMPL输入参数
-        pred_root_orient_6d = pred_motion[:, :, :6]  # [bs, seq, 6]
-        pred_body_pose_6d = pred_motion[:, :, 6:]    # [bs, seq, 21*6]
-        
-        # 转换为轴角表示
-        pred_root_orient_6d_flat = pred_root_orient_6d.reshape(-1, 6)
-        pred_body_pose_6d_flat = pred_body_pose_6d.reshape(-1, 21, 6)
-        pred_root_orient_mat_flat = rotation_6d_to_matrix(pred_root_orient_6d_flat)
-        pred_body_pose_mat_flat = rotation_6d_to_matrix(pred_body_pose_6d_flat.reshape(-1, 6)).reshape(-1, 21, 3, 3)
-        pred_root_orient_axis_flat = matrix_to_axis_angle(pred_root_orient_mat_flat)
-        pred_body_pose_axis_flat = matrix_to_axis_angle(pred_body_pose_mat_flat.reshape(-1, 3, 3)).reshape(-1, 21*3)
-        pred_transl_flat = trans.reshape(-1, 3)
-        
-        # 2. SMPL前向运动学
-        pred_pose_body_input = {
-            'root_orient': pred_root_orient_axis_flat, 
-            'pose_body': pred_body_pose_axis_flat, 
-            'trans': pred_transl_flat
-        }
-        pred_smplh_out = self.body_model(**pred_pose_body_input)
-        pred_joints_all = pred_smplh_out.Jtr.view(batch_size, seq_len, -1, 3)  # [bs, seq, num_joints, 3]
-        
-        # 3. 提取手部IMU数据
-        human_imu_part = imu_data[:, :, :self.num_human_imus * self.imu_dim] # [bs, seq, num_human_imus * imu_dim]
-        human_imu_reshaped = human_imu_part.reshape(batch_size, seq_len, self.num_human_imus, self.imu_dim) # [bs, seq, num_human_imus, imu_dim]
-        
-        lhand_imu = human_imu_reshaped[:, :, self.lhand_imu_idx, :] # [bs, seq, imu_dim]
-        rhand_imu = human_imu_reshaped[:, :, self.rhand_imu_idx, :] # [bs, seq, imu_dim]
-        
-        # 提取物体IMU
-        start_idx_obj_imu = self.num_human_imus * self.imu_dim
-        end_idx_obj_imu = start_idx_obj_imu + self.imu_dim
-        obj_imu = imu_data[:, :, start_idx_obj_imu:end_idx_obj_imu] # [bs, seq, imu_dim]
-        imu_feat = torch.cat([lhand_imu, rhand_imu, obj_imu], dim=2) # [bs, seq, 3 * imu_dim]
-        
-        # 4. 使用SMPL全局关节位置提取手部位置
-        # 手腕关节在SMPL中的索引是20和21
-        lhand_pos_global = pred_joints_all[:, :, self.wrist_l_idx, :] # [bs, seq, 3] (关节20)
-        rhand_pos_global = pred_joints_all[:, :, self.wrist_r_idx, :] # [bs, seq, 3] (关节21)
-        hands_pos_feat = torch.cat([lhand_pos_global, rhand_pos_global], dim=2) # [bs, seq, 2 * 3]
-        
-        # # 5. 提取手部旋转 (从 pred_reduced_global_pose_6d 中提取)
-        # pred_reduced_global_pose_6d_reshaped = pred_reduced_global_pose_6d.reshape(batch_size, seq_len, joint_set.n_reduced, 6)
-        # lhand_rot_s3 = pred_reduced_global_pose_6d_reshaped[:, :, self.lhand_jnt_idx_in_reduced, :] # [bs, seq, 6]
-        # rhand_rot_s3 = pred_reduced_global_pose_6d_reshaped[:, :, self.rhand_jnt_idx_in_reduced, :] # [bs, seq, 6]
-        # hands_rot_feat = torch.cat([lhand_rot_s3, rhand_rot_s3], dim=2) # [bs, seq, 2 * 6]
-        
-        # 6. 获取手部接触和物体平移网络的初始状态
-        hand_contact_initial_state = get_initial_rnn_state(self.proj_hand_contact_state, self.hand_contact_net)
-        obj_trans_initial_state = get_initial_rnn_state(self.proj_obj_trans_state, self.obj_trans_net)
-        
-        # 7. 手部接触预测
-        # hand_contact_input = torch.cat([imu_feat, hands_pos_feat, hands_rot_feat], dim=2)
-        hand_contact_input = torch.cat([imu_feat, hands_pos_feat], dim=2)
-        pred_hand_contact_prob_logits, _ = self.hand_contact_net(hand_contact_input, hand_contact_initial_state) # [bs, seq, 3]
-        pred_hand_contact_prob = torch.sigmoid(pred_hand_contact_prob_logits) # [bs, seq, 3]
-        
-        # 8. 物体平移预测 (使用手部接触网络的输入和输出)
-        obj_trans_input = torch.cat([hand_contact_input, pred_hand_contact_prob], dim=2)
-        pred_obj_trans, _ = self.obj_trans_net(obj_trans_input, obj_trans_initial_state) # [bs, seq, 3]
-
         # --- 重塑回结果格式 ---
         # pose_6d 已经是 [bs, seq, num_joints*6]
         
@@ -531,8 +454,6 @@ class TransPoseNet(torch.nn.Module):
             "pred_leaf_pos": pred_leaf_pos, # [bs, seq, n_leaf, 3] # <<< 添加
             "pred_full_pos": pred_full_pos, # [bs, seq, n_full, 3] # <<< 添加
             "root_vel": velocity,     # [bs, seq, 3] - 根关节速度 # <<< 添加
-            "pred_hand_contact_prob": pred_hand_contact_prob, # [bs, seq, 3] <<< 新增
-            "pred_obj_trans": pred_obj_trans, # [bs, seq, 3] <<< 新增
             # "pred_wrist_delta_6d": delta_6d.reshape(batch_size, seq_len, 2, 6), # Commented out
             # "pred_wrist_refined_6d": wrist_refined_6d.reshape(batch_size, seq_len, 2, 6) # Commented out
         }

@@ -40,8 +40,9 @@ def main():
     # 设置保存目录
     time_stamp = datetime.now().strftime("%m%d%H%M")
     save_dir = os.path.join(cfg.save_dir, f"transpose_{time_stamp}")
-    cfg.save_dir = save_dir
-    os.makedirs(save_dir, exist_ok=True)
+    cfg.save_dir = save_dir if not cfg.debug else None
+    if not cfg.debug:
+        os.makedirs(save_dir, exist_ok=True)
     
     # 打印训练配置
     print("=" * 50)
@@ -50,22 +51,24 @@ def main():
     print(f"训练帧窗口大小: {cfg.train.window}")
     print(f"测试帧窗口大小: {cfg.test.window}")
     print(f"训练窗口步长: {cfg.train.window_stride}")
-    print(f"保存目录: {save_dir}")
+    print(f"保存目录: {cfg.save_dir}")
     
     # 打印损失权重信息（如果有）
     if hasattr(cfg, 'loss_weights'):
         print("\n损失权重配置:")
         print(f"姿态损失权重: {cfg.loss_weights.rot}")
         print(f"根节点位置损失权重: {cfg.loss_weights.root_pos}")
-        print(f"物体位置损失权重: {cfg.loss_weights.obj_trans}")
         print(f"物体旋转损失权重: {cfg.loss_weights.obj_rot}")
+        print(f"叶子节点位置损失权重: {cfg.loss_weights.leaf_pos}")
+        print(f"全身关节位置损失权重: {cfg.loss_weights.full_pos}")
+        print(f"根关节速度损失权重: {cfg.loss_weights.root_vel}")
     print("=" * 50)
-    
+
     # 设置数据集路径 - 使用绝对路径
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 检查是否使用小型数据集进行快速测试
-    use_small_dataset = os.path.exists(os.path.join(base_dir, cfg.train.debug_data_path)) and args.debug
+    use_small_dataset = os.path.exists(os.path.join(base_dir, cfg.train.debug_data_path)) and cfg.debug
     
     if use_small_dataset:
         print("使用小型测试数据集进行快速开发...")
@@ -86,7 +89,7 @@ def main():
         window_size=cfg.train.window,
         window_stride=cfg.train.window_stride,
         normalize=cfg.train.normalize,
-        debug=args.debug
+        debug=cfg.debug
     )
     
     # 如果数据集为空，则无法继续
@@ -116,7 +119,7 @@ def main():
             window_size=cfg.test.window,
             window_stride=cfg.test.window_stride,
             normalize=cfg.test.normalize,
-            debug=args.debug
+            debug=cfg.debug
         )
         
         test_loader = DataLoader(
@@ -146,11 +149,11 @@ def main():
         print("开始TransPose模型训练过程...")
         model, optimizer = do_train_imu_TransPose(cfg, train_loader, test_loader)
     
-    print(f"训练完成！TransPose模型已保存到 {save_dir}")
+    print(f"训练完成！TransPose模型已保存到 {cfg.save_dir}")
     
     # 保存完整配置
     import yaml
-    with open(os.path.join(save_dir, 'training_config.yaml'), 'w') as f:
+    with open(os.path.join(cfg.save_dir, 'training_config.yaml'), 'w') as f:
         yaml.dump(cfg.__dict__, f)
     
     return

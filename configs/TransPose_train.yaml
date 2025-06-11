@@ -13,15 +13,15 @@ bm_path: body_models/smplh/male/model.npz
 use_transpose_model: True
 
 # 训练超参数
-epoch: 400  # 训练轮数
-batch_size: 80  # 批大小
+epoch: 200  # 训练轮数
+batch_size: 60  # 批大小
 lr: 0.0005  # 学习率
 weight_decay: 0.00005  # 权重衰减
 milestones: [150,200,300,400]  # 学习率调整节点
 gamma: 0.1  # 学习率衰减系数
 seed: 42  # 随机种子
 num_workers: 12  # 数据加载线程数
-hidden_dim_multiplier: 2  # 隐藏层维度乘数
+hidden_dim_multiplier: 1  # 隐藏层维度乘数
 
 # 特征维度配置
 num_human_imus: 6  # 人体IMU数量
@@ -36,21 +36,24 @@ loss_weights:
   root_pos: 1.0  # 根节点位置损失权重
   obj_trans: 1.0  # 物体位置损失权重
   obj_rot: 1.0  # 物体旋转损失权重
-
+  leaf_pos: 1.0  # 叶子节点位置损失权重
+  full_pos: 1.0  # 全身关节位置损失权重
+  root_vel: 1.0  # 根关节速度损失权重
+  hand_contact: 1.0  # 手部接触损失权重
 # 训练窗口配置
 train:
   window: 120  # 训练时使用的时间窗口长度
   window_stride: 60  # 训练时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0429/train"  # 训练数据路径
-  debug_data_path: "processed_data_0429/debug"  # 调试数据路径
+  data_path: "processed_data_0506/train"  # 训练数据路径
+  debug_data_path: "processed_data_0506/debug"  # 调试数据路径
 
 # 测试窗口配置
 test:
   window: 120  # 测试时使用的时间窗口长度
   window_stride: 120  # 测试时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0429/test"  # 测试数据路径
+  data_path: "processed_data_0506/test"  # 测试数据路径
 
 # 数据增强配置
 augmentation:

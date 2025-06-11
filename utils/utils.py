@@ -143,3 +143,41 @@ def cross_product(u, v):
     out = torch.stack((i, j, k), dim=-1)
     
     return out 
+
+
+def global2local(global_rotmats, parents):
+    """
+    将全局旋转矩阵转换为局部旋转矩阵。
+
+    Args:
+        global_rotmats: 全局旋转矩阵 [batch_size, num_joints, 3, 3]
+        parents: 父关节索引数组 (NumPy array)，-1 表示根关节
+
+    Returns:
+        local_rotmats: 局部旋转矩阵 [batch_size, num_joints, 3, 3]
+    """
+    batch_size, num_joints, _, _ = global_rotmats.shape
+    device = global_rotmats.device
+    
+    local_rotmats = torch.zeros_like(global_rotmats)
+    
+    # 根关节的局部旋转等于其全局旋转
+    local_rotmats[:, 0] = global_rotmats[:, 0]
+    
+    # 遍历非根关节
+    for i in range(1, num_joints):
+        parent_idx = parents[i]
+        
+        # 获取父关节和当前关节的全局旋转
+        R_global_parent = global_rotmats[:, parent_idx]
+        R_global_current = global_rotmats[:, i]
+        
+        # 计算父关节全局旋转的逆（转置）
+        R_global_parent_inv = R_global_parent.transpose(-1, -2)
+        
+        # 计算局部旋转: R_local = R_parent_inv * R_global
+        R_local_current = torch.matmul(R_global_parent_inv, R_global_current)
+        
+        local_rotmats[:, i] = R_local_current
+        
+    return local_rotmats 

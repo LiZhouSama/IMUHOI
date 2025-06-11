@@ -1,0 +1,2 @@
+- contact pred
+- no reduced joints

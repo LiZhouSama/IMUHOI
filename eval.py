@@ -9,6 +9,7 @@ from easydict import EasyDict as edict
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 import argparse
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 def load_config(config_path):
     """加载配置文件"""
@@ -69,10 +70,11 @@ def load_model(model_path, config, device):
     return model
 
 def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True):
-    """评估模型性能，计算 MPJPE, MPJRE (角度), Object Error, Jitter (适配 SMPLH)"""
+    """评估模型性能，计算 MPJPE, MPJRE (角度), Object Trans Error, Contact F1, Jitter (适配 SMPLH)"""
     metrics = {
-        'mpjpe': [], 'mpjre_angle': [],
-        'obj_trans_err': [], 'obj_rot_angle': [], 'jitter': []
+        'mpjpe': [], 'mpjre_angle': [], 'jitter': [],
+        'obj_trans_err': [], 
+        'contact_f1_lhand': [], 'contact_f1_rhand': [], 'contact_f1_obj': []
     }
     num_batches = 0
     num_eval_joints = 22
@@ -84,19 +86,23 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             gt_root_pos = batch["root_pos"].to(device)
             gt_motion = batch["motion"].to(device)
             gt_human_imu = batch["human_imu"].to(device)
-            # Add check for head_global_trans - crucial for denormalization
-            if "head_global_trans_start" not in batch:
-                 print(f"Warning: Batch {batch_idx} missing 'head_global_trans_start'. Skipping batch.")
-                 continue
-            gt_head_trans_start = batch["head_global_trans_start"].to(device)
+            # 不需要反归一化，移除相关检查
 
             gt_obj_imu = batch.get("obj_imu", None)
             gt_obj_trans = batch.get("obj_trans", None)
             gt_obj_rot_6d = batch.get("obj_rot", None)
+            
+            # 获取接触标志
+            gt_lhand_contact = batch.get("lhand_contact", None)  # [bs, T]
+            gt_rhand_contact = batch.get("rhand_contact", None)  # [bs, T]
+            gt_obj_contact = batch.get("obj_contact", None)      # [bs, T]
 
             if gt_obj_imu is not None: gt_obj_imu = gt_obj_imu.to(device)
             if gt_obj_trans is not None: gt_obj_trans = gt_obj_trans.to(device)
             if gt_obj_rot_6d is not None: gt_obj_rot_6d = gt_obj_rot_6d.to(device)
+            if gt_lhand_contact is not None: gt_lhand_contact = gt_lhand_contact.to(device)
+            if gt_rhand_contact is not None: gt_rhand_contact = gt_rhand_contact.to(device)
+            if gt_obj_contact is not None: gt_obj_contact = gt_obj_contact.to(device)
 
             bs, seq_len, motion_dim = gt_motion.shape
             if motion_dim != 132:
@@ -140,8 +146,8 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             # --- Extract Predictions (Normalized) ---
             pred_root_pos_norm = pred_dict.get("root_pos", None)
             pred_motion_norm = pred_dict.get("motion", None)
-            pred_obj_trans_norm = pred_dict.get("obj_trans", None)
-            pred_obj_rot_norm = pred_dict.get("obj_rot", None)
+            pred_obj_trans_norm = pred_dict.get("pred_obj_trans", None)  # 注意键名变化
+            pred_hand_contact_prob = pred_dict.get("pred_hand_contact_prob", None)  # [bs, T, 3]
 
             if pred_motion_norm is None:
                 print(f"Warning: Batch {batch_idx}: Model did not output 'motion'. Skipping batch.")
@@ -150,22 +156,13 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 print(f"Warning: Batch {batch_idx}: Model did not output 'root_pos'. Using GT root position for evaluation.")
 
 
-            # --- Denormalize Predictions using First Frame Head Pose ---
-            head_global_rot_start = gt_head_trans_start[..., :3, :3]
-            head_global_pos_start = gt_head_trans_start[..., :3, 3]
-
-            # Denormalize root orientation， 不再需要denormalize
+            # --- 直接使用归一化数据进行评估 ---
             pred_root_orient_6d_norm = pred_motion_norm[:, :, :6]
             pred_root_orient_mat_norm = transforms.rotation_6d_to_matrix(pred_root_orient_6d_norm)
-            # pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat_norm
-            # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(bs * seq_len, 3)
             pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat_norm).reshape(bs * seq_len, 3)
             
             if pred_root_pos_norm is not None:
-                # pred_root_pos_relative_rotated = torch.matmul(head_global_rot_start, pred_root_pos_norm.unsqueeze(-1))
-                # pred_transl = pred_root_pos_relative_rotated.squeeze(-1) @ head_global_rot_start.transpose(-1, -2) + head_global_pos_start
-                # pred_transl = pred_transl.reshape(bs * seq_len, 3)
-                pred_transl = pred_root_pos_norm.reshape(bs*seq_len, 3)
+                pred_transl = pred_root_pos_norm.reshape(bs * seq_len, 3)
             else:
                 pred_transl = gt_root_pos.reshape(bs*seq_len, 3)
 
@@ -174,14 +171,14 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             pred_body_pose_mat = transforms.rotation_6d_to_matrix(pred_body_pose_6d.reshape(-1, 6)).reshape(bs * seq_len, 21, 3, 3)
             pred_body_pose_axis = transforms.matrix_to_axis_angle(pred_body_pose_mat.reshape(-1, 3, 3)).reshape(bs * seq_len, 21 * 3)
 
-            # --- Prepare GT for SMPL and Metrics ---
-            gt_root_orient_6d = gt_motion[:, :, :6].reshape(bs * seq_len, 6)
+            # --- 准备GT数据进行SMPL和指标计算 (直接使用归一化数据) ---
+            gt_root_orient_6d = gt_motion[:, :, :6]  # [bs, T, 6]
             gt_body_pose_6d = gt_motion[:, :, 6:].reshape(bs * seq_len, 21, 6)
             gt_root_orient_mat = transforms.rotation_6d_to_matrix(gt_root_orient_6d)
             gt_body_pose_mat = transforms.rotation_6d_to_matrix(gt_body_pose_6d.reshape(-1, 6)).reshape(bs * seq_len, 21, 3, 3)
-            gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat)
+            gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(bs * seq_len, 3)
             gt_body_pose_axis = transforms.matrix_to_axis_angle(gt_body_pose_mat.reshape(-1, 3, 3)).reshape(bs * seq_len, 21 * 3)
-            gt_transl = gt_root_pos.reshape(bs*seq_len, 3)
+            gt_transl = gt_root_pos.reshape(bs * seq_len, 3)
 
             # --- Get SMPL Joints ---
             pred_pose_body_input = {'root_orient': pred_root_orient_axis, 'pose_body': pred_body_pose_axis, 'trans': pred_transl}
@@ -229,38 +226,63 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             mpjre_angle = angle_deg.mean()
             metrics['mpjre_angle'].append(mpjre_angle.item()) # Store mean angle in degrees
 
-            # Object Metrics (Conditional)
-            if evaluate_objects and has_object:
-                if pred_obj_trans_norm is not None: 
-                    # pred_obj_trans_relative_rotated = pred_obj_trans_norm.unsqueeze(-1) @ head_global_rot_start.unsqueeze(1).transpose(-1, -2)
-                    # pred_obj_trans = pred_obj_trans_relative_rotated.squeeze(-1) + head_global_pos_start.unsqueeze(1)
-                    # Calculate Translation Error
-                    obj_trans_err = torch.linalg.norm(pred_obj_trans_norm - gt_obj_trans, dim=-1).mean()
-                    metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert meters to mm
-                else:
-                    print(f"Warning: Batch {batch_idx}: Missing predicted object translation for error calculation.")
-                    metrics['obj_trans_err'].append(float('nan'))
-                if pred_obj_rot_norm is not None:
-                    # Denormalize rotation
-                    pred_obj_rot_6d_norm = pred_obj_rot_norm
-                    pred_obj_rot_mat_norm = transforms.rotation_6d_to_matrix(pred_obj_rot_6d_norm.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
-                    # pred_obj_rot_mat = torch.matmul(head_global_rot_start.unsqueeze(1), pred_obj_rot_mat_norm)
-                    # Calculate Rotation Error (Angle in Degrees)
-                    gt_obj_rot_mat = transforms.rotation_6d_to_matrix(gt_obj_rot_6d.reshape(-1, 6)).reshape(bs, seq_len, 3, 3)
-                    # R_rel = R_gt^T @ R_pred
-                    obj_rel_rot_mat = torch.matmul(gt_obj_rot_mat.transpose(-1, -2), pred_obj_rot_mat_norm)
-                    obj_trace = torch.einsum('...ii->...', obj_rel_rot_mat) # [bs, seq]
-                    obj_cos_theta = torch.clamp((obj_trace - 1.0) / 2.0, -1.0, 1.0)
-                    obj_angle_rad = torch.acos(obj_cos_theta)
-                    obj_angle_deg = obj_angle_rad * (180.0 / np.pi)
-                    obj_rot_angle_err = obj_angle_deg.mean()
-                    metrics['obj_rot_angle'].append(obj_rot_angle_err.item()) # Store mean angle in degrees
-                else:
-                    print(f"Warning: Batch {batch_idx}: Missing predicted object rotation for error calculation.")
-                    metrics['obj_rot_angle'].append(float('nan'))
+            # Object Translation Error (直接使用归一化数据)
+            if evaluate_objects and has_object and pred_obj_trans_norm is not None:
+                # 直接计算归一化空间中的平移误差
+                obj_trans_err = torch.linalg.norm(pred_obj_trans_norm - gt_obj_trans, dim=-1).mean()
+                metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert to mm scale
+            elif evaluate_objects and has_object:
+                print(f"Warning: Batch {batch_idx}: Missing predicted object translation for error calculation.")
+                metrics['obj_trans_err'].append(float('nan'))
             elif evaluate_objects and not has_object:
-                 metrics['obj_trans_err'].append(float('nan'))
-                 metrics['obj_rot_angle'].append(float('nan'))
+                metrics['obj_trans_err'].append(float('nan'))
+
+            # Contact Prediction Evaluation
+            if pred_hand_contact_prob is not None:
+                # Convert probabilities to binary predictions (threshold = 0.5)
+                pred_contacts = (pred_hand_contact_prob > 0.5).float()  # [bs, T, 3]
+                pred_lhand_contact = pred_contacts[:, :, 0]  # [bs, T]
+                pred_rhand_contact = pred_contacts[:, :, 1]  # [bs, T] 
+                pred_obj_contact = pred_contacts[:, :, 2]    # [bs, T]
+                
+                # Calculate F1 scores for each contact type
+                if gt_lhand_contact is not None:
+                    gt_lhand_flat = gt_lhand_contact.cpu().numpy().flatten()
+                    pred_lhand_flat = pred_lhand_contact.cpu().numpy().flatten()
+                    if len(np.unique(gt_lhand_flat)) > 1:  # 确保有正负样本
+                        lhand_f1 = f1_score(gt_lhand_flat, pred_lhand_flat, average='binary')
+                        metrics['contact_f1_lhand'].append(lhand_f1)
+                    else:
+                        metrics['contact_f1_lhand'].append(float('nan'))
+                else:
+                    metrics['contact_f1_lhand'].append(float('nan'))
+                    
+                if gt_rhand_contact is not None:
+                    gt_rhand_flat = gt_rhand_contact.cpu().numpy().flatten()
+                    pred_rhand_flat = pred_rhand_contact.cpu().numpy().flatten()
+                    if len(np.unique(gt_rhand_flat)) > 1:  # 确保有正负样本
+                        rhand_f1 = f1_score(gt_rhand_flat, pred_rhand_flat, average='binary')
+                        metrics['contact_f1_rhand'].append(rhand_f1)
+                    else:
+                        metrics['contact_f1_rhand'].append(float('nan'))
+                else:
+                    metrics['contact_f1_rhand'].append(float('nan'))
+                    
+                if gt_obj_contact is not None:
+                    gt_obj_flat = gt_obj_contact.cpu().numpy().flatten()
+                    pred_obj_flat = pred_obj_contact.cpu().numpy().flatten()
+                    if len(np.unique(gt_obj_flat)) > 1:  # 确保有正负样本
+                        obj_f1 = f1_score(gt_obj_flat, pred_obj_flat, average='binary')
+                        metrics['contact_f1_obj'].append(obj_f1)
+                    else:
+                        metrics['contact_f1_obj'].append(float('nan'))
+                else:
+                    metrics['contact_f1_obj'].append(float('nan'))
+            else:
+                # 如果没有预测接触，则添加NaN
+                metrics['contact_f1_lhand'].append(float('nan'))
+                metrics['contact_f1_rhand'].append(float('nan'))
+                metrics['contact_f1_obj'].append(float('nan'))
 
 
             # Jitter (Mean acceleration magnitude of joints)
@@ -284,8 +306,9 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             avg_metrics[key] = np.mean(valid_values)
             unit = ""
             if key == 'mpjpe' or key == 'obj_trans_err': unit = "(mm)"
-            elif key == 'mpjre_angle' or key == 'obj_rot_angle': unit = "(deg)"
+            elif key == 'mpjre_angle': unit = "(deg)"
             elif key == 'jitter': unit = "(mm/frame^2)"
+            elif 'contact_f1' in key: unit = "(F1)"
             print(f"  {key} {unit}: {avg_metrics[key]:.4f} (from {len(valid_values)}/{len(values)} valid samples)")
         else:
             avg_metrics[key] = float('nan')
@@ -380,12 +403,14 @@ def main():
     print("\n--- Evaluation Results ---")
     print(f"MPJPE (mm):                                   {results.get('mpjpe', 'N/A'):.4f}")
     print(f"MPJRE (deg):                                  {results.get('mpjre_angle', 'N/A'):.4f}")
+    print(f"Jitter (mm/frame^2):                          {results.get('jitter', 'N/A'):.4f}")
     if not args.no_eval_objects:
         print(f"Obj Trans Error (mm):                         {results.get('obj_trans_err', 'N/A'):.4f}")
-        print(f"Obj Rot Error (deg):                          {results.get('obj_rot_angle', 'N/A'):.4f}")
     else:
          print("Object metrics skipped.")
-    print(f"Jitter (mm/frame^2):                          {results.get('jitter', 'N/A'):.4f}")
+    print(f"LHand Contact F1:                             {results.get('contact_f1_lhand', 'N/A'):.4f}")
+    print(f"RHand Contact F1:                             {results.get('contact_f1_rhand', 'N/A'):.4f}")
+    print(f"Obj Contact F1:                               {results.get('contact_f1_obj', 'N/A'):.4f}")
     print("--------------------------")
 
 if __name__ == "__main__":
