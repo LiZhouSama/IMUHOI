@@ -241,6 +241,7 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             if pred_hand_contact_prob is not None:
                 # Convert probabilities to binary predictions (threshold = 0.5)
                 pred_contacts = (pred_hand_contact_prob > 0.5).float()  # [bs, T, 3]
+                # pred_contacts = torch.ones_like(pred_contacts)  # 测试默认预测接触的baseline
                 pred_lhand_contact = pred_contacts[:, :, 0]  # [bs, T]
                 pred_rhand_contact = pred_contacts[:, :, 1]  # [bs, T] 
                 pred_obj_contact = pred_contacts[:, :, 2]    # [bs, T]
@@ -375,7 +376,6 @@ def main():
     test_dataset = IMUDataset(
             data_dir=test_data_dir,
             window_size=test_window_size,
-            window_stride=config.test.get('window_stride', test_window_size),
             normalize=config.test.get('normalize', True),
             debug=config.get('debug', False)
         )

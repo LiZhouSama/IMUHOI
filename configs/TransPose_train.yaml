@@ -2,22 +2,22 @@
 
 # 基本配置
 model_name: "TransPose_IMU"
-wandb_project_name: "imu_transpose"
+tensorboard_project_name: "imu_transpose"  # TensorBoard项目名称
 model_type: "TransPose"  # 模型类型：使用TransPose
 device: "cuda:0"  # 使用的GPU编号
 gpus: [0]  # 使用的GPU编号
 save_dir: "outputs/TransPose"  # 模型保存路径
-use_wandb: True  # 是否使用wandb记录训练过程
+use_tensorboard: True  # 是否使用tensorboard记录训练过程
 # pretrained_checkpoint: "checkpoints/TransPose/epoch_50_best.pt"  # 预训练模型路径，如果需要从现有模型继续训练，取消注释并设置路径
 bm_path: body_models/smplh/male/model.npz
 use_transpose_model: True
 
 # 训练超参数
-epoch: 200  # 训练轮数
-batch_size: 60  # 批大小
-lr: 0.0005  # 学习率
+epoch: 300  # 训练轮数
+batch_size: 50  # 批大小
+lr: 0.0004  # 学习率
 weight_decay: 0.00005  # 权重衰减
-milestones: [150,200,300,400]  # 学习率调整节点
+milestones: [150,250,350,450]  # 学习率调整节点
 gamma: 0.1  # 学习率衰减系数
 seed: 42  # 随机种子
 num_workers: 12  # 数据加载线程数
@@ -30,6 +30,27 @@ num_joints: 22  # SMPL模型关节数量
 joint_dim: 6  # 使用6D旋转表示
 vel_scale: 3
 
+# 物体静止相关参数
+obj_imu_change_threshold: 0.1
+obj_contact_threshold: 0.3
+obj_rot_weight: 0.5
+
+# ContactAwareLoss相关参数
+use_contact_aware_loss: False  # 是否使用ContactAwareLoss
+contact_distance: 0.1  # 目标接触距离 10cm
+contact_ramp_up_steps: 10000  # 基础损失3000步后达到全权重
+
+# ContactAwareLoss内部权重
+contact_loss_weights:
+  contact_distance: 1.0      # 距离一致性权重
+  contact_velocity: 0.5      # 速度一致性权重
+  approach_smoothness: 0.3   # 接近平滑性权重
+  contact_consistency: 0.2   # 接触状态一致性权重
+
+
+# 手部接触相关参数
+hand_contact_distance: 0.1   # 10cm目标距离
+
 # 损失权重配置
 loss_weights:
   rot: 1.0  # 姿态损失权重
@@ -38,22 +59,25 @@ loss_weights:
   obj_rot: 1.0  # 物体旋转损失权重
   leaf_pos: 1.0  # 叶子节点位置损失权重
   full_pos: 1.0  # 全身关节位置损失权重
-  root_vel: 1.0  # 根关节速度损失权重
-  hand_contact: 1.0  # 手部接触损失权重
+  root_vel: 10  # 根关节速度损失权重
+  hand_contact: 0.1  # 手部接触损失权重
+  contact_aware: 1.0  # 接触感知损失权重
+  obj_vel: 10  # 物体速度损失权重
+  leaf_vel: 10  # 叶子节点速度损失权重
 # 训练窗口配置
 train:
   window: 120  # 训练时使用的时间窗口长度
-  window_stride: 60  # 训练时窗口步长
+  # window_stride: 60  # 训练时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0506/train"  # 训练数据路径
-  debug_data_path: "processed_data_0506/debug"  # 调试数据路径
+  data_path: "processed_data_0612/train"  # 训练数据路径
+  debug_data_path: "processed_data_0612/debug"  # 调试数据路径
 
 # 测试窗口配置
 test:
   window: 120  # 测试时使用的时间窗口长度
-  window_stride: 120  # 测试时窗口步长
+  # window_stride: 120  # 测试时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0506/test"  # 测试数据路径
+  data_path: "processed_data_0612/test"  # 测试数据路径
 
 # 数据增强配置
 augmentation:

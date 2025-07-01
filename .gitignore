@@ -123,6 +123,7 @@ wandb/
 *.h5
 *.npy
 *.npz
+*.gz
 
 # 系统文件
 .DS_Store

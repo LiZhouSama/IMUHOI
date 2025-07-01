@@ -7,7 +7,7 @@ from tqdm import tqdm
 import pytorch3d.transforms as transforms
 import random # Import random for shuffling sequence info in debug mode
 
-from configs.global_config import FRAME_RATE, IMU_JOINTS, IMU_JOINT_NAMES, HEAD_IDX
+from configs.global_config import FRAME_RATE, IMU_JOINTS_POS, IMU_JOINTS_ROT, IMU_JOINT_NAMES, acc_scale
 
 # --- IMU 计算函数 ---
 def _syn_acc_optimized(v, smooth_n=4):
@@ -48,7 +48,7 @@ def _syn_acc_optimized(v, smooth_n=4):
     # 恢复原始形状
     return acc.reshape(orig_shape)
 
-def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
+def compute_imu_data(position_global, rotation_global, imu_joints_pos, imu_joints_rot, smooth_n=4):
     """
     计算特定关节的IMU数据（加速度和方向）
     
@@ -64,11 +64,11 @@ def compute_imu_data(position_global, rotation_global, imu_joints, smooth_n=4):
     device = position_global.device
     
     # 提取指定关节的位置和旋转
-    imu_positions = position_global[:, imu_joints, :]  # [T, num_imus, 3]
-    imu_orientations = rotation_global[:, imu_joints, :, :]  # [T, num_imus, 3, 3]
+    imu_positions = position_global[:, imu_joints_pos, :]  # [T, num_imus, 3]
+    imu_orientations = rotation_global[:, imu_joints_rot, :, :]  # [T, num_imus, 3, 3]
     
     T = imu_positions.shape[0]
-    num_imus = len(imu_joints)
+    num_imus = len(imu_joints_pos)
     
     # 并行计算所有IMU关节的加速度
     imu_accelerations = _syn_acc_optimized(imu_positions, smooth_n)
@@ -108,21 +108,21 @@ def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
 # --- 结束 IMU 计算函数 ---
 
 class IMUDataset(Dataset):
-    def __init__(self, data_dir, window_size=60, window_stride=30, normalize=True, debug=False):
+    def __init__(self, data_dir, window_size=60, normalize=True, debug=False, min_obj_contact_frames=10):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
         Args:
             data_dir: 数据目录
             window_size: 窗口大小
-            window_stride: (未使用) 窗口步长 - 保留以兼容旧接口
             normalize: 是否对数据进行标准化
             debug: 是否在调试模式
+            min_obj_contact_frames: 序列中至少需要的物体接触帧数，少于此值的序列将被过滤掉
         """
         self.data_dir = data_dir
         self.window_size = window_size
-        # self.window_stride = window_stride # No longer used for sampling
         self.normalize = normalize
         self.debug = debug
+        self.min_obj_contact_frames = min_obj_contact_frames
 
         # 查找序列文件
         self.sequence_files = glob.glob(os.path.join(data_dir, "*.pt"))
@@ -135,6 +135,7 @@ class IMUDataset(Dataset):
         # 执行加载、共享和序列信息收集
         self._load_share_and_collect_info()
         print(f"预加载并收集信息完成，共找到{len(self.sequence_info)}个有效序列")
+        print(f"过滤条件：序列长度 >= {self.window_size + 1}，物体接触帧数 >= {self.min_obj_contact_frames}")
 
         # 检查BPS文件夹
         self.bps_dir = os.path.join(os.path.dirname(data_dir), "bps_features")
@@ -174,6 +175,22 @@ class IMUDataset(Dataset):
                 # 需要 seq_len >= window_size + 1 (因为最大 start_idx 是 seq_len - window_size)
                 if seq_len < self.window_size + 1:
                     # print(f"调试：跳过文件 {file_path}，序列长度 {seq_len} 不足以创建大小为 {self.window_size} 的窗口。")
+                    continue
+
+                # 检查物体接触帧数是否足够
+                if "obj_contact" in seq_data and seq_data["obj_contact"] is not None:
+                    obj_contact_frames = seq_data["obj_contact"]
+                    if isinstance(obj_contact_frames, torch.Tensor):
+                        contact_count = obj_contact_frames.sum().item()
+                    else:
+                        contact_count = np.sum(obj_contact_frames)
+                    
+                    if contact_count < self.min_obj_contact_frames:
+                        print(f"跳过文件 {file_path}，物体接触帧数 {contact_count} 少于最小要求 {self.min_obj_contact_frames}")
+                        continue
+                else:
+                    # 如果没有物体接触数据，也跳过（根据需要可以调整这个行为）
+                    print(f"跳过文件 {file_path}，缺少物体接触数据")
                     continue
 
                 # 将所有Tensor移动到共享内存
@@ -219,7 +236,7 @@ class IMUDataset(Dataset):
         except IndexError:
              print(f"错误：索引 {idx} 超出 sequence_info 范围 (大小: {len(self.sequence_info)})")
              # 返回错误字典
-             return self._get_error_dict()
+             return 
 
 
         # 2. 随机生成 start_idx
@@ -228,8 +245,9 @@ class IMUDataset(Dataset):
         if max_start_idx < 1:
             # 这种情况理论上在 __init__ 中被过滤掉了，但为了安全起见
             print(f"错误：序列 {seq_name} (长度 {seq_len}) 过短，无法采样窗口大小 {self.window_size}")
-            return self._get_error_dict()
+            return 
         start_idx = torch.randint(1, max_start_idx + 1, (1,)).item()
+        # start_idx = 1
         end_idx = start_idx + self.window_size # 切片时使用 end_idx
 
         # 3. 从预加载数据中获取序列数据
@@ -237,7 +255,7 @@ class IMUDataset(Dataset):
              seq_data = self.loaded_data[file_path]
         except KeyError:
              print(f"错误：无法在预加载数据中找到文件路径 {file_path} 对应的键。序列索引: {idx}")
-             return self._get_error_dict()
+             return 
 
         # 4. 切片和处理数据
         try:
@@ -254,9 +272,13 @@ class IMUDataset(Dataset):
             # --- 动态计算人类 IMU 数据 ---
             position_global_full = seq_data["position_global_full_gt_world"][start_idx:end_idx] # [seq, J, 3]
             rotation_global_full = seq_data["rotation_global"][start_idx:end_idx] # [seq, J, 3, 3]
-            human_imu_data = compute_imu_data(position_global_full, rotation_global_full, IMU_JOINTS)
+            human_imu_data = compute_imu_data(position_global_full, rotation_global_full, IMU_JOINTS_POS, IMU_JOINTS_ROT)
             human_imu_acc = human_imu_data["accelerations"] # [seq, num_imus, 3]
             human_imu_ori = human_imu_data["orientations"] # [seq, num_imus, 3, 3]
+            
+            # 提取IMU关节的全局位置和旋转（用于可视化）
+            imu_global_positions = position_global_full[:, IMU_JOINTS_POS, :]  # [seq, num_imus, 3]
+            imu_global_rotations = rotation_global_full[:, IMU_JOINTS_ROT, :, :]  # [seq, num_imus, 3, 3]
             # --- 结束动态计算 ---
 
             # 将旋转矩阵转换为6D旋转表示
@@ -299,46 +321,31 @@ class IMUDataset(Dataset):
             norm_human_imu = human_imu.float()
             norm_obj_imu = obj_imu.float()
             if self.normalize:  
-                # head_imu_acc_start = human_imu_acc[0, HEAD_IDX] # [3]
-                # head_imu_ori_start = human_imu_ori_flat[0, HEAD_IDX] # [3, 3]
-                # head_imu_ori_start_inv = torch.inverse(head_imu_ori_start)
-                # norm_human_imu_acc = head_imu_ori_start_inv @ torch.cat([human_imu_acc[:,:5] - head_imu_acc_start, human_imu_acc[:,5:]], dim=1).unsqueeze(-1)
-                # norm_human_imu_acc = norm_human_imu_acc.squeeze(-1)
-                # norm_human_imu_ori = torch.cat((head_imu_ori_start_inv @ human_imu_ori_flat[:, :5], human_imu_ori_flat[:, 5:]), dim=1) 
-                # norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
-                # norm_obj_acc = head_imu_ori_start_inv @ (obj_imu_acc - head_imu_acc_start).unsqueeze(-1)
-                # norm_obj_acc = norm_obj_acc.squeeze(-1)
-                # norm_obj_ori = head_imu_ori_start_inv @ obj_imu_ori
-                # norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
-                
-                # # 对motion归一化(输出)
-                # head_global_pos_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, 3]
-                # head_global_rot_start = seq_data["head_global_trans"][start_idx:start_idx+1, :3, :3]
-                # head_rot_invert = head_global_rot_start.swapaxes(-2,-1)
-                # norm_motion = motion.clone()
-                # root_rot = transforms.rotation_6d_to_matrix(norm_motion[:, :6]) # 每一帧
-                # norm_root_rot = head_rot_invert @ root_rot
-                # norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
-                # norm_root_pos = head_rot_invert @ (root_pos - head_global_pos_start).unsqueeze(-1)
-                # norm_root_pos = norm_root_pos.squeeze(-1)
-                # if has_object:
-                #     # 对obj归一化(输出)
-                #     norm_obj_trans = head_rot_invert @ (obj_trans - head_global_pos_start).unsqueeze(-1)
-                #     norm_obj_trans = norm_obj_trans.squeeze(-1)
-                #     norm_obj_rot = head_rot_invert @ obj_rot
-                #     norm_obj_rot = transforms.matrix_to_rotation_6d(norm_obj_rot)
 
                 root_imu_acc_start = human_imu_acc[0, -1] # [3]
                 root_imu_ori_start = human_imu_ori_flat[0, -1] # [3, 3]
                 root_imu_ori_start_inv = torch.inverse(root_imu_ori_start)
-                norm_human_imu_acc = root_imu_ori_start_inv @ (human_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                # norm_human_imu_acc = root_imu_ori_start_inv @ (human_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                norm_human_imu_acc = root_imu_ori_start_inv @ human_imu_acc .unsqueeze(-1)
                 norm_human_imu_acc = norm_human_imu_acc.squeeze(-1)
                 norm_human_imu_ori = root_imu_ori_start_inv @ human_imu_ori_flat
                 norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
-                norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                # norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                norm_obj_acc = root_imu_ori_start_inv @ obj_imu_acc.unsqueeze(-1)
                 norm_obj_acc = norm_obj_acc.squeeze(-1)
                 norm_obj_ori = root_imu_ori_start_inv @ obj_imu_ori
                 norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
+
+                # norm_human_imu_acc = torch.cat((human_imu_acc[:, :5] - human_imu_acc[:, 5:], human_imu_acc[:, 5:]), dim=1).bmm(human_imu_ori_flat[:, -1]) / acc_scale
+                # norm_human_imu_ori = torch.cat((human_imu_ori_flat[:, 5:].transpose(2, 3).matmul(human_imu_ori_flat[:, :5]), human_imu_ori_flat[:, 5:]), dim=1)
+                # norm_human_imu = torch.cat((norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)), dim=-1)
+                # # 物体是不是不需要归一化到根坐标系下？
+                # norm_obj_imu_acc = obj_imu_acc.bmm(human_imu_ori_flat[:, -1]) / acc_scale
+                # norm_obj_imu_ori = human_imu_ori_flat[:, 5:].transpose(2, 3).matmul(obj_imu_ori)
+                # norm_obj_imu = torch.cat((norm_obj_imu_acc, transforms.matrix_to_rotation_6d(norm_obj_imu_ori)), dim=-1)
+                # # norm_obj_imu_acc = obj_imu_acc/acc_scale
+                # # norm_obj_imu_ori = obj_imu_ori
+                # # norm_obj_imu = torch.cat((norm_obj_imu_acc, transforms.matrix_to_rotation_6d(norm_obj_imu_ori)), dim=-1)
 
                 # 对motion归一化(输出)
                 root_global_pos_start = root_pos[0]
@@ -348,7 +355,7 @@ class IMUDataset(Dataset):
                 root_start_rot_invert = root_global_rot_start.swapaxes(-2,-1)
                 norm_root_rot = root_start_rot_invert @ root_rot
                 norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
-                norm_root_pos = root_start_rot_invert @ (root_pos - root_global_pos_start).unsqueeze(-1)
+                norm_root_pos = root_start_rot_invert @ (root_pos - root_global_pos_start).unsqueeze(-1)    # 相当于初始位置为0
                 norm_root_pos = norm_root_pos.squeeze(-1)
                 if has_object:
                     # 对obj归一化(输出)
@@ -357,14 +364,48 @@ class IMUDataset(Dataset):
                     norm_obj_rot = root_start_rot_invert @ obj_rot
                     norm_obj_rot = transforms.matrix_to_rotation_6d(norm_obj_rot)
 
+                # norm_human_imu = human_imu.clone()
+                # norm_obj_imu = obj_imu.clone()
+                # norm_motion = motion.clone()
+                # norm_root_pos = root_pos.clone()
+                # norm_obj_trans = obj_trans.clone()
+                # norm_obj_rot = transforms.matrix_to_rotation_6d(obj_rot)
 
-            # --- 计算根关节速度 ---
+
+            # --- 计算速度 ---
+            # 1. 根关节速度
             if norm_root_pos.shape[0] > 1:
                 root_vel = (norm_root_pos[1:] - norm_root_pos[:-1])
                 root_vel = torch.cat([torch.zeros_like(root_vel[:1]), root_vel], dim=0)
             else:
                 root_vel = torch.zeros_like(norm_root_pos)
-            # --- 结束计算根关节速度 ---
+            
+            # 2. 物体速度
+            if has_object and norm_obj_trans.shape[0] > 1:
+                obj_vel = (norm_obj_trans[1:] - norm_obj_trans[:-1])
+                obj_vel = torch.cat([torch.zeros_like(obj_vel[:1]), obj_vel], dim=0)
+            else:
+                obj_vel = torch.zeros(norm_root_pos.shape[0], 3)
+                
+            # 3. 叶子节点速度 (从position_global_full计算)
+            from configs.global_config import joint_set
+            leaf_indices = joint_set.leaf  # [7, 8, 12, 20, 21]
+            
+            # 从全局关节位置中提取叶子节点位置
+            leaf_positions_global = position_global_full[:, leaf_indices, :]  # [seq, n_leaf, 3]
+            
+            # 计算叶子节点的全局速度（相邻帧差分）
+            if leaf_positions_global.shape[0] > 1:
+                leaf_vel_global = leaf_positions_global[1:] - leaf_positions_global[:-1]  # [seq-1, n_leaf, 3]
+                # 第一帧速度设为0
+                leaf_vel_global = torch.cat([torch.zeros_like(leaf_vel_global[:1]), leaf_vel_global], dim=0)  # [seq, n_leaf, 3]
+            else:
+                leaf_vel_global = torch.zeros_like(leaf_positions_global)  # [seq, n_leaf, 3]
+            
+            # 归一化叶子节点速度：使用root_start_rot_invert左乘
+            # root_start_rot_invert: [3, 3], leaf_vel_global: [seq, n_leaf, 3]
+            leaf_vel = torch.einsum('ij,tnj->tni', root_start_rot_invert, leaf_vel_global)  # [seq, n_leaf, 3]
+            # --- 结束计算速度 ---
 
             # 加载BPS特征（如果有）
             bps_features = None
@@ -389,16 +430,10 @@ class IMUDataset(Dataset):
 
             # 构建结果字典
             if has_object:
-                # --- 获取原始接触标签 ---
-                lhand_c_window = seq_data.get("lhand_contact")[start_idx:end_idx].bool()
-                rhand_c_window = seq_data.get("rhand_contact")[start_idx:end_idx].bool()
-                obj_movement_window = seq_data.get("obj_contact")[start_idx:end_idx].bool()
-
-                # --- 计算用于可视化的最终接触标志 ---
-                lhand_c_processed = lhand_c_window & obj_movement_window
-                rhand_c_processed = rhand_c_window & obj_movement_window
-                obj_c_processed = obj_movement_window & (lhand_c_window | rhand_c_window)
-                # --- 结束接触标志计算 ---
+                # --- 直接使用预处理计算好的接触标签 ---
+                lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+                rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+                obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
 
                 result = {
                     "root_pos": norm_root_pos.float(),
@@ -407,6 +442,8 @@ class IMUDataset(Dataset):
                     "root_pos_start": root_global_pos_start.float(),  # [3]
                     "root_rot_start": root_global_rot_start.float(),  # [3, 3]
                     "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
+                    # "imu_global_positions": imu_global_positions.float(),  # [seq, num_imus, 3] - IMU关节全局位置
+                    # "imu_global_rotations": imu_global_rotations.float(),  # [seq, num_imus, 3, 3] - IMU关节全局旋转
                     "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
                     "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
                     "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
@@ -414,9 +451,11 @@ class IMUDataset(Dataset):
                     "obj_name": obj_name,
                     "has_object": has_object,
                     "root_vel": root_vel.float(), # [seq, 3] - 单位: m/frame
-                    "lhand_contact": lhand_c_processed, # [seq]
-                    "rhand_contact": rhand_c_processed, # [seq]
-                    "obj_contact": obj_c_processed, # [seq]
+                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度
+                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度占位符
+                    "lhand_contact": lhand_contact_window.bool(), # [seq]
+                    "rhand_contact": rhand_contact_window.bool(), # [seq]
+                    "obj_contact": obj_contact_window.bool(), # [seq]
                 }
             else:
                 result = {
@@ -426,7 +465,11 @@ class IMUDataset(Dataset):
                     "root_pos_start": root_global_pos_start.float(), # Need to ensure this is available or handled if no object
                     "root_rot_start": root_global_rot_start.float(), # Same as above
                     "human_imu": norm_human_imu.float(),
+                    "imu_global_positions": imu_global_positions.float(),  # [seq, num_imus, 3] - IMU关节全局位置
+                    "imu_global_rotations": imu_global_rotations.float(),  # [seq, num_imus, 3, 3] - IMU关节全局旋转
                     "root_vel": root_vel.float(),
+                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度（无物体时为零）
+                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度占位符
                     "has_object": has_object, # Indicate no object
                 }
 
@@ -441,15 +484,4 @@ class IMUDataset(Dataset):
             traceback.print_exc() # 打印详细错误
             seq_len = self.window_size
             # 返回包含正确键但值为默认值的字典，以避免后续代码出错
-            return {
-                "root_pos": torch.zeros(seq_len, 3),
-                "motion": torch.zeros(seq_len, 132),
-                "human_imu": torch.zeros(seq_len, len(IMU_JOINTS), 9),  # 现在是9D (3D加速度 + 6D旋转)
-                "obj_imu": torch.zeros(seq_len, 1, 9),  # 现在是9D (3D加速度 + 6D旋转)
-                "obj_trans": torch.zeros(seq_len, 3),
-                "obj_rot": transforms.matrix_to_rotation_6d(torch.eye(3).unsqueeze(0).repeat(seq_len, 1, 1)).float(),  # [seq, 6] - 6D旋转表示
-                "obj_scale": torch.ones(seq_len),
-                "obj_name": None,
-                "has_object": False,
-                "root_vel": torch.zeros(seq_len, 3),
-            }
+            return 

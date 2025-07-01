@@ -6,15 +6,15 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-import wandb
-os.environ["WANDB_MODE"] = "offline"
+from torch.utils.tensorboard import SummaryWriter
 from torch import optim
 from tqdm import tqdm
 from datetime import datetime
-from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
+from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
 from utils.utils import tensor2numpy
 from models.TransPose_net import TransPoseNet, joint_set
+from models.ContactAwareLoss import ContactAwareLoss
 from torch.cuda.amp import autocast, GradScaler
 
 
@@ -33,7 +33,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     # 初始化配置
     device = torch.device(f'cuda:{cfg.gpus[0]}' if torch.cuda.is_available() else 'cpu')
     model_name = cfg.model_name
-    use_wandb = cfg.use_wandb and not cfg.debug
+    use_tensorboard = cfg.use_tensorboard and not cfg.debug
     pose_rep = 'rot6d'  # 使用6D表示
     max_epoch = cfg.epoch
     save_dir = cfg.save_dir
@@ -41,7 +41,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
 
     # 打印训练配置
     print(f'Training: {model_name} (using TransPose), pose_rep: {pose_rep}')
-    print(f'use_wandb: {use_wandb}, device: {device}')
+    print(f'use_tensorboard: {use_tensorboard}, device: {device}')
     print(f'max_epoch: {max_epoch}')
     if not cfg.debug:
         os.makedirs(save_dir, exist_ok=True)
@@ -66,16 +66,37 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     # 定义学习率调度器
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=cfg.milestones, gamma=cfg.gamma)
 
-    # 如果使用wandb，初始化
-    if use_wandb:
-        wandb_project = cfg.wandb_project_name
-        wandb.init(project=wandb_project, name=datetime.now().strftime("%m%d%H%M"), config=cfg)
+    # 初始化ContactAwareLoss（如果启用）
+    use_contact_aware_loss = getattr(cfg, 'use_contact_aware_loss', False)
+    contact_loss_fn = None
+    if use_contact_aware_loss:
+        contact_loss_fn = ContactAwareLoss(
+            contact_distance=getattr(cfg, 'contact_distance', 0.1),
+            ramp_up_steps=getattr(cfg, 'contact_ramp_up_steps', 1000),
+            loss_weights=getattr(cfg, 'contact_loss_weights', {
+                'contact_distance': 1.0,
+                'contact_velocity': 0.5,
+                'approach_smoothness': 0.3,
+                'contact_consistency': 0.2
+            })
+        )
+        print(f'Initialized ContactAwareLoss with contact_distance={contact_loss_fn.contact_distance}')
+    else:
+        print('ContactAwareLoss is disabled')
+
+    # 如果使用tensorboard，初始化
+    writer = None
+    if use_tensorboard:
+        log_dir = os.path.join(save_dir, 'tensorboard_logs', datetime.now().strftime("%m%d%H%M"))
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f'TensorBoard logs will be saved to: {log_dir}')
 
     # 训练循环
     best_loss = float('inf')
     train_losses = defaultdict(list)
     test_losses = defaultdict(list)
     n_iter = 0
+    training_step_count = 0  # 用于ContactAwareLoss的渐进式权重
 
     for epoch in range(max_epoch):
         # 训练阶段
@@ -88,6 +109,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_loss_root_vel = 0
         train_loss_hand_contact = 0
         train_loss_obj_trans = 0
+        train_loss_contact_aware = 0
+        train_loss_obj_vel = 0
+        train_loss_leaf_vel = 0
         
         train_iter = tqdm(train_loader, desc=f'Epoch {epoch}')
         
@@ -103,6 +127,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             obj_imu = batch.get("obj_imu", None)
             obj_rot = batch.get("obj_rot", None)
             obj_trans = batch.get("obj_trans", None) # 新增：提取物体平移
+            
+            # 获取速度真值
+            obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, 3]
+            leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, n_leaf, 3]
             
             if obj_imu is not None:
                 obj_imu = obj_imu.to(device)
@@ -163,38 +191,59 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     pose_body=gt_pose_axis_angle_flat[:, 3:], # [bs*seq, (num_joints-1)*3]
                     trans=gt_trans_flat # 使用真实的trans
                 )
-                gt_j_flat = body_model_output_gt.Jtr[:, :model.num_joints, :] # [bs*seq, num_joints, 3]
-                gt_j_seq = gt_j_flat.reshape(bs, seq, model.num_joints, 3) # [bs, seq, num_joints, 3]
+                gt_j_global_flat = body_model_output_gt.Jtr[:, :model.num_joints, :] # [bs*seq, num_joints, 3]
+                gt_j_local_flat = gt_j_global_flat - gt_trans_flat.unsqueeze(1)
+                gt_j_seq = gt_j_local_flat.reshape(bs, seq, model.num_joints, 3) # [bs, seq, num_joints, 3]
                 
                 gt_leaf_pos = gt_j_seq[:, :, joint_set.leaf, :] # [bs, seq, n_leaf, 3]
                 gt_full_pos = gt_j_seq[:, :, joint_set.full, :] # [bs, seq, n_full, 3] (joint_set.full is 1..21)
+                # gt_reduced_motion = rotation_6d_to_matrix(motion.clone().reshape(bs, seq, model.num_joints, model.joint_dim))
+                # gt_reduced_motion[:, :, joint_set.ignored, :] = torch.eye(3, device=gt_reduced_motion.device).repeat(bs, seq, joint_set.n_ignored, 1, 1)
+                # gt_reduced_motion = matrix_to_rotation_6d(gt_reduced_motion).reshape(bs, seq, model.num_joints * model.joint_dim)
+
             
             # 计算损失
-            # 1. 姿态损失
-            loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
-            
-            # 2. 根节点位置损失
-            loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
-            
-            # 5. 叶子节点位置损失 (L1)
+            # 1. 叶子节点位置损失 (L1)
             loss_leaf_pos = torch.nn.functional.l1_loss(pred_dict["pred_leaf_pos"], gt_leaf_pos)
             
-            # 6. 全身关节位置损失 (L1, 加权)
+            # 2. 全身关节位置损失 (L1, 加权)
             l1_diff_full = torch.abs(pred_dict["pred_full_pos"] - gt_full_pos) # [bs, seq, n_full, 3]
             weights_full = torch.ones_like(l1_diff_full)
             weights_full[:, :, [19, 20], :] = 4.0
             loss_full_pos = (l1_diff_full * weights_full).mean()
             
-            # 7. 根关节速度损失 (L1)
+            # 3. 根关节速度损失 (L1)， 真值：全局根关节速度
             loss_root_vel = torch.nn.functional.l1_loss(pred_dict["root_vel"], root_vel)
             
-            # 8. 手部接触损失 (BCE)
+            # 4. 姿态损失
+            loss_rot = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
+            
+            # 5. 根节点位置损失
+            loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+            
+            # 6. 手部接触损失 (BCE)
             loss_hand_contact = torch.nn.functional.binary_cross_entropy(pred_dict["pred_hand_contact_prob"], hand_contact_gt)
             
-            # 9. 物体平移损失 (MSE or L1) - 这里使用MSE为例
+            # 7. 物体平移损失 (MSE or L1) - 这里使用MSE为例
             # 确保 obj_trans (真值) 已经移动到 device 并且存在
             obj_trans_gt = data_dict["obj_trans"] # 从已经 .to(device) 的 data_dict 中获取
             loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans_gt)
+            
+            # 8. 接触感知损失 (ContactAwareLoss) - 可选
+            if use_contact_aware_loss and contact_loss_fn is not None:
+                contact_loss, contact_loss_dict = contact_loss_fn(
+                    pred_hand_pos=pred_dict["pred_hand_pos"],      # [bs, seq, 2, 3]
+                    pred_obj_pos=pred_dict["pred_obj_trans"],      # [bs, seq, 3]
+                    contact_probs=pred_dict["pred_hand_contact_prob"], # [bs, seq, 3]
+                    training_step=training_step_count
+                )
+            else:
+                contact_loss = torch.tensor(0.0, device=device)
+                contact_loss_dict = {}
+            
+            # 9. 速度损失
+            loss_obj_vel = torch.nn.functional.mse_loss(pred_dict["pred_obj_vel"], obj_vel) # 物体速度损失
+            loss_leaf_vel = torch.nn.functional.mse_loss(pred_dict["pred_leaf_vel"], leaf_vel) # 叶子节点速度损失
             
             # 计算总损失（加权）
             if hasattr(cfg, 'loss_weights'):
@@ -204,7 +253,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 w_full_pos = cfg.loss_weights.full_pos if hasattr(cfg.loss_weights, 'full_pos') else 0.1
                 w_root_vel = cfg.loss_weights.root_vel if hasattr(cfg.loss_weights, 'root_vel') else 0.1
                 w_hand_contact = cfg.loss_weights.hand_contact if hasattr(cfg.loss_weights, 'hand_contact') else 0.1
-                w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1 # <<< 新增物体平移损失权重
+                w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1
+                w_contact_aware = cfg.loss_weights.contact_aware if hasattr(cfg.loss_weights, 'contact_aware') else 0.1
+                w_obj_vel = cfg.loss_weights.obj_vel if hasattr(cfg.loss_weights, 'obj_vel') else 0.1
+                w_leaf_vel = cfg.loss_weights.leaf_vel if hasattr(cfg.loss_weights, 'leaf_vel') else 0.1
             else:
                 # 默认权重
                 w_rot = 1.0
@@ -213,7 +265,14 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 w_full_pos = 0.1
                 w_root_vel = 0.1
                 w_hand_contact = 0.1
-                w_obj_trans = 0.1 # <<< 新增物体平移损失权重
+                w_obj_trans = 0.1
+                w_contact_aware = 0.1
+                w_obj_vel = 0.1
+                w_leaf_vel = 0.1
+            
+            # 如果ContactAwareLoss被禁用，将其权重设为0
+            if not use_contact_aware_loss:
+                w_contact_aware = 0.0
             
             loss = (w_rot * loss_rot + 
                     w_root_pos * loss_root_pos + 
@@ -221,7 +280,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     w_full_pos * loss_full_pos + 
                     w_root_vel * loss_root_vel +
                     w_hand_contact * loss_hand_contact +
-                    w_obj_trans * loss_obj_trans) # <<< 新增损失项
+                    w_obj_trans * loss_obj_trans +
+                    w_contact_aware * contact_loss +
+                    w_obj_vel * loss_obj_vel +
+                    w_leaf_vel * loss_leaf_vel)
             
             
             # 反向传播和优化
@@ -238,34 +300,52 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             train_loss_root_vel += loss_root_vel.item()
             train_loss_hand_contact += loss_hand_contact.item()
             train_loss_obj_trans += loss_obj_trans.item()
+            train_loss_contact_aware += contact_loss.item()
+            train_loss_obj_vel += loss_obj_vel.item()
+            train_loss_leaf_vel += loss_leaf_vel.item()
             
             # 更新tqdm描述
-            train_iter.set_postfix({
+            postfix_dict = {
                 'loss': loss.item(),
                 'rot': loss_rot.item(), 
                 'root_pos': loss_root_pos.item(), 
-                'leaf_pos': loss_leaf_pos.item(),
-                'full_pos': loss_full_pos.item(),
-                'root_vel': loss_root_vel.item(),
                 'hand_contact': loss_hand_contact.item(),
-                'obj_trans': loss_obj_trans.item()
-            })
+                'obj_trans': loss_obj_trans.item(),
+                'obj_vel': loss_obj_vel.item(),
+                'leaf_vel': loss_leaf_vel.item(),
+            }
             
-            # 记录wandb
-            if use_wandb:
-                log_dict = {
-                    'train_loss': loss.item(),
-                    'train_loss_rot': loss_rot.item(),
-                    'train_loss_root_pos': loss_root_pos.item(),
-                    'train_loss_leaf_pos': loss_leaf_pos.item(),
-                    'train_loss_full_pos': loss_full_pos.item(),
-                    'train_loss_root_vel': loss_root_vel.item(),
-                    'train_loss_hand_contact': loss_hand_contact.item(),
-                    'train_loss_obj_trans': loss_obj_trans.item()
-                }
-                wandb.log(log_dict, step=n_iter)
+            # 只有启用ContactAwareLoss时才显示相关指标
+            if use_contact_aware_loss:
+                postfix_dict['contact_aware'] = contact_loss.item()
+                
+            train_iter.set_postfix(postfix_dict)
+            
+            # 记录tensorboard
+            if writer is not None:
+                writer.add_scalar('train/loss', loss.item(), n_iter)
+                writer.add_scalar('train/loss_rot', loss_rot.item(), n_iter)
+                writer.add_scalar('train/loss_root_pos', loss_root_pos.item(), n_iter)
+                writer.add_scalar('train/loss_leaf_pos', loss_leaf_pos.item(), n_iter)
+                writer.add_scalar('train/loss_full_pos', loss_full_pos.item(), n_iter)
+                writer.add_scalar('train/loss_root_vel', loss_root_vel.item(), n_iter)
+                writer.add_scalar('train/loss_hand_contact', loss_hand_contact.item(), n_iter)
+                writer.add_scalar('train/loss_obj_trans', loss_obj_trans.item(), n_iter)
+                writer.add_scalar('train/loss_obj_vel', loss_obj_vel.item(), n_iter)
+                writer.add_scalar('train/loss_leaf_vel', loss_leaf_vel.item(), n_iter)
+                
+                # 只有启用ContactAwareLoss时才记录相关指标
+                if use_contact_aware_loss:
+                    writer.add_scalar('train/loss_contact_aware', contact_loss.item(), n_iter)
+                    # 记录ContactAwareLoss的详细信息
+                    for loss_name, loss_value in contact_loss_dict.items():
+                        if isinstance(loss_value, torch.Tensor):
+                            writer.add_scalar(f'contact/{loss_name}', loss_value.item(), n_iter)
+                        else:
+                            writer.add_scalar(f'contact/{loss_name}', loss_value, n_iter)
                 
             n_iter += 1
+            training_step_count += 1
 
         # 计算平均训练损失
         train_loss /= len(train_loader)
@@ -276,6 +356,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_loss_root_vel /= len(train_loader)
         train_loss_hand_contact /= len(train_loader)
         train_loss_obj_trans /= len(train_loader)
+        train_loss_contact_aware /= len(train_loader)
+        train_loss_obj_vel /= len(train_loader)
+        train_loss_leaf_vel /= len(train_loader)
         
         train_losses['loss'].append(train_loss)
         train_losses['loss_rot'].append(train_loss_rot)
@@ -285,15 +368,27 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_losses['loss_root_vel'].append(train_loss_root_vel)
         train_losses['loss_hand_contact'].append(train_loss_hand_contact)
         train_losses['loss_obj_trans'].append(train_loss_obj_trans)
+        train_losses['loss_contact_aware'].append(train_loss_contact_aware)
+        train_losses['loss_obj_vel'].append(train_loss_obj_vel)
+        train_losses['loss_leaf_vel'].append(train_loss_leaf_vel)
         
-        print(f'Epoch {epoch}, Train Loss: {train_loss:.6f}, '
-              f'Rot Loss: {train_loss_rot:.6f}, '
-              f'Root Pos Loss: {train_loss_root_pos:.6f}, '
-              f'Leaf Pos Loss: {train_loss_leaf_pos:.6f}, '
-              f'Full Pos Loss: {train_loss_full_pos:.6f}, '
-              f'Root Vel Loss: {train_loss_root_vel:.6f}, '
-              f'Hand Contact Loss: {train_loss_hand_contact:.6f}, '
-              f'Obj Trans Loss: {train_loss_obj_trans:.6f}')
+        # 打印训练损失
+        loss_msg = (f'Epoch {epoch}, Train Loss: {train_loss:.6f}, '
+                   f'Rot Loss: {train_loss_rot:.6f}, '
+                   f'Root Pos Loss: {train_loss_root_pos:.6f}, '
+                   f'Leaf Pos Loss: {train_loss_leaf_pos:.6f}, '
+                   f'Full Pos Loss: {train_loss_full_pos:.6f}, '
+                   f'Root Vel Loss: {train_loss_root_vel:.6f}, '
+                   f'Hand Contact Loss: {train_loss_hand_contact:.6f}, '
+                   f'Obj Trans Loss: {train_loss_obj_trans:.6f}, '
+                   f'Obj Vel Loss: {train_loss_obj_vel:.6f}, '
+                   f'Leaf Vel Loss: {train_loss_leaf_vel:.6f}')
+        
+        # 只有启用ContactAwareLoss时才添加相关信息
+        if use_contact_aware_loss:
+            loss_msg += f', Contact Aware Loss: {train_loss_contact_aware:.6f}'
+            
+        print(loss_msg)
 
         # 每5个epoch进行一次测试和保存
         if epoch % 10 == 0 and test_loader is not None:
@@ -307,6 +402,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             test_loss_root_vel = 0
             test_loss_hand_contact = 0
             test_loss_obj_trans = 0
+            test_loss_contact_aware = 0
+            test_loss_obj_vel = 0
+            test_loss_leaf_vel = 0
             
             with torch.no_grad():
                 test_iter = tqdm(test_loader, desc=f'Test Epoch {epoch}')
@@ -330,6 +428,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     
                     if obj_trans is not None: obj_trans = obj_trans.to(device)
                     else: obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
+
+                    # 获取速度真值（测试）
+                    obj_vel_eval = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, 3]
+                    leaf_vel_eval = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, n_leaf, 3]
 
                     bps_features = batch.get("bps_features", None)
                     if bps_features is not None: bps_features = bps_features.to(device)
@@ -367,10 +469,16 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         pose_body=gt_pose_axis_angle_flat_eval[:, 3:], # [bs*seq, (num_joints-1)*3]
                         trans=gt_trans_flat_eval # [bs*seq, 3]
                     )
-                    gt_j_flat_eval = body_model_output_gt_eval.Jtr[:, :model.num_joints, :] # [bs*seq, num_joints, 3]
-                    gt_j_seq_eval = gt_j_flat_eval.reshape(bs, seq, model.num_joints, 3) # [bs, seq, num_joints, 3]
+
+                    gt_j_global_flat_eval = body_model_output_gt_eval.Jtr[:, :model.num_joints, :] # [bs*seq, num_joints, 3]
+                    gt_j_local_flat_eval = gt_j_global_flat_eval - gt_trans_flat_eval.unsqueeze(1)
+                    gt_j_seq_eval = gt_j_local_flat_eval.reshape(bs, seq, model.num_joints, 3) # [bs, seq, num_joints, 3]
+
                     gt_leaf_pos_eval = gt_j_seq_eval[:, :, joint_set.leaf, :] # [bs, seq, n_leaf, 3]
                     gt_full_pos_eval = gt_j_seq_eval[:, :, joint_set.full, :] # [bs, seq, n_full, 3]
+                    # gt_reduced_motion_eval = rotation_6d_to_matrix(motion.clone().reshape(bs, seq, model.num_joints, model.joint_dim))
+                    # gt_reduced_motion_eval[:, :, joint_set.ignored, :] = torch.eye(3, device=gt_reduced_motion_eval.device).repeat(bs, seq, joint_set.n_ignored, 1, 1)
+                    # gt_reduced_motion_eval = matrix_to_rotation_6d(gt_reduced_motion_eval).reshape(bs, seq, model.num_joints * model.joint_dim)
                     
                     # 计算评估指标
                     # 1. 姿态损失
@@ -378,10 +486,6 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     
                     # 2. 根节点位置损失
                     loss_root_pos = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
-                    
-                    # # 3. 物体位置损失  # 已注释：不计算这个损失
-                    # loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["obj_trans"], obj_trans)
-                    
                     
                     # 5. 叶子节点位置损失 (L1)
                     loss_leaf_pos = torch.nn.functional.l1_loss(pred_dict["pred_leaf_pos"], gt_leaf_pos_eval)
@@ -402,7 +506,23 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     obj_trans_gt_eval = data_dict_eval["obj_trans"] # 从已经 .to(device) 的 data_dict_eval 中获取
                     loss_obj_trans = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans_gt_eval)
                     
-                    # 计算总损失（加权）- 使用与训练相同的权重进行评估?
+                    # 10. 接触感知损失 (ContactAwareLoss) - 可选
+                    if use_contact_aware_loss and contact_loss_fn is not None:
+                        contact_loss_eval, contact_loss_dict_eval = contact_loss_fn(
+                            pred_hand_pos=pred_dict["pred_hand_pos"],      # [bs, seq, 2, 3]
+                            pred_obj_pos=pred_dict["pred_obj_trans"],      # [bs, seq, 3]
+                            contact_probs=pred_dict["pred_hand_contact_prob"], # [bs, seq, 3]
+                            training_step=training_step_count  # 使用当前训练步数
+                        )
+                    else:
+                        contact_loss_eval = torch.tensor(0.0, device=device)
+                        contact_loss_dict_eval = {}
+                    
+                    # 11. 速度损失（评估）
+                    loss_obj_vel_eval = torch.nn.functional.mse_loss(pred_dict["pred_obj_vel"], obj_vel_eval) # 物体速度损失
+                    loss_leaf_vel_eval = torch.nn.functional.mse_loss(pred_dict["pred_leaf_vel"], leaf_vel_eval) # 叶子节点速度损失
+                    
+                    # 计算总损失（加权）- 使用与训练相同的权重进行评估
                     if hasattr(cfg, 'loss_weights'):
                         w_rot = cfg.loss_weights.rot if hasattr(cfg.loss_weights, 'rot') else 1.0
                         w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 0.1
@@ -410,7 +530,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         w_full_pos = cfg.loss_weights.full_pos if hasattr(cfg.loss_weights, 'full_pos') else 0.1
                         w_root_vel = cfg.loss_weights.root_vel if hasattr(cfg.loss_weights, 'root_vel') else 0.1
                         w_hand_contact = cfg.loss_weights.hand_contact if hasattr(cfg.loss_weights, 'hand_contact') else 0.1
-                        w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1 # <<< 新增物体平移损失权重
+                        w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 0.1
+                        w_contact_aware = cfg.loss_weights.contact_aware if hasattr(cfg.loss_weights, 'contact_aware') else 0.1
+                        w_obj_vel = cfg.loss_weights.obj_vel if hasattr(cfg.loss_weights, 'obj_vel') else 0.1
+                        w_leaf_vel = cfg.loss_weights.leaf_vel if hasattr(cfg.loss_weights, 'leaf_vel') else 0.1
                     else:
                         w_rot = 1.0
                         w_root_pos = 0.1
@@ -418,7 +541,14 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         w_full_pos = 0.1
                         w_root_vel = 0.1
                         w_hand_contact = 0.1
-                        w_obj_trans = 0.1 # <<< 新增物体平移损失权重
+                        w_obj_trans = 0.1
+                        w_contact_aware = 0.1
+                        w_obj_vel = 0.1
+                        w_leaf_vel = 0.1
+                    
+                    # 如果ContactAwareLoss被禁用，将其权重设为0
+                    if not use_contact_aware_loss:
+                        w_contact_aware = 0.0
                     
                     test_metric = (w_rot * loss_rot + 
                                    w_root_pos * loss_root_pos + 
@@ -426,7 +556,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                                    w_full_pos * loss_full_pos + 
                                    w_root_vel * loss_root_vel +
                                    w_hand_contact * loss_hand_contact +
-                                   w_obj_trans * loss_obj_trans) # <<< 新增损失项
+                                   w_obj_trans * loss_obj_trans +
+                                   w_contact_aware * contact_loss_eval +
+                                   w_obj_vel * loss_obj_vel_eval +
+                                   w_leaf_vel * loss_leaf_vel_eval)
                     
                     # # --- 计算手部细化评估指标 --- #
                     # gt_wrist_l_6d_eval = motion.reshape(bs * seq, model.num_joints, 6)[:, model.wrist_l_idx, :] # [bs*seq, 6]
@@ -455,9 +588,12 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     test_loss_root_vel += loss_root_vel.item()
                     test_loss_hand_contact += loss_hand_contact.item()
                     test_loss_obj_trans += loss_obj_trans.item()
+                    test_loss_contact_aware += contact_loss_eval.item()
+                    test_loss_obj_vel += loss_obj_vel_eval.item()
+                    test_loss_leaf_vel += loss_leaf_vel_eval.item()
                     
                     # 更新tqdm描述
-                    test_iter.set_postfix({
+                    test_postfix_dict = {
                         'test_metric': test_metric.item(),
                         'loss_rot': loss_rot.item(),
                         'loss_root_pos': loss_root_pos.item(),
@@ -465,8 +601,16 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         'loss_full_pos': loss_full_pos.item(),
                         'loss_root_vel': loss_root_vel.item(),
                         'hand_contact': loss_hand_contact.item(),
-                        'obj_trans': loss_obj_trans.item()
-                    })
+                        'obj_trans': loss_obj_trans.item(),
+                        'obj_vel': loss_obj_vel_eval.item(),
+                        'leaf_vel': loss_leaf_vel_eval.item()
+                    }
+                    
+                    # 只有启用ContactAwareLoss时才显示相关指标
+                    if use_contact_aware_loss:
+                        test_postfix_dict['contact_aware'] = contact_loss_eval.item()
+                        
+                    test_iter.set_postfix(test_postfix_dict)
             
             # 计算平均测试损失
             test_loss /= len(test_loader)
@@ -477,6 +621,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             test_loss_root_vel /= len(test_loader)
             test_loss_hand_contact /= len(test_loader)
             test_loss_obj_trans /= len(test_loader)
+            test_loss_contact_aware /= len(test_loader)
+            test_loss_obj_vel /= len(test_loader)
+            test_loss_leaf_vel /= len(test_loader)
             
             test_losses['loss'].append(test_loss)
             test_losses['loss_rot'].append(test_loss_rot)
@@ -486,28 +633,43 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             test_losses['loss_root_vel'].append(test_loss_root_vel)
             test_losses['loss_hand_contact'].append(test_loss_hand_contact)
             test_losses['loss_obj_trans'].append(test_loss_obj_trans)
+            test_losses['loss_contact_aware'].append(test_loss_contact_aware)
+            test_losses['loss_obj_vel'].append(test_loss_obj_vel)
+            test_losses['loss_leaf_vel'].append(test_loss_leaf_vel)
             
-            print(f'Epoch {epoch}, Test Metric: {test_loss:.6f}, '
-                  f'Rot Loss: {test_loss_rot:.6f}, '
-                  f'Root Pos Loss: {test_loss_root_pos:.6f}, '
-                  f'Leaf Pos Loss: {test_loss_leaf_pos:.6f}, '
-                  f'Full Pos Loss: {test_loss_full_pos:.6f}, '
-                  f'Root Vel Loss: {test_loss_root_vel:.6f}, '
-                  f'Hand Contact Loss: {test_loss_hand_contact:.6f}, '
-                  f'Obj Trans Loss: {test_loss_obj_trans:.6f}')
+            # 打印测试损失
+            test_loss_msg = (f'Epoch {epoch}, Test Metric: {test_loss:.6f}, '
+                            f'Rot Loss: {test_loss_rot:.6f}, '
+                            f'Root Pos Loss: {test_loss_root_pos:.6f}, '
+                            f'Leaf Pos Loss: {test_loss_leaf_pos:.6f}, '
+                            f'Full Pos Loss: {test_loss_full_pos:.6f}, '
+                            f'Root Vel Loss: {test_loss_root_vel:.6f}, '
+                            f'Hand Contact Loss: {test_loss_hand_contact:.6f}, '
+                            f'Obj Trans Loss: {test_loss_obj_trans:.6f}, '
+                            f'Obj Vel Loss: {test_loss_obj_vel:.6f}, '
+                            f'Leaf Vel Loss: {test_loss_leaf_vel:.6f}')
             
-            if use_wandb:
-                log_dict = {
-                    'test_metric': test_loss,
-                    'test_loss_rot': test_loss_rot,
-                    'test_loss_root_pos': test_loss_root_pos,
-                    'test_loss_leaf_pos': test_loss_leaf_pos,
-                    'test_loss_full_pos': test_loss_full_pos,
-                    'test_loss_root_vel': test_loss_root_vel,
-                    'test_loss_hand_contact': test_loss_hand_contact,
-                    'test_loss_obj_trans': test_loss_obj_trans
-                }
-                wandb.log(log_dict, step=n_iter)
+            # 只有启用ContactAwareLoss时才添加相关信息
+            if use_contact_aware_loss:
+                test_loss_msg += f', Contact Aware Loss: {test_loss_contact_aware:.6f}'
+                
+            print(test_loss_msg)
+            
+            if writer is not None:
+                writer.add_scalar('test/metric', test_loss, n_iter)
+                writer.add_scalar('test/loss_rot', test_loss_rot, n_iter)
+                writer.add_scalar('test/loss_root_pos', test_loss_root_pos, n_iter)
+                writer.add_scalar('test/loss_leaf_pos', test_loss_leaf_pos, n_iter)
+                writer.add_scalar('test/loss_full_pos', test_loss_full_pos, n_iter)
+                writer.add_scalar('test/loss_root_vel', test_loss_root_vel, n_iter)
+                writer.add_scalar('test/loss_hand_contact', test_loss_hand_contact, n_iter)
+                writer.add_scalar('test/loss_obj_trans', test_loss_obj_trans, n_iter)
+                writer.add_scalar('test/loss_obj_vel', test_loss_obj_vel, n_iter)
+                writer.add_scalar('test/loss_leaf_vel', test_loss_leaf_vel, n_iter)
+                
+                # 只有启用ContactAwareLoss时才记录相关指标
+                if use_contact_aware_loss:
+                    writer.add_scalar('test/loss_contact_aware', test_loss_contact_aware, n_iter)
             
             # 保存最佳模型
             if test_loss < best_loss and not cfg.debug:
@@ -555,14 +717,15 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         with open(os.path.join(save_dir, 'loss_curves.pkl'), 'wb') as f:
             pickle.dump(loss_curves, f)
     
-    # 如果使用wandb，保存训练曲线
-    if use_wandb:
-        wandb.log({
-            'final_train_loss': train_loss,
-            'final_test_loss': test_loss if test_loader is not None else None,
-            'best_test_loss': best_loss if test_loader is not None else None,
-        })
-        wandb.finish()
+    # 如果使用tensorboard，保存最终指标并关闭writer
+    if writer is not None:
+        writer.add_scalar('final/train_loss', train_loss, max_epoch)
+        if test_loader is not None:
+            writer.add_scalar('final/test_loss', test_loss, max_epoch)
+            writer.add_scalar('final/best_test_loss', best_loss, max_epoch)
+        log_dir = writer.log_dir
+        writer.close()
+        print(f'TensorBoard logs saved. You can view them with: tensorboard --logdir {os.path.dirname(log_dir)}')
     
     # 如果是超参数搜索，返回最佳测试损失
     if trial is not None:

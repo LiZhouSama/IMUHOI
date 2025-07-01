@@ -9,21 +9,8 @@ from human_body_prior.body_model.body_model import BodyModel
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d, so3_relative_angle
 from utils.utils import global2local
 
-from configs.global_config import FRAME_RATE, IMU_JOINTS, IMU_JOINT_NAMES, HEAD_IDX
+from configs.global_config import FRAME_RATE, IMU_JOINTS_POS, IMU_JOINTS_ROT, IMU_JOINT_NAMES, joint_set
 
-class joint_set:
-    # TransPose关节索引
-    leaf = [7, 8, 12, 20, 21]
-    full = list(range(1, 22))
-    reduced = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-    ignored = [0]
-
-    lower_body = [0, 1, 2, 4, 5, 7, 8, 10, 11]
-    lower_body_parent = [None, 0, 0, 1, 2, 3, 4, 5, 6]
-    n_leaf = len(leaf)
-    n_full = len(full)
-    n_reduced = len(reduced)
-    n_ignored = len(ignored)
 
 
 # 定义辅助函数
@@ -115,46 +102,53 @@ class TransPoseNet(torch.nn.Module):
 
 
         # --- 手部接触网络相关索引 ---
-        self.lhand_imu_idx = 0 # 基于 global_config.py IMU_JOINT_NAMES
-        self.rhand_imu_idx = 1 # 基于 global_config.py IMU_JOINT_NAMES
+        self.lhand_imu_idx = IMU_JOINT_NAMES.index('left_hand') # 基于 global_config.py IMU_JOINT_NAMES
+        self.rhand_imu_idx = IMU_JOINT_NAMES.index('right_hand') # 基于 global_config.py IMU_JOINT_NAMES
         # self.num_human_imus 维度中的索引
 
         # joint_set.full 中的手腕关节索引 (原始SMPL关节20和21)
         # joint_set.full = [1, ..., 21], 长度为21
         # 原始关节20 -> joint_set.full.index(20) = 19
         # 原始关节21 -> joint_set.full.index(21) = 20
-        self.lhand_jnt_idx_in_full = 19 
-        self.rhand_jnt_idx_in_full = 20
+        self.lhand_jnt_idx_in_full = joint_set.full.index(20)
+        self.rhand_jnt_idx_in_full = joint_set.full.index(21)
 
         # joint_set.reduced 中的手腕关节索引 (原始SMPL关节20和21)
         # joint_set.reduced = [1, 2, ..., 19, 20, 21] (实际值)
         # 在这个 reduced 列表中，原始关节20是列表的第19个元素 (0-indexed)
         # 在这个 reduced 列表中，原始关节21是列表的第20个元素 (0-indexed)
-        self.lhand_jnt_idx_in_reduced = 19
-        self.rhand_jnt_idx_in_reduced = 20
+        # self.lhand_jnt_idx_in_reduced = joint_set.reduced.index(20)
+        # self.rhand_jnt_idx_in_reduced = joint_set.reduced.index(21)
 
 
         # --- RNN 模块定义 ---
-        # 姿态估计级联架构
-        self.pose_s1 = RNN(n_imu, joint_set.n_leaf * 3, 256 * hidden_dim_multiplier)
-        self.pose_s2 = RNN(joint_set.n_leaf * 3 + n_imu, joint_set.n_full * 3, 64 * hidden_dim_multiplier)
-        self.pose_s3 = RNN(joint_set.n_full * 3 + n_imu, joint_set.n_reduced * 6, 128 * hidden_dim_multiplier)
 
-        # 足部接触概率预测网络
-        self.contact_prob_net = RNN(joint_set.n_leaf * 3 + n_imu, 2, 64 * hidden_dim_multiplier)
+        # --- 速度估计网络 (在手部接触网络之前) ---
+        # 输入: 所有IMU数据 (human_imu + obj_imu)
+        # 输出: 物体速度(3) + 叶子节点速度(n_leaf * 3)
+        n_velocity_output = 3 + joint_set.n_leaf * 3  # 物体速度 + 叶子节点速度
+        self.velocity_net = RNN(n_imu, n_velocity_output, 256 * hidden_dim_multiplier) # 速度估计网络
 
-        # 基于运动学的速度分支预测网络 (设置为单向)
-        self.trans_b2 = RNN(joint_set.n_full * 3 + n_imu, 3, 256 * hidden_dim_multiplier, bidirectional=False)
-        
         # --- 手部接触预测网络 ---
-        # 输入: 3*imu_dim (双手IMU+物体IMU) + 2*3 (手部位置 from S2) + 2*6 (手部旋转 from S3 reduced)
-        # n_hand_contact_input = (3 * self.imu_dim) + (2 * 3) + (2 * 6)
-        n_hand_contact_input = (3 * self.imu_dim) + (2 * 3)
+        # 输入: 3*imu_dim (双手IMU+物体IMU) + 双手速度(2*3) + 物体速度(3)
+        n_hand_contact_input = 3 * self.imu_dim + 2 * 3 + 3
         self.hand_contact_net = RNN(n_hand_contact_input, 3, 128 * hidden_dim_multiplier) # 输出3个接触概率
+        
+                # 姿态估计级联架构 (只使用人体IMU + 人体相关节点速度 + 手部接触概率)
+        # S1输入: human_imu + 叶子节点速度（人体相关的速度）+ 手部接触概率(3)
+        self.pose_s1 = RNN(n_human_imu + joint_set.n_leaf * 3 + 3, joint_set.n_leaf * 3, 256 * hidden_dim_multiplier)
+        self.pose_s2 = RNN(joint_set.n_leaf * 3 + n_human_imu, joint_set.n_full * 3, 64 * hidden_dim_multiplier)
+        self.pose_s3 = RNN(joint_set.n_full * 3 + n_human_imu, joint_set.n_reduced * 6, 128 * hidden_dim_multiplier)
 
+        # 足部接触概率预测网络 (只使用人体IMU)
+        self.contact_prob_net = RNN(joint_set.n_leaf * 3 + n_human_imu, 2, 64 * hidden_dim_multiplier)
+
+        # 基于运动学的速度分支预测网络 (设置为单向, 只使用人体IMU)
+        self.trans_b2 = RNN(joint_set.n_full * 3 + n_human_imu, 3, 256 * hidden_dim_multiplier, bidirectional=False)
+        
         # --- 物体平移预测网络 ---
-        # 输入: 与 hand_contact_net 相同，再加3维接触概率
-        n_obj_trans_input = n_hand_contact_input + 3 # hand_contact_input + pred_hand_contact_prob
+        # 输入: 2*3 (手部位置) + 3 (接触概率) + 3 (物体速度)
+        n_obj_trans_input = (2 * 3) + 3 + 3
         self.obj_trans_net = RNN(n_obj_trans_input, 3, 128 * hidden_dim_multiplier) # 输出3维物体平移
 
 
@@ -168,6 +162,7 @@ class TransPoseNet(torch.nn.Module):
             return torch.nn.Linear(self.initial_state_dim, 2 * num_layers * num_directions * hidden_size).to(self.device)
 
         # Access hidden size directly from the RNN modules
+        self.proj_velocity_state = create_state_projection(self.velocity_net.n_hidden, self.velocity_net.n_rnn_layer, self.velocity_net.num_directions == 2)
         self.proj_s1_state = create_state_projection(self.pose_s1.n_hidden, self.pose_s1.n_rnn_layer, self.pose_s1.num_directions == 2)
         self.proj_s2_state = create_state_projection(self.pose_s2.n_hidden, self.pose_s2.n_rnn_layer, self.pose_s2.num_directions == 2)
         self.proj_s3_state = create_state_projection(self.pose_s3.n_hidden, self.pose_s3.n_rnn_layer, self.pose_s3.num_directions == 2)
@@ -182,26 +177,30 @@ class TransPoseNet(torch.nn.Module):
         for p in self.body_model.parameters(): # Freeze SMPL model parameters
             p.requires_grad = False
         self.parents_tensor = self.body_model.kintree_table[0].long().to(cfg.device) # Store parents tensor
-        self.imu_joints = torch.tensor(IMU_JOINTS, device=cfg.device) # Store IMU joint indices
+        self.imu_joints_pos = torch.tensor(IMU_JOINTS_POS, device=cfg.device) # Store IMU joint indices
+        self.imu_joints_rot = torch.tensor(IMU_JOINTS_ROT, device=cfg.device) # Store IMU joint indices
 
         # 4. 常量
-        self.left_foot_idx = 10 # e.g., 10 for SMPL
-        self.right_foot_idx = 11 # e.g., 11 for SMPL
         # 确保 gravity_velocity 是一个 tensor 并移到正确的设备
         self.gravity_velocity = torch.tensor([0.0, 0.0, -0.018], dtype=torch.float32).to(cfg.device)
         self.vel_scale = cfg.vel_scale if hasattr(cfg, 'vel_scale') else 1.66 # 参考代码中的 vel_scale
         self.prob_threshold_min = cfg.prob_threshold_min if hasattr(cfg, 'prob_threshold_min') else 0.1 # 参考代码使用了 (0.5, 0.9)，这里用更宽松的默认值
         self.prob_threshold_max = cfg.prob_threshold_max if hasattr(cfg, 'prob_threshold_max') else 0.9
         self.floor_y = cfg.floor_y if hasattr(cfg, 'floor_y') else 0.0 # 地面高度
+        
+        # 物体静止逻辑参数
+        self.obj_imu_change_threshold = cfg.obj_imu_change_threshold if hasattr(cfg, 'obj_imu_change_threshold') else 0.1
+        self.obj_contact_threshold = cfg.obj_contact_threshold if hasattr(cfg, 'obj_contact_threshold') else 0.3
+        self.obj_rot_weight = cfg.obj_rot_weight if hasattr(cfg, 'obj_rot_weight') else 0.5  # 旋转变化的权重
+        
+        # 手部接触相关参数（用于loss计算）
+        self.hand_contact_distance = cfg.hand_contact_distance if hasattr(cfg, 'hand_contact_distance') else 0.1  # 10cm
         # # 5. Hand Refiner Module
         # self.hand_refiner = HandRefiner().to(cfg.device) # <<< 添加
         # 6. Indices for Refiner
         # SMPL joint indices
+        self.left_foot_idx, self.right_foot_idx = 7, 8 
         self.wrist_l_idx, self.wrist_r_idx = 20, 21
-        self.elbow_l_idx, self.elbow_r_idx = 18, 19
-        # IMU indices (corresponding to IMU_JOINTS list: [20, 21, ...])
-        self.wrist_l_imu_idx = IMU_JOINTS.index(self.wrist_l_idx) # Should be 0
-        self.wrist_r_imu_idx = IMU_JOINTS.index(self.wrist_r_idx) # Should be 1
         # ----------------------------------
         
         
@@ -270,24 +269,18 @@ class TransPoseNet(torch.nn.Module):
 
         # 3. 填充 R_global_full:
         R_global_full[:, joint_set.reduced] = R_reduced_pred
-        R_global_full[:, 0] = rotation_6d_to_matrix(imu_rotation_6d[:, -1])
+        R_global_full[:, IMU_JOINTS_ROT] = R_imu # 填充全局旋转真值
 
         # 4. 使用 global2local 转换为局部旋转矩阵
         # 确保 parents_tensor 在正确的设备上
         local_rotmats = global2local(R_global_full, self.parents_tensor.to(device)) # [bs*seq, num_joints, 3, 3]
+        local_rotmats[:,0] = R_imu[:, -1] # 填充全局髋部的旋转真值
+        local_rotmats[:, [20, 21, 7, 8]] = torch.eye(3, device=device).repeat(bs_seq, 4, 1, 1)
 
         # 5. 转换回 6D 表示
         local_pose_6d = matrix_to_rotation_6d(local_rotmats.reshape(-1, 3, 3)).reshape(bs_seq, self.num_joints * 6) # [bs*seq, num_joints*6]
 
         return local_pose_6d
-
-    def _reduced_to_pose_6d(self, root_rotation, reduced_pose):
-        reduced_pose = rotation_6d_to_matrix(reduced_pose).reshape(-1, joint_set.n_reduced, 3, 3)
-        pose_mat = torch.eye(3, device=reduced_pose.device).repeat(reduced_pose.shape[0], 22, 1, 1)
-        pose_mat[:, joint_set.reduced] = reduced_pose
-        pose_mat[:, joint_set.ignored] = torch.eye(3, device=pose_mat.device)
-        pose_mat[:, 0] = rotation_6d_to_matrix(root_rotation)
-        return matrix_to_rotation_6d(pose_mat)
         
     def _prob_to_weight(self, p):
         """
@@ -313,7 +306,40 @@ class TransPoseNet(torch.nn.Module):
         clamped_p = p.clamp(threshold_min, threshold_max)
         weight = (clamped_p - threshold_min) / (threshold_max - threshold_min)
         return weight.unsqueeze(1) # 返回 [batch_size*seq_len, 1]
-
+    
+    def compute_obj_imu_change(self, obj_imu):
+        """
+        计算物体IMU的变化量
+        
+        Args:
+            obj_imu: [bs, seq, imu_dim] (前3维是加速度，后6维是旋转)
+        
+        Returns:
+            imu_change: [bs, seq] 每帧的IMU变化标量
+        """
+        bs, seq = obj_imu.shape[:2]
+        
+        # 计算相邻帧的差异
+        obj_imu_diff = obj_imu[:, 1:] - obj_imu[:, :-1]  # [bs, seq-1, imu_dim]
+        
+        # 分别处理加速度和旋转
+        acc_diff = obj_imu_diff[:, :, :3]  # 加速度变化
+        rot_diff = obj_imu_diff[:, :, 3:]  # 旋转变化
+        
+        # 计算变化量的幅度
+        acc_change = torch.norm(acc_diff, dim=-1)  # [bs, seq-1]
+        rot_change = torch.norm(rot_diff, dim=-1)  # [bs, seq-1]
+        
+        # 综合变化量（可以设置不同权重）
+        total_change = acc_change + self.obj_rot_weight * rot_change  # 旋转权重可调
+        
+        # 第一帧设为0
+        first_frame = torch.zeros(bs, 1, device=obj_imu.device)
+        imu_change = torch.cat([first_frame, total_change], dim=1)  # [bs, seq]
+        
+        return imu_change
+    
+    
     def forward(self, data_dict):
         """
         前向传播
@@ -328,6 +354,8 @@ class TransPoseNet(torch.nn.Module):
         imu_data, initial_state_flat = self.format_input(data_dict)
         batch_size, seq_len, _ = imu_data.shape
         device = imu_data.device
+        human_imu_data = imu_data[:,:,:self.num_human_imus*self.imu_dim] # [bs, seq, 6*9]
+        obj_imu_data = imu_data[:,:,self.num_human_imus*self.imu_dim:] # [bs, seq, 1*9]
 
         # 2. 计算压缩后的初始状态
         compressed_initial_state = self.initial_state_compressor(initial_state_flat) # [bs, initial_state_dim]
@@ -349,35 +377,68 @@ class TransPoseNet(torch.nn.Module):
             return (h_0, c_0)
 
         # --- 获取基本 RNNs 的初始状态 ---
+        velocity_initial_state = get_initial_rnn_state(self.proj_velocity_state, self.velocity_net)
         s1_initial_state = get_initial_rnn_state(self.proj_s1_state, self.pose_s1)
         s2_initial_state = get_initial_rnn_state(self.proj_s2_state, self.pose_s2)
         s3_initial_state = get_initial_rnn_state(self.proj_s3_state, self.pose_s3)
         contact_initial_state = get_initial_rnn_state(self.proj_contact_state, self.contact_prob_net)
         trans_b2_initial_state = get_initial_rnn_state(self.proj_trans_b2_state, self.trans_b2)
 
-        # --- 级联网络处理 --- 
-        # RNN 输入现在是 [bs, seq, n_input]
+        # --- 速度估计 (在所有其他网络之前) ---
+        # 使用所有IMU数据进行速度估计
+        pred_velocity_output, _ = self.velocity_net(imu_data, velocity_initial_state) # [bs, seq, n_velocity_output]
+        
+        # 分离预测的速度
+        pred_obj_vel = pred_velocity_output[:, :, :3] # [bs, seq, 3] - 物体速度
+        pred_leaf_vel = pred_velocity_output[:, :, 3:].reshape(batch_size, seq_len, joint_set.n_leaf, 3) # [bs, seq, n_leaf, 3] - 叶子节点速度
+        pred_leaf_vel_flat = pred_leaf_vel.reshape(batch_size, seq_len, -1) # [bs, seq, n_leaf*3] - 展平的叶子节点速度
+        
+        # 提取双手速度 (叶子节点中的手腕速度)
+        # joint_set.leaf = [7, 8, 12, 20, 21] 对应 [left_ankle, right_ankle, left_collar, left_wrist, right_wrist]
+        # 手腕索引在 leaf 中的位置: left_wrist=3, right_wrist=4
+        lhand_vel = pred_leaf_vel[:, :, 3, :] # [bs, seq, 3] - 左手速度
+        rhand_vel = pred_leaf_vel[:, :, 4, :] # [bs, seq, 3] - 右手速度
+
+        # --- 手部接触预测 ---
+        # 提取双手IMU和物体IMU
+        human_imu_reshaped = human_imu_data.reshape(batch_size, seq_len, self.num_human_imus, self.imu_dim) # [bs, seq, num_human_imus, imu_dim]
+        lhand_imu = human_imu_reshaped[:, :, self.lhand_imu_idx, :] # [bs, seq, imu_dim]
+        rhand_imu = human_imu_reshaped[:, :, self.rhand_imu_idx, :] # [bs, seq, imu_dim]
+        
+        # 构建手部接触网络的输入: IMU + 双手速度 + 物体速度
+        imu_feat = torch.cat([lhand_imu, rhand_imu, obj_imu_data], dim=2) # [bs, seq, 3 * imu_dim]
+        hand_vel_feat = torch.cat([lhand_vel, rhand_vel], dim=2) # [bs, seq, 2*3]
+        hand_contact_input = torch.cat([imu_feat, hand_vel_feat, pred_obj_vel], dim=2) # [bs, seq, 3*imu_dim + 2*3 + 3]
+        
+        # 获取手部接触网络的初始状态
+        hand_contact_initial_state = get_initial_rnn_state(self.proj_hand_contact_state, self.hand_contact_net)
+        
+        # 手部接触预测
+        pred_hand_contact_prob_logits, _ = self.hand_contact_net(hand_contact_input, hand_contact_initial_state) # [bs, seq, 3]
+        pred_hand_contact_prob = torch.sigmoid(pred_hand_contact_prob_logits) # [bs, seq, 3]
+
+        # --- 级联网络处理 (使用人体IMU + 人体相关节点速度 + 手部接触概率) --- 
+        # RNN 输入现在是 [bs, seq, n_human_imu + n_leaf*3 + 3]
 
         # 第一阶段：预测关键关节位置
-        s1_input = imu_data # [bs, seq, n_imu]
+        s1_input = torch.cat([human_imu_data, pred_leaf_vel_flat, pred_hand_contact_prob], dim=2) # [bs, seq, n_human_imu + n_leaf*3 + 3]
         s1_output, _ = self.pose_s1(s1_input, s1_initial_state) # [bs, seq, joint_set.n_leaf * 3]
         pred_leaf_pos = s1_output.reshape(batch_size, seq_len, joint_set.n_leaf, 3) # <<< 添加
 
         # 第二阶段：预测所有关节位置
-        s2_input = torch.cat([s1_output, imu_data], dim=2) # [bs, seq, n_output_s1 + n_imu]
+        s2_input = torch.cat([s1_output, human_imu_data], dim=2) # [bs, seq, n_output_s1 + n_human_imu]
         s2_output, _ = self.pose_s2(s2_input, s2_initial_state) # [bs, seq, joint_set.n_full * 3]
         pred_full_pos = s2_output.reshape(batch_size, seq_len, joint_set.n_full, 3) # <<< 添加
 
-        # 第三阶段：预测关节旋转和物体旋转
-        s3_input = torch.cat([s2_output, imu_data], dim=2) # [bs, seq, n_output_s2 + n_imu]
+        # 第三阶段：预测关节旋转
+        s3_input = torch.cat([s2_output, human_imu_data], dim=2) # [bs, seq, n_output_s2 + n_human_imu]
         s3_output, _ = self.pose_s3(s3_input, s3_initial_state) # [bs, seq, n_output_s3]
         
         # S3 输出现在是 reduced 关节的全局 6D 旋转
         pred_reduced_global_pose_6d = s3_output # [bs, seq, n_reduced*6]
 
-        human_imu_flat = imu_data[:,:,:self.num_human_imus*self.imu_dim].reshape(-1, self.num_human_imus, self.imu_dim) # [bs*seq, 6, 9]
+        human_imu_flat = human_imu_data.reshape(-1, self.num_human_imus, self.imu_dim) # [bs*seq, 6, 9]
         human_imu_rot_flat = human_imu_flat[:,:,3:9] # [bs*seq, 6, 6]
-        # 使用S3预测的根旋转, S3的输出包含了根旋转
         # === 使用新函数计算最终的局部姿态 (motion) ===
         pred_motion_6d_flat = self._reduced_global_to_local_6d(
             human_imu_rot_flat, # [bs*seq, 6, 6]
@@ -387,15 +448,15 @@ class TransPoseNet(torch.nn.Module):
         pred_motion = pred_motion_6d_flat.reshape(batch_size, seq_len, -1) # [bs, seq, 22, 6]
         # ===============================================
 
-        # --- 人体平移估计 --- 
+        # --- 人体平移估计 (只使用人体IMU) --- 
         # 1. 预测足部接触概率
-        contact_prob_input = torch.cat([s1_output, imu_data], dim=2) # [bs, seq, n_output_s1 + n_imu]
+        contact_prob_input = torch.cat([s1_output, human_imu_data], dim=2) # [bs, seq, n_output_s1 + n_human_imu]
         contact_probability, _ = self.contact_prob_net(contact_prob_input, contact_initial_state) # [bs, seq, 2]
         contact_probability = torch.sigmoid(contact_probability) # [bs, seq, 2]
         contact_probability_flat = contact_probability.reshape(-1, 2) # [bs*seq, 2]
 
         # 2. 预测速度分支 B2
-        trans_b2_input = torch.cat([s2_output, imu_data], dim=2) # [bs, seq, n_output_s2 + n_imu]
+        trans_b2_input = torch.cat([s2_output, human_imu_data], dim=2) # [bs, seq, n_output_s2 + n_human_imu]
         trans_b2_initial_state = get_initial_rnn_state(self.proj_trans_b2_state, self.trans_b2)
         velocity_b2, _ = self.trans_b2(trans_b2_input, trans_b2_initial_state) # [bs, seq, 3]
         velocity_b2_flat = velocity_b2.reshape(-1, 3) # [bs*seq, 3]
@@ -436,12 +497,8 @@ class TransPoseNet(torch.nn.Module):
         # velocity_b2_flat 是 RNN 输出，代表局部坐标系下的速度
         # 需要转换到世界坐标系
         tran_b2_vel = torch.bmm(root_orient_mat_flat, velocity_b2_flat.unsqueeze(-1)).squeeze(-1) # [bs*seq, 3]
-        # 原 TransPose 做了 vel_scale / 60.0 的缩放，这里也加上
-        tran_b2_vel = tran_b2_vel * self.vel_scale / 60.0 # ? (如果速度是m/frame, 乘以scale得到m/s? 还是说velocity_b2已经是m/s了?)
-                                                    # 假设 velocity_b2 输出的是 m/frame (因为RNN在每帧上操作)
-                                                    # 那么乘以 vel_scale (无单位?) / 60 (frames/s) 得到 m/s?
-                                                    # 或者 velocity_b2 输出的是某种无单位的速度表示，乘以 scale/60 转为 m/frame?
-                                                    # 暂时只乘以 vel_scale，单位问题需要后续确认
+        # tran_b2_vel = tran_b2_vel * self.vel_scale / 60.0 
+        tran_b2_vel = tran_b2_vel * self.vel_scale  # 可能和监督方式有关，上面/60是Transpose Style
 
         # 7. 融合速度分支
         max_contact_prob = contact_probability_flat.max(dim=1).values # [bs*seq]
@@ -457,7 +514,7 @@ class TransPoseNet(torch.nn.Module):
         # 如果需要绝对位置，需要加上初始位置 data_dict['root_pos'][:, 0]
         # trans = trans + data_dict['root_pos'][:, 0:1, :] # Add initial root position
 
-        # --- 手部接触预测和物体平移预测 (使用SMPL全局关节位置) ---
+        # --- 物体平移预测 (使用SMPL全局关节位置) ---
         # 现在我们有了完整的人体平移和姿态，可以通过SMPL前向运动学得到准确的全局关节位置
         
         # 1. 准备SMPL输入参数
@@ -482,59 +539,49 @@ class TransPoseNet(torch.nn.Module):
         pred_smplh_out = self.body_model(**pred_pose_body_input)
         pred_joints_all = pred_smplh_out.Jtr.view(batch_size, seq_len, -1, 3)  # [bs, seq, num_joints, 3]
         
-        # 3. 提取手部IMU数据
-        human_imu_part = imu_data[:, :, :self.num_human_imus * self.imu_dim] # [bs, seq, num_human_imus * imu_dim]
-        human_imu_reshaped = human_imu_part.reshape(batch_size, seq_len, self.num_human_imus, self.imu_dim) # [bs, seq, num_human_imus, imu_dim]
-        
-        lhand_imu = human_imu_reshaped[:, :, self.lhand_imu_idx, :] # [bs, seq, imu_dim]
-        rhand_imu = human_imu_reshaped[:, :, self.rhand_imu_idx, :] # [bs, seq, imu_dim]
-        
-        # 提取物体IMU
-        start_idx_obj_imu = self.num_human_imus * self.imu_dim
-        end_idx_obj_imu = start_idx_obj_imu + self.imu_dim
-        obj_imu = imu_data[:, :, start_idx_obj_imu:end_idx_obj_imu] # [bs, seq, imu_dim]
-        imu_feat = torch.cat([lhand_imu, rhand_imu, obj_imu], dim=2) # [bs, seq, 3 * imu_dim]
-        
-        # 4. 使用SMPL全局关节位置提取手部位置
+        # 3. 使用SMPL全局关节位置提取手部位置
         # 手腕关节在SMPL中的索引是20和21
         lhand_pos_global = pred_joints_all[:, :, self.wrist_l_idx, :] # [bs, seq, 3] (关节20)
         rhand_pos_global = pred_joints_all[:, :, self.wrist_r_idx, :] # [bs, seq, 3] (关节21)
         hands_pos_feat = torch.cat([lhand_pos_global, rhand_pos_global], dim=2) # [bs, seq, 2 * 3]
         
-        # # 5. 提取手部旋转 (从 pred_reduced_global_pose_6d 中提取)
-        # pred_reduced_global_pose_6d_reshaped = pred_reduced_global_pose_6d.reshape(batch_size, seq_len, joint_set.n_reduced, 6)
-        # lhand_rot_s3 = pred_reduced_global_pose_6d_reshaped[:, :, self.lhand_jnt_idx_in_reduced, :] # [bs, seq, 6]
-        # rhand_rot_s3 = pred_reduced_global_pose_6d_reshaped[:, :, self.rhand_jnt_idx_in_reduced, :] # [bs, seq, 6]
-        # hands_rot_feat = torch.cat([lhand_rot_s3, rhand_rot_s3], dim=2) # [bs, seq, 2 * 6]
-        
-        # 6. 获取手部接触和物体平移网络的初始状态
-        hand_contact_initial_state = get_initial_rnn_state(self.proj_hand_contact_state, self.hand_contact_net)
+        # 4. 获取物体平移网络的初始状态
         obj_trans_initial_state = get_initial_rnn_state(self.proj_obj_trans_state, self.obj_trans_net)
         
-        # 7. 手部接触预测
-        # hand_contact_input = torch.cat([imu_feat, hands_pos_feat, hands_rot_feat], dim=2)
-        hand_contact_input = torch.cat([imu_feat, hands_pos_feat], dim=2)
-        pred_hand_contact_prob_logits, _ = self.hand_contact_net(hand_contact_input, hand_contact_initial_state) # [bs, seq, 3]
-        pred_hand_contact_prob = torch.sigmoid(pred_hand_contact_prob_logits) # [bs, seq, 3]
-        
-        # 8. 物体平移预测 (使用手部接触网络的输入和输出)
-        obj_trans_input = torch.cat([hand_contact_input, pred_hand_contact_prob], dim=2)
-        pred_obj_trans, _ = self.obj_trans_net(obj_trans_input, obj_trans_initial_state) # [bs, seq, 3]
+        # 5. 物体平移预测 (使用手部位置、接触概率和物体速度)
+        obj_trans_input = torch.cat([hands_pos_feat, pred_hand_contact_prob, pred_obj_vel], dim=2)
+        pred_obj_trans, _ = self.obj_trans_net(obj_trans_input, obj_trans_initial_state) # [bs, seq, 3] - 物体位置
 
-        # --- 重塑回结果格式 ---
-        # pose_6d 已经是 [bs, seq, num_joints*6]
+        # # --- 应用物体静止逻辑 ---
+        # # 计算物体IMU变化量
+        # obj_imu_change = self.compute_obj_imu_change(obj_imu_data) # [bs, seq]
         
-        # 返回预测结果
+        # # 物体静止条件：仅看IMU变化小
+        # should_be_static = obj_imu_change < self.obj_imu_change_threshold # [bs, seq]
+        
+        # # 让静止时的位置保持与上一帧一致（逐帧处理以处理连续静止帧）
+        # for t in range(1, seq_len):
+        #     static_mask = should_be_static[:, t]  # [bs]
+        #     if static_mask.any():
+        #         pred_obj_trans[static_mask, t] = pred_obj_trans[static_mask, t-1]
+        
+        # --- 提取手部位置信息（用于loss计算） ---
+        # 获取手部位置
+        hand_positions = torch.stack([lhand_pos_global, rhand_pos_global], dim=2) # [bs, seq, 2, 3]
+        
+        # --- 重塑回结果格式 ---
+        # 返回预测结果，保持原有的键名并添加手部位置信息
         results = {
-            "motion": pred_motion,         # [bs, seq, num_joints*6]
+            "motion": pred_motion,         # [bs, seq, num_joints*6] - 原始预测姿态
             "root_pos": trans,       # [bs, seq, 3] - 人体平移
-            "pred_leaf_pos": pred_leaf_pos, # [bs, seq, n_leaf, 3] # <<< 添加
-            "pred_full_pos": pred_full_pos, # [bs, seq, n_full, 3] # <<< 添加
-            "root_vel": velocity,     # [bs, seq, 3] - 根关节速度 # <<< 添加
-            "pred_hand_contact_prob": pred_hand_contact_prob, # [bs, seq, 3] <<< 新增
-            "pred_obj_trans": pred_obj_trans, # [bs, seq, 3] <<< 新增
-            # "pred_wrist_delta_6d": delta_6d.reshape(batch_size, seq_len, 2, 6), # Commented out
-            # "pred_wrist_refined_6d": wrist_refined_6d.reshape(batch_size, seq_len, 2, 6) # Commented out
+            "pred_leaf_pos": pred_leaf_pos, # [bs, seq, n_leaf, 3]
+            "pred_full_pos": pred_full_pos, # [bs, seq, n_full, 3]
+            "root_vel": velocity,     # [bs, seq, 3] - 根关节速度
+            "pred_hand_contact_prob": pred_hand_contact_prob, # [bs, seq, 3]
+            "pred_obj_trans": pred_obj_trans, # [bs, seq, 3] - 物体位置（相对于初始位置的位移）
+            "pred_hand_pos": hand_positions, # [bs, seq, 2, 3] - 手部位置（用于loss计算）
+            "pred_obj_vel": pred_obj_vel, # [bs, seq, 3] - 预测的物体速度
+            "pred_leaf_vel": pred_leaf_vel, # [bs, seq, n_leaf, 3] - 预测的叶子节点速度
         }
         
         return results 

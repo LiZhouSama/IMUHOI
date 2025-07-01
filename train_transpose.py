@@ -50,7 +50,6 @@ def main():
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练帧窗口大小: {cfg.train.window}")
     print(f"测试帧窗口大小: {cfg.test.window}")
-    print(f"训练窗口步长: {cfg.train.window_stride}")
     print(f"保存目录: {cfg.save_dir}")
     
     # 打印损失权重信息（如果有）
@@ -87,7 +86,6 @@ def main():
     train_dataset = IMUDataset(
         data_dir=train_path,
         window_size=cfg.train.window,
-        window_stride=cfg.train.window_stride,
         normalize=cfg.train.normalize,
         debug=cfg.debug
     )
@@ -117,7 +115,6 @@ def main():
         test_dataset = IMUDataset(
             data_dir=test_path,
             window_size=cfg.test.window,
-            window_stride=cfg.test.window_stride,
             normalize=cfg.test.normalize,
             debug=cfg.debug
         )
