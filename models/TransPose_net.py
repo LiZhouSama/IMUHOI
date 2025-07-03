@@ -77,7 +77,13 @@ class TransPoseNet(torch.nn.Module):
         self.joint_dim = cfg.joint_dim if hasattr(cfg, 'joint_dim') else 6  # 使用6D旋转表示
         self.num_joints = cfg.num_joints if hasattr(cfg, 'num_joints') else 22 # SMPLH有22个身体关节
         hidden_dim_multiplier = cfg.hidden_dim_multiplier if hasattr(cfg, 'hidden_dim_multiplier') else 1
-        self.device = cfg.device if hasattr(cfg, 'device') else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 设置设备，优先使用配置的device，或者根据GPU可用性决定
+        if hasattr(cfg, 'device'):
+            self.device = torch.device(cfg.device)
+        elif hasattr(cfg, 'gpus') and cfg.gpus:
+            self.device = torch.device(f"cuda:{cfg.gpus[0]}" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
         # 计算IMU输入维度
@@ -136,7 +142,7 @@ class TransPoseNet(torch.nn.Module):
         
                 # 姿态估计级联架构 (只使用人体IMU + 人体相关节点速度 + 手部接触概率)
         # S1输入: human_imu + 叶子节点速度（人体相关的速度）+ 手部接触概率(3)
-        self.pose_s1 = RNN(n_human_imu + joint_set.n_leaf * 3 + 3, joint_set.n_leaf * 3, 256 * hidden_dim_multiplier)
+        self.pose_s1 = RNN(n_human_imu + joint_set.n_leaf * 3, joint_set.n_leaf * 3, 256 * hidden_dim_multiplier)
         self.pose_s2 = RNN(joint_set.n_leaf * 3 + n_human_imu, joint_set.n_full * 3, 64 * hidden_dim_multiplier)
         self.pose_s3 = RNN(joint_set.n_full * 3 + n_human_imu, joint_set.n_reduced * 6, 128 * hidden_dim_multiplier)
 
@@ -173,18 +179,19 @@ class TransPoseNet(torch.nn.Module):
 
 
         # 3. SMPL Body Model for FK
-        self.body_model = BodyModel(bm_fname=cfg.bm_path, num_betas=16).to(cfg.device) # 假设cfg有device
+        self.body_model = BodyModel(bm_fname=cfg.bm_path, num_betas=16).to(self.device)
         for p in self.body_model.parameters(): # Freeze SMPL model parameters
             p.requires_grad = False
-        self.parents_tensor = self.body_model.kintree_table[0].long().to(cfg.device) # Store parents tensor
-        self.imu_joints_pos = torch.tensor(IMU_JOINTS_POS, device=cfg.device) # Store IMU joint indices
-        self.imu_joints_rot = torch.tensor(IMU_JOINTS_ROT, device=cfg.device) # Store IMU joint indices
+        # 使用 register_buffer 确保这些tensor在多GPU训练时能正确分发
+        self.register_buffer('parents_tensor', self.body_model.kintree_table[0].long())
+        self.register_buffer('imu_joints_pos', torch.tensor(IMU_JOINTS_POS, dtype=torch.long))
+        self.register_buffer('imu_joints_rot', torch.tensor(IMU_JOINTS_ROT, dtype=torch.long))
 
         # 4. 常量
-        # 确保 gravity_velocity 是一个 tensor 并移到正确的设备
-        self.gravity_velocity = torch.tensor([0.0, 0.0, -0.018], dtype=torch.float32).to(cfg.device)
+        # 使用 register_buffer 确保 gravity_velocity 在多GPU训练时能正确分发到各个设备
+        self.register_buffer('gravity_velocity', torch.tensor([0.0, 0.0, -0.018], dtype=torch.float32))
         self.vel_scale = cfg.vel_scale if hasattr(cfg, 'vel_scale') else 1.66 # 参考代码中的 vel_scale
-        self.prob_threshold_min = cfg.prob_threshold_min if hasattr(cfg, 'prob_threshold_min') else 0.1 # 参考代码使用了 (0.5, 0.9)，这里用更宽松的默认值
+        self.prob_threshold_min = cfg.prob_threshold_min if hasattr(cfg, 'prob_threshold_min') else 0.5 # 参考代码使用了 (0.5, 0.9)，这里用更宽松的默认值
         self.prob_threshold_max = cfg.prob_threshold_max if hasattr(cfg, 'prob_threshold_max') else 0.9
         self.floor_y = cfg.floor_y if hasattr(cfg, 'floor_y') else 0.0 # 地面高度
         
@@ -272,8 +279,8 @@ class TransPoseNet(torch.nn.Module):
         R_global_full[:, IMU_JOINTS_ROT] = R_imu # 填充全局旋转真值
 
         # 4. 使用 global2local 转换为局部旋转矩阵
-        # 确保 parents_tensor 在正确的设备上
-        local_rotmats = global2local(R_global_full, self.parents_tensor.to(device)) # [bs*seq, num_joints, 3, 3]
+        # parents_tensor 现在是buffer，会自动在正确的设备上
+        local_rotmats = global2local(R_global_full, self.parents_tensor) # [bs*seq, num_joints, 3, 3]
         local_rotmats[:,0] = R_imu[:, -1] # 填充全局髋部的旋转真值
         local_rotmats[:, [20, 21, 7, 8]] = torch.eye(3, device=device).repeat(bs_seq, 4, 1, 1)
 
@@ -421,7 +428,7 @@ class TransPoseNet(torch.nn.Module):
         # RNN 输入现在是 [bs, seq, n_human_imu + n_leaf*3 + 3]
 
         # 第一阶段：预测关键关节位置
-        s1_input = torch.cat([human_imu_data, pred_leaf_vel_flat, pred_hand_contact_prob], dim=2) # [bs, seq, n_human_imu + n_leaf*3 + 3]
+        s1_input = torch.cat([human_imu_data, pred_leaf_vel_flat], dim=2) # [bs, seq, n_human_imu + n_leaf*3 + 3]
         s1_output, _ = self.pose_s1(s1_input, s1_initial_state) # [bs, seq, joint_set.n_leaf * 3]
         pred_leaf_pos = s1_output.reshape(batch_size, seq_len, joint_set.n_leaf, 3) # <<< 添加
 
@@ -478,14 +485,14 @@ class TransPoseNet(torch.nn.Module):
         j_seq = j_flat.reshape(batch_size, seq_len, self.num_joints, 3)
         left_foot_pos = j_seq[:, :, self.left_foot_idx, :]
         right_foot_pos = j_seq[:, :, self.right_foot_idx, :]
-        # 计算位移：当前帧 - 上一帧 (注意符号，速度 = pos_prev - pos_curr / dt? 还是 pos_curr - pos_prev / dt?)
+        # 计算位移：当前帧 - 上一帧，然后转换为m/s单位
         # TransPose 原版计算的是 prev - curr, 表示速度是向前的
         prev_left_foot_pos = torch.roll(left_foot_pos, shifts=1, dims=1)
         prev_right_foot_pos = torch.roll(right_foot_pos, shifts=1, dims=1)
         prev_left_foot_pos[:, 0, :] = left_foot_pos[:, 0, :] # 第一帧速度为0
         prev_right_foot_pos[:, 0, :] = right_foot_pos[:, 0, :] # 第一帧速度为0
-        lfoot_vel = (prev_left_foot_pos - left_foot_pos) # * 60.0 ? 如果速度以 m/s 为单位
-        rfoot_vel = (prev_right_foot_pos - right_foot_pos) # * 60.0 ?
+        lfoot_vel = (prev_left_foot_pos - left_foot_pos) # m/frame
+        rfoot_vel = (prev_right_foot_pos - right_foot_pos) # m/frame
         lfoot_vel_flat = lfoot_vel.reshape(-1, 3) # [bs*seq, 3]
         rfoot_vel_flat = rfoot_vel.reshape(-1, 3) # [bs*seq, 3]
         
@@ -495,10 +502,9 @@ class TransPoseNet(torch.nn.Module):
 
         # 6. 计算速度分支 B2
         # velocity_b2_flat 是 RNN 输出，代表局部坐标系下的速度
-        # 需要转换到世界坐标系
-        tran_b2_vel = torch.bmm(root_orient_mat_flat, velocity_b2_flat.unsqueeze(-1)).squeeze(-1) # [bs*seq, 3]
-        # tran_b2_vel = tran_b2_vel * self.vel_scale / 60.0 
-        tran_b2_vel = tran_b2_vel * self.vel_scale  # 可能和监督方式有关，上面/60是Transpose Style
+        # 需要转换到世界坐标系并转换为m/frame单位(因为监督值是m/s)
+        velocity_b2_flat = torch.bmm(root_orient_mat_flat, velocity_b2_flat.unsqueeze(-1)).squeeze(-1) # [bs*seq, 3]
+        tran_b2_vel = velocity_b2_flat * self.vel_scale / FRAME_RATE  # 转换为m/frame单位
 
         # 7. 融合速度分支
         max_contact_prob = contact_probability_flat.max(dim=1).values # [bs*seq]
@@ -509,10 +515,8 @@ class TransPoseNet(torch.nn.Module):
 
         # 9. 计算最终平移 (通过累积速度)
         velocity = velocity_flat.reshape(batch_size, seq_len, 3) # [bs, seq, 3]
-        # 假设 velocity 是 m/frame, 直接累积得到相对位移
+        # velocity 是 m/frame, 直接累积得到相对位移
         trans = torch.cumsum(velocity, dim=1) # [bs, seq, 3]
-        # 如果需要绝对位置，需要加上初始位置 data_dict['root_pos'][:, 0]
-        # trans = trans + data_dict['root_pos'][:, 0:1, :] # Add initial root position
 
         # --- 物体平移预测 (使用SMPL全局关节位置) ---
         # 现在我们有了完整的人体平移和姿态，可以通过SMPL前向运动学得到准确的全局关节位置
@@ -572,16 +576,18 @@ class TransPoseNet(torch.nn.Module):
         # --- 重塑回结果格式 ---
         # 返回预测结果，保持原有的键名并添加手部位置信息
         results = {
-            "motion": pred_motion,         # [bs, seq, num_joints*6] - 原始预测姿态
-            "root_pos": trans,       # [bs, seq, 3] - 人体平移
+            "pred_leaf_vel": pred_leaf_vel, # [bs, seq, n_leaf, 3] - 预测的叶子节点速度 (m/s)
+            "pred_obj_vel": pred_obj_vel, # [bs, seq, 3] - 预测的物体速度 (m/s)
+            "pred_hand_contact_prob": pred_hand_contact_prob, # [bs, seq, 3]
             "pred_leaf_pos": pred_leaf_pos, # [bs, seq, n_leaf, 3]
             "pred_full_pos": pred_full_pos, # [bs, seq, n_full, 3]
-            "root_vel": velocity,     # [bs, seq, 3] - 根关节速度
-            "pred_hand_contact_prob": pred_hand_contact_prob, # [bs, seq, 3]
-            "pred_obj_trans": pred_obj_trans, # [bs, seq, 3] - 物体位置（相对于初始位置的位移）
+            "motion": pred_motion,         # [bs, seq, num_joints*6] - 原始预测姿态
+            "tran_b2_vel": velocity_b2_flat.reshape(batch_size, seq_len, 3),     # [bs, seq, 3] - Trans-B2速度 (m/s)
+            "contact_probability": contact_probability, # [bs, seq, 2] - 足部接触概率
+            "root_vel": velocity * FRAME_RATE,     # [bs, seq, 3] - 根关节速度(m/s)
+            "root_pos": trans,       # [bs, seq, 3] - 人体平移
             "pred_hand_pos": hand_positions, # [bs, seq, 2, 3] - 手部位置（用于loss计算）
-            "pred_obj_vel": pred_obj_vel, # [bs, seq, 3] - 预测的物体速度
-            "pred_leaf_vel": pred_leaf_vel, # [bs, seq, n_leaf, 3] - 预测的叶子节点速度
+            "pred_obj_trans": pred_obj_trans, # [bs, seq, 3] - 物体位置（相对于初始位置的位移）
         }
         
         return results 

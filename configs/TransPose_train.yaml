@@ -4,23 +4,26 @@
 model_name: "TransPose_IMU"
 tensorboard_project_name: "imu_transpose"  # TensorBoard项目名称
 model_type: "TransPose"  # 模型类型：使用TransPose
-device: "cuda:0"  # 使用的GPU编号
-gpus: [0]  # 使用的GPU编号
+device: "cuda:0"  # 主GPU设备
+gpus: [0]  # 使用的GPU编号列表，支持多卡训练
+           # 单卡训练: [0] 
+           # 双卡训练: [0, 1]
 save_dir: "outputs/TransPose"  # 模型保存路径
 use_tensorboard: True  # 是否使用tensorboard记录训练过程
+use_multi_gpu: True  # 是否启用多GPU训练（当gpus列表长度>1时自动启用）
 # pretrained_checkpoint: "checkpoints/TransPose/epoch_50_best.pt"  # 预训练模型路径，如果需要从现有模型继续训练，取消注释并设置路径
 bm_path: body_models/smplh/male/model.npz
 use_transpose_model: True
 
 # 训练超参数
 epoch: 300  # 训练轮数
-batch_size: 50  # 批大小
-lr: 0.0004  # 学习率
+batch_size: 50  # 批大小（多GPU时会自动分配到各GPU）
+lr: 0.0004  # 学习率（多GPU时会自动按GPU数量线性缩放）
 weight_decay: 0.00005  # 权重衰减
 milestones: [150,250,350,450]  # 学习率调整节点
 gamma: 0.1  # 学习率衰减系数
 seed: 42  # 随机种子
-num_workers: 12  # 数据加载线程数
+num_workers: 12  # 数据加载线程数（多GPU时建议增加）
 hidden_dim_multiplier: 1  # 隐藏层维度乘数
 
 # 特征维度配置
@@ -60,24 +63,26 @@ loss_weights:
   leaf_pos: 1.0  # 叶子节点位置损失权重
   full_pos: 1.0  # 全身关节位置损失权重
   root_vel: 10  # 根关节速度损失权重
-  hand_contact: 0.1  # 手部接触损失权重
+  tran_b2: 0.001  # 根关节速度损失权重
+  hand_contact: 1  # 手部接触损失权重
   contact_aware: 1.0  # 接触感知损失权重
-  obj_vel: 10  # 物体速度损失权重
-  leaf_vel: 10  # 叶子节点速度损失权重
+  obj_vel: 1  # 物体速度损失权重
+  leaf_vel: 1  # 叶子节点速度损失权重
+  foot_contact: 1  # 足部接触损失权重
 # 训练窗口配置
 train:
   window: 120  # 训练时使用的时间窗口长度
   # window_stride: 60  # 训练时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0612/train"  # 训练数据路径
-  debug_data_path: "processed_data_0612/debug"  # 调试数据路径
+  data_path: "processed_data_0701/train"  # 训练数据路径
+  debug_data_path: "processed_data_0701/debug"  # 调试数据路径
 
 # 测试窗口配置
 test:
   window: 120  # 测试时使用的时间窗口长度
   # window_stride: 120  # 测试时窗口步长
   normalize: True  # 是否归一化数据
-  data_path: "processed_data_0612/test"  # 测试数据路径
+  data_path: "processed_data_0701/test"  # 测试数据路径
 
 # 数据增强配置
 augmentation:

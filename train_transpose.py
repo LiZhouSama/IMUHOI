@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.nn as nn
 import random
 from torch.utils.data import DataLoader
 from datetime import datetime
@@ -37,6 +38,37 @@ def main():
     # 从args中获取配置
     cfg = args  # 使用合并后的配置
     
+    # 设置GPU配置
+    if torch.cuda.is_available():
+        # 检查可用的GPU数量
+        available_gpus = torch.cuda.device_count()
+        print(f"可用GPU数量: {available_gpus}")
+        
+        # 验证配置的GPU是否可用
+        valid_gpus = [gpu for gpu in cfg.gpus if gpu < available_gpus]
+        if len(valid_gpus) != len(cfg.gpus):
+            print(f"警告: 配置的GPU {cfg.gpus} 中部分不可用，使用可用GPU: {valid_gpus}")
+            cfg.gpus = valid_gpus
+        
+        # 设置多GPU配置
+        cfg.use_multi_gpu = getattr(cfg, 'use_multi_gpu', True) and len(cfg.gpus) > 1
+        cfg.device = f"cuda:{cfg.gpus[0]}"  # 主GPU
+        
+        # 设置CUDA设备
+        torch.cuda.set_device(cfg.gpus[0])
+        
+        if cfg.use_multi_gpu:
+            print(f"启用多GPU训练: {cfg.gpus}")
+            # 多GPU训练时调整学习率
+            cfg.lr = cfg.lr * len(cfg.gpus)  # 线性缩放学习率
+            print(f"多GPU训练，学习率调整为: {cfg.lr}")
+        else:
+            print(f"使用单GPU训练: {cfg.gpus[0]}")
+    else:
+        print("CUDA不可用，使用CPU训练")
+        cfg.device = "cpu"
+        cfg.use_multi_gpu = False
+    
     # 设置保存目录
     time_stamp = datetime.now().strftime("%m%d%H%M")
     save_dir = os.path.join(cfg.save_dir, f"transpose_{time_stamp}")
@@ -47,20 +79,12 @@ def main():
     # 打印训练配置
     print("=" * 50)
     print(f"模型类型: TransPose")
+    print(f"GPU配置: {cfg.gpus} (多GPU: {cfg.use_multi_gpu})")
     print(f"批次大小: {cfg.batch_size}")
+    print(f"学习率: {cfg.lr}")
     print(f"训练帧窗口大小: {cfg.train.window}")
     print(f"测试帧窗口大小: {cfg.test.window}")
     print(f"保存目录: {cfg.save_dir}")
-    
-    # 打印损失权重信息（如果有）
-    if hasattr(cfg, 'loss_weights'):
-        print("\n损失权重配置:")
-        print(f"姿态损失权重: {cfg.loss_weights.rot}")
-        print(f"根节点位置损失权重: {cfg.loss_weights.root_pos}")
-        print(f"物体旋转损失权重: {cfg.loss_weights.obj_rot}")
-        print(f"叶子节点位置损失权重: {cfg.loss_weights.leaf_pos}")
-        print(f"全身关节位置损失权重: {cfg.loss_weights.full_pos}")
-        print(f"根关节速度损失权重: {cfg.loss_weights.root_vel}")
     print("=" * 50)
 
     # 设置数据集路径 - 使用绝对路径

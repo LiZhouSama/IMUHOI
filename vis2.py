@@ -180,7 +180,7 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
     return obj_mesh_verts, obj_mesh_faces
 
 
-def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True, vis_gt_only=False):
+def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False):
     """ 在 aitviewer 场景中可视化单个批次的数据 (真值和预测) """
     # --- Revised Clearing Logic (Attempt 5 - Using Scene.remove) ---
     try:
@@ -196,7 +196,11 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 node.name == "ObjContactIndicator" or # 物体运动指示器名称
                 node.name == "Pred-LHandContact" or # 预测左手接触
                 node.name == "Pred-RHandContact" or # 预测右手接触
-                node.name == "Pred-ObjContactIndicator") # 预测物体接触
+                node.name == "Pred-ObjContactIndicator" or # 预测物体接触
+                node.name == "GT-LFootContact" or  # 真值左脚接触
+                node.name == "GT-RFootContact" or  # 真值右脚接触
+                node.name == "Pred-LFootContact" or # 预测左脚接触
+                node.name == "Pred-RFootContact") # 预测右脚接触
         ]
 
         # Call viewer.scene.remove() for each identified node
@@ -329,6 +333,19 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     pred_obj_contact_labels_seq = pred_contact_labels[:, 2]
                 else:
                     print("Warning: Model did not output 'pred_hand_contact_prob'.")
+                
+                # --- Get predicted foot contact probabilities ---
+                pred_foot_contact_prob_batch = pred_dict.get("contact_probability") # [bs, T, 2]
+                pred_lfoot_contact_labels_seq = None
+                pred_rfoot_contact_labels_seq = None
+                if pred_foot_contact_prob_batch is not None:
+                    pred_foot_contact_prob_seq = pred_foot_contact_prob_batch[bs].to(device) # [T, 2]
+                    # Convert probabilities to 0/1 labels
+                    pred_foot_contact_labels = (pred_foot_contact_prob_seq > 0.5).bool()
+                    pred_lfoot_contact_labels_seq = pred_foot_contact_labels[:, 0]
+                    pred_rfoot_contact_labels_seq = pred_foot_contact_labels[:, 1]
+                else:
+                    print("Warning: Model did not output 'contact_probability' for foot contact.")
                 # --- End predicted contact probabilities ---
 
                 if pred_motion is not None:
@@ -483,6 +500,14 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         lhand_contact_seq = batch["lhand_contact"][bs] # [T]
         rhand_contact_seq = batch["rhand_contact"][bs] # [T]
         obj_contact_seq = batch["obj_contact"][bs] # [T]
+        
+        # --- 获取足部接触真值数据 ---
+        lfoot_contact_seq = batch.get("lfoot_contact", None)
+        rfoot_contact_seq = batch.get("rfoot_contact", None)
+        if lfoot_contact_seq is not None:
+            lfoot_contact_seq = lfoot_contact_seq[bs] # [T]
+        if rfoot_contact_seq is not None:
+            rfoot_contact_seq = rfoot_contact_seq[bs] # [T]
         # --- 获取 GT 关节点位置 ---
         Jtr_gt_seq = body_pose_gt.Jtr # [T, J, 3]
 
@@ -495,6 +520,10 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         # --- 定义手腕关节点索引 (请根据你的模型确认) ---
         lhand_idx = 20
         rhand_idx = 21
+        
+        # --- 定义足踝关节点索引 ---
+        lfoot_idx = 7  # 左脚踝
+        rfoot_idx = 8  # 右脚踝
 
         # --- 应用新的接触可视化逻辑 ---
         contact_radius = 0.03 # 可调整
@@ -644,12 +673,111 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             )
                             viewer.scene.add(pred_obj_contact_spheres)
             # --- 结束预测接触可视化 ---
+        
+        # --- 足部接触可视化 (只在启用时执行) ---
+        if show_foot_contact:
+            foot_contact_radius = 0.04  # 稍大一些的半径来区分手部接触
+            
+            # --- 可视化真值左脚接触 (紫色立方体) ---
+            if lfoot_contact_seq is not None:
+                gt_lfoot_contact_points_list = []
+                for t in range(T):
+                    if lfoot_contact_seq[t] > 0.5:  # 处理可能的浮点数标签
+                        gt_lfoot_contact_points_list.append(Jtr_gt_seq[t, lfoot_idx])
+                
+                if gt_lfoot_contact_points_list:
+                    gt_lfoot_contact_points = torch.stack(gt_lfoot_contact_points_list, dim=0)
+                    if gt_lfoot_contact_points.numel() > 0:
+                        gt_lfoot_points_yup_tensor = torch.matmul(gt_lfoot_contact_points, R_yup.T.to(device))
+                        gt_lfoot_points_yup_np = gt_lfoot_points_yup_tensor.cpu().numpy()
+                        gt_lfoot_spheres = Spheres(
+                            positions=gt_lfoot_points_yup_np,
+                            radius=foot_contact_radius,
+                            name="GT-LFootContact",
+                            color=(0.5, 0.0, 0.5, 0.8),  # 紫色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(gt_lfoot_spheres)
+            
+            # --- 可视化真值右脚接触 (橙色立方体) ---
+            if rfoot_contact_seq is not None:
+                gt_rfoot_contact_points_list = []
+                for t in range(T):
+                    if rfoot_contact_seq[t] > 0.5:  # 处理可能的浮点数标签
+                        gt_rfoot_contact_points_list.append(Jtr_gt_seq[t, rfoot_idx])
+                
+                if gt_rfoot_contact_points_list:
+                    gt_rfoot_contact_points = torch.stack(gt_rfoot_contact_points_list, dim=0)
+                    if gt_rfoot_contact_points.numel() > 0:
+                        gt_rfoot_points_yup_tensor = torch.matmul(gt_rfoot_contact_points, R_yup.T.to(device))
+                        gt_rfoot_points_yup_np = gt_rfoot_points_yup_tensor.cpu().numpy()
+                        gt_rfoot_spheres = Spheres(
+                            positions=gt_rfoot_points_yup_np,
+                            radius=foot_contact_radius,
+                            name="GT-RFootContact",
+                            color=(1.0, 0.5, 0.0, 0.8),  # 橙色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(gt_rfoot_spheres)
+            
+            # --- 可视化预测的足部接触 (只在非仅真值模式下) ---
+            if not vis_gt_only and Jtr_pred_seq is not None:
+                pred_foot_contact_radius = 0.035  # 稍小一些来区分真值和预测
+                
+                # 预测左脚接触
+                if pred_lfoot_contact_labels_seq is not None:
+                    pred_lfoot_contact_points_list = []
+                    for t in range(T):
+                        if pred_lfoot_contact_labels_seq[t]:
+                            point_on_pred_human = Jtr_pred_seq[t, lfoot_idx]
+                            pred_lfoot_contact_points_list.append(point_on_pred_human + pred_offset)
+                    
+                    if pred_lfoot_contact_points_list:
+                        pred_lfoot_contact_points = torch.stack(pred_lfoot_contact_points_list, dim=0)
+                        if pred_lfoot_contact_points.numel() > 0:
+                            pred_lfoot_points_yup_tensor = torch.matmul(pred_lfoot_contact_points, R_yup.T.to(device))
+                            pred_lfoot_points_yup_np = pred_lfoot_points_yup_tensor.cpu().numpy()
+                            pred_lfoot_spheres = Spheres(
+                                positions=pred_lfoot_points_yup_np,
+                                radius=pred_foot_contact_radius,
+                                name="Pred-LFootContact",
+                                color=(0.8, 0.3, 0.8, 0.8),  # 浅紫色
+                                gui_affine=False,
+                                is_selectable=False
+                            )
+                            viewer.scene.add(pred_lfoot_spheres)
+                
+                # 预测右脚接触
+                if pred_rfoot_contact_labels_seq is not None:
+                    pred_rfoot_contact_points_list = []
+                    for t in range(T):
+                        if pred_rfoot_contact_labels_seq[t]:
+                            point_on_pred_human = Jtr_pred_seq[t, rfoot_idx]
+                            pred_rfoot_contact_points_list.append(point_on_pred_human + pred_offset)
+                    
+                    if pred_rfoot_contact_points_list:
+                        pred_rfoot_contact_points = torch.stack(pred_rfoot_contact_points_list, dim=0)
+                        if pred_rfoot_contact_points.numel() > 0:
+                            pred_rfoot_points_yup_tensor = torch.matmul(pred_rfoot_contact_points, R_yup.T.to(device))
+                            pred_rfoot_points_yup_np = pred_rfoot_points_yup_tensor.cpu().numpy()
+                            pred_rfoot_spheres = Spheres(
+                                positions=pred_rfoot_points_yup_np,
+                                radius=pred_foot_contact_radius,
+                                name="Pred-RFootContact",
+                                color=(1.0, 0.7, 0.3, 0.8),  # 浅橙色
+                                gui_affine=False,
+                                is_selectable=False
+                            )
+                            viewer.scene.add(pred_rfoot_spheres)
+        # --- 结束足部接触可视化 ---
 
 
 # === 自定义 Viewer 类 ===
 
 class InteractiveViewer(Viewer):
-    def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, show_objects=True, vis_gt_only=False, **kwargs):
+    def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list # 直接使用加载到内存的列表
         self.current_index = 0
@@ -659,6 +787,7 @@ class InteractiveViewer(Viewer):
         self.device = device
         self.show_objects = show_objects
         self.vis_gt_only = vis_gt_only
+        self.show_foot_contact = show_foot_contact
         self.obj_geo_root = obj_geo_root
 
         # 设置初始相机位置 (可选)
@@ -677,7 +806,7 @@ class InteractiveViewer(Viewer):
             mode_str = " (仅真值)" if self.vis_gt_only else " (真值+预测)"
             print(f"Visualizing sequence index: {self.current_index}{mode_str}")
             try:
-                visualize_batch_data(self, batch, self.model, self.smpl_model, self.device, self.obj_geo_root, self.show_objects, self.vis_gt_only)
+                visualize_batch_data(self, batch, self.model, self.smpl_model, self.device, self.obj_geo_root, self.show_objects, self.vis_gt_only, self.show_foot_contact)
                 self.title = f"Sequence Index: {self.current_index}/{len(self.data_list)-1}{mode_str} (q/e:±1, Ctrl+q/e:±10, Alt+q/e:±50)"
             except Exception as e:
                  print(f"Error visualizing sequence {self.current_index}: {e}")
@@ -786,6 +915,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers.')
     parser.add_argument('--no_objects', action='store_true', help='Do not load or visualize objects.')
     parser.add_argument('--vis_gt_only', action='store_true', help='Only visualize ground truth, skip model inference and prediction visualization.')
+    parser.add_argument('--show_foot_contact', action='store_true', help='Visualize foot-ground contact indicators.')
     parser.add_argument('--limit_sequences', type=int, default=None, help='Limit the number of sequences to load for visualization.')
     args = parser.parse_args()
 
@@ -879,6 +1009,7 @@ def main():
         obj_geo_root=args.obj_geo_root,
         show_objects=(not args.no_objects),
         vis_gt_only=args.vis_gt_only,
+        show_foot_contact=args.show_foot_contact,
         window_size=(1920, 1080) # Example window size
         # Add other Viewer kwargs if needed (e.g., fps)
     )
@@ -886,6 +1017,12 @@ def main():
     print("  q/e: 前进/后退 1个序列")
     print("  Ctrl+q/e: 前进/后退 10个序列")
     print("  Alt+q/e: 前进/后退 50个序列")
+    if args.show_foot_contact:
+        print("Foot contact visualization enabled:")
+        print("  GT Left Foot: Purple spheres")
+        print("  GT Right Foot: Orange spheres")
+        print("  Pred Left Foot: Light Purple spheres")
+        print("  Pred Right Foot: Light Orange spheres")
     print("Other standard aitviewer controls should also work (e.g., mouse drag to rotate, scroll to zoom).")
     viewer_instance.run()
 

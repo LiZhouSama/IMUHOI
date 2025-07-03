@@ -327,12 +327,12 @@ class IMUDataset(Dataset):
                 root_imu_ori_start_inv = torch.inverse(root_imu_ori_start)
                 # norm_human_imu_acc = root_imu_ori_start_inv @ (human_imu_acc - root_imu_acc_start).unsqueeze(-1)
                 norm_human_imu_acc = root_imu_ori_start_inv @ human_imu_acc .unsqueeze(-1)
-                norm_human_imu_acc = norm_human_imu_acc.squeeze(-1)
+                norm_human_imu_acc = norm_human_imu_acc.squeeze(-1) / acc_scale
                 norm_human_imu_ori = root_imu_ori_start_inv @ human_imu_ori_flat
                 norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
                 # norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
                 norm_obj_acc = root_imu_ori_start_inv @ obj_imu_acc.unsqueeze(-1)
-                norm_obj_acc = norm_obj_acc.squeeze(-1)
+                norm_obj_acc = norm_obj_acc.squeeze(-1) / acc_scale
                 norm_obj_ori = root_imu_ori_start_inv @ obj_imu_ori
                 norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
 
@@ -375,14 +375,14 @@ class IMUDataset(Dataset):
             # --- 计算速度 ---
             # 1. 根关节速度
             if norm_root_pos.shape[0] > 1:
-                root_vel = (norm_root_pos[1:] - norm_root_pos[:-1])
+                root_vel = (norm_root_pos[1:] - norm_root_pos[:-1]) * FRAME_RATE  # 转换为米/秒
                 root_vel = torch.cat([torch.zeros_like(root_vel[:1]), root_vel], dim=0)
             else:
                 root_vel = torch.zeros_like(norm_root_pos)
             
             # 2. 物体速度
             if has_object and norm_obj_trans.shape[0] > 1:
-                obj_vel = (norm_obj_trans[1:] - norm_obj_trans[:-1])
+                obj_vel = (norm_obj_trans[1:] - norm_obj_trans[:-1]) * FRAME_RATE  # 转换为米/秒
                 obj_vel = torch.cat([torch.zeros_like(obj_vel[:1]), obj_vel], dim=0)
             else:
                 obj_vel = torch.zeros(norm_root_pos.shape[0], 3)
@@ -396,7 +396,7 @@ class IMUDataset(Dataset):
             
             # 计算叶子节点的全局速度（相邻帧差分）
             if leaf_positions_global.shape[0] > 1:
-                leaf_vel_global = leaf_positions_global[1:] - leaf_positions_global[:-1]  # [seq-1, n_leaf, 3]
+                leaf_vel_global = (leaf_positions_global[1:] - leaf_positions_global[:-1]) * FRAME_RATE  # 转换为米/秒
                 # 第一帧速度设为0
                 leaf_vel_global = torch.cat([torch.zeros_like(leaf_vel_global[:1]), leaf_vel_global], dim=0)  # [seq, n_leaf, 3]
             else:
@@ -429,6 +429,10 @@ class IMUDataset(Dataset):
                          bps_features = None # 失败时置空
 
             # 构建结果字典
+            # --- 加载足部接触标签 ---
+            lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(motion.shape[0], dtype=torch.float))[start_idx:end_idx]
+            rfoot_contact_window = seq_data.get("rfoot_contact", torch.zeros(motion.shape[0], dtype=torch.float))[start_idx:end_idx]
+            
             if has_object:
                 # --- 直接使用预处理计算好的接触标签 ---
                 lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
@@ -438,24 +442,23 @@ class IMUDataset(Dataset):
                 result = {
                     "root_pos": norm_root_pos.float(),
                     "motion": norm_motion.float(),  # [seq, 132]
-                    # "head_global_trans_start": seq_data["head_global_trans"][start_idx:start_idx+1].float(),  # [1, 4, 4]
                     "root_pos_start": root_global_pos_start.float(),  # [3]
                     "root_rot_start": root_global_rot_start.float(),  # [3, 3]
                     "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
-                    # "imu_global_positions": imu_global_positions.float(),  # [seq, num_imus, 3] - IMU关节全局位置
-                    # "imu_global_rotations": imu_global_rotations.float(),  # [seq, num_imus, 3, 3] - IMU关节全局旋转
                     "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
                     "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
                     "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
                     "obj_scale": obj_scale.float() , # [seq] (单独返回)
                     "obj_name": obj_name,
                     "has_object": has_object,
-                    "root_vel": root_vel.float(), # [seq, 3] - 单位: m/frame
-                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度
-                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度占位符
+                    "root_vel": root_vel.float(), # [seq, 3] - 单位: m/s
+                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度 (m/s)
+                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度 (m/s)
                     "lhand_contact": lhand_contact_window.bool(), # [seq]
                     "rhand_contact": rhand_contact_window.bool(), # [seq]
                     "obj_contact": obj_contact_window.bool(), # [seq]
+                    "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
+                    "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
                 }
             else:
                 result = {
@@ -468,9 +471,11 @@ class IMUDataset(Dataset):
                     "imu_global_positions": imu_global_positions.float(),  # [seq, num_imus, 3] - IMU关节全局位置
                     "imu_global_rotations": imu_global_rotations.float(),  # [seq, num_imus, 3, 3] - IMU关节全局旋转
                     "root_vel": root_vel.float(),
-                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度（无物体时为零）
-                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度占位符
+                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度（无物体时为零，m/s）
+                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度 (m/s)
                     "has_object": has_object, # Indicate no object
+                    "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
+                    "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
                 }
 
             if bps_features is not None:

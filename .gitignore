@@ -124,6 +124,8 @@ wandb/
 *.npy
 *.npz
 *.gz
+*.zip
+*.7z
 
 # 系统文件
 .DS_Store

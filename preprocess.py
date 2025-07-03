@@ -374,6 +374,52 @@ def apply_transformation_to_obj_geometry(obj_mesh_verts, obj_rot, obj_trans, sca
     return transformed_obj_verts
 
 
+def compute_foot_contact_labels(position_global_full_gt_world, foot_velocity_threshold=0.008):
+    """
+    计算左脚和右脚的地面接触标签
+    
+    参数:
+        position_global_full_gt_world: 全局关节位置 [T, 22, 3]
+        foot_velocity_threshold: 脚部速度阈值，低于此值认为与地面接触
+    
+    返回:
+        lfoot_contact: 左脚接触标签 [T]
+        rfoot_contact: 右脚接触标签 [T]
+    """
+    T = position_global_full_gt_world.shape[0]
+    device = position_global_full_gt_world.device
+    
+    # 提取左脚和右脚的全局位置（关节索引7和8）
+    lfoot_pos = position_global_full_gt_world[:, 7, :]  # [T, 3] 左脚踝
+    rfoot_pos = position_global_full_gt_world[:, 8, :]  # [T, 3] 右脚踝
+    
+    # 计算脚部速度（相邻帧差分）
+    if T > 1:
+        lfoot_vel = torch.zeros_like(lfoot_pos)
+        rfoot_vel = torch.zeros_like(rfoot_pos)
+        
+        # 计算速度：当前帧 - 前一帧
+        lfoot_vel[1:] = lfoot_pos[1:] - lfoot_pos[:-1]
+        rfoot_vel[1:] = rfoot_pos[1:] - rfoot_pos[:-1]
+        
+        # 计算速度的L2范数
+        lfoot_speed = torch.norm(lfoot_vel, dim=1)  # [T]
+        rfoot_speed = torch.norm(rfoot_vel, dim=1)  # [T]
+        
+        # 根据速度阈值判断接触（速度小于阈值则接触）
+        lfoot_contact = (lfoot_speed < foot_velocity_threshold).float()
+        rfoot_contact = (rfoot_speed < foot_velocity_threshold).float()
+        
+        # 第一帧默认接触地面
+        lfoot_contact[0] = 1.0
+        rfoot_contact[0] = 1.0
+    else:
+        # 只有一帧时，默认接触地面
+        lfoot_contact = torch.ones(T, device=device)
+        rfoot_contact = torch.ones(T, device=device)
+    
+    return lfoot_contact, rfoot_contact
+
 def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=None, bps_points=None, obj_mesh_dir=None):
     """处理单个序列并保存为pt文件"""
     
@@ -426,6 +472,11 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     
     # 获取全局关节位置
     position_global_full_gt_world = body_pose_world.Jtr[:, :22, :].cpu()
+    
+    # 计算足部接触标签
+    lfoot_contact, rfoot_contact = compute_foot_contact_labels(
+        position_global_full_gt_world.to(device)
+    )
     
     # 计算头部全局变换矩阵
     # position_head_world = position_global_full_gt_world[:, 15, :].to(device)
@@ -501,7 +552,9 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         # "head_global_trans": head_global_trans.cpu(),
         "rotation_local_full_gt_list": rotation_local_full_gt_list.cpu(),
         "position_global_full_gt_world": position_global_full_gt_world.float(),
-        "rotation_global": rotation_global_matrot_reshaped.cpu()
+        "rotation_global": rotation_global_matrot_reshaped.cpu(),
+        "lfoot_contact": lfoot_contact.cpu(),  # 左脚接触标签
+        "rfoot_contact": rfoot_contact.cpu()   # 右脚接触标签
     }
     
     # 添加物体数据(如果存在)
@@ -729,9 +782,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0612/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0701/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0612/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0701/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
