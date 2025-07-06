@@ -1,0 +1,2 @@
+- FR=30, acc_scale=30
+- 取消了trans-b2的loss

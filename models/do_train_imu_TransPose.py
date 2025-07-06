@@ -18,42 +18,42 @@ from models.ContactAwareLoss import ContactAwareLoss
 from torch.cuda.amp import autocast, GradScaler
 
 
-def compute_multi_scale_velocity_loss(pred_vel, gt_vel, frame_scales=[1, 3, 9, 27]):
-    """
-    计算Trans-B2的多尺度速度监督损失
-    
-    Args:
-        pred_vel: 预测的坐标系速度 [bs, seq, 3]
-        gt_vel: 真值的全局坐标系速度 [bs, seq, 3]
-        frame_scales: 监督的帧数尺度列表
-    
-    Returns:
-        total_loss: 总的多尺度速度损失
-    """
-    bs, seq, _ = pred_vel.shape
-    device = pred_vel.device
-
-    total_loss = 0.0
-    
-    for n in frame_scales:
-        # 计算每n帧的损失
-        frame_loss = 0.0
-        num_segments = seq // n
-        
-        for m in range(num_segments):
-            start_idx = m * n
-            end_idx = start_idx + n
-            
-            # 计算这个段内每一帧的L2损失
-            pred_segment = pred_vel[:, start_idx:end_idx, :]  # [bs, n, 3]
-            gt_segment = gt_vel[:, start_idx:end_idx, :]      # [bs, n, 3] - 修复：直接使用gt_vel
-            
-            segment_loss = torch.sum((pred_segment - gt_segment) ** 2)
-            frame_loss += segment_loss
-        
-        total_loss += frame_loss
-    
-    return total_loss
+# def compute_multi_scale_velocity_loss(pred_vel, gt_vel, frame_scales=[1, 3, 9, 27]):
+#     """
+#     计算Trans-B2的多尺度速度监督损失
+#     
+#     Args:
+#         pred_vel: 预测的坐标系速度 [bs, seq, 3]
+#         gt_vel: 真值的全局坐标系速度 [bs, seq, 3]
+#         frame_scales: 监督的帧数尺度列表
+#     
+#     Returns:
+#         total_loss: 总的多尺度速度损失
+#     """
+#     bs, seq, _ = pred_vel.shape
+#     device = pred_vel.device
+# 
+#     total_loss = 0.0
+#     
+#     for n in frame_scales:
+#         # 计算每n帧的损失
+#         frame_loss = 0.0
+#         num_segments = seq // n
+#         
+#         for m in range(num_segments):
+#             start_idx = m * n
+#             end_idx = start_idx + n
+#             
+#             # 计算这个段内每一帧的L2损失
+#             pred_segment = pred_vel[:, start_idx:end_idx, :]  # [bs, n, 3]
+#             gt_segment = gt_vel[:, start_idx:end_idx, :]      # [bs, n, 3] - 修复：直接使用gt_vel
+#             
+#             segment_loss = torch.sum((pred_segment - gt_segment) ** 2)
+#             frame_loss += segment_loss
+#         
+#         total_loss += frame_loss
+#     
+#     return total_loss
 
 
 def get_actual_model(model):
@@ -172,7 +172,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_loss_leaf_pos = 0
         train_loss_full_pos = 0
         train_loss_foot_contact = 0
-        train_loss_tran_b2 = 0
+        # train_loss_tran_b2 = 0
         train_loss_root_vel = 0
         train_loss_hand_contact = 0
         train_loss_obj_trans = 0
@@ -191,13 +191,26 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             
             # 处理可选的物体数据
             bs, seq = human_imu.shape[:2]
-            obj_imu = batch.get("obj_imu", None).to(device)
-            obj_rot = batch.get("obj_rot", None).to(device)
-            obj_trans = batch.get("obj_trans", None).to(device) # 新增：提取物体平移
+            obj_imu = batch.get("obj_imu", None)
+            obj_rot = batch.get("obj_rot", None)
+            obj_trans = batch.get("obj_trans", None) # 新增：提取物体平移
             
             # 获取速度真值
-            obj_vel = batch.get("obj_vel").to(device) # [bs, seq, 3]
-            leaf_vel = batch.get("leaf_vel").to(device) # [bs, seq, n_leaf, 3]
+            obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, 3]
+            leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, n_leaf, 3]
+            
+            if obj_imu is not None:
+                obj_imu = obj_imu.to(device)
+            else:
+                obj_imu = torch.zeros((bs, seq, 1, cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9), device=device, dtype=human_imu.dtype)
+            if obj_rot is not None:
+                obj_rot = obj_rot.to(device)
+            else:
+                obj_rot = torch.zeros((bs, seq, 6), device=device, dtype=motion.dtype)
+            if obj_trans is not None:
+                obj_trans = obj_trans.to(device)
+            else:
+                obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
             
             # --- 获取手部接触真值 ---
             lhand_contact_gt = batch.get("lhand_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device) # [bs, seq]
@@ -280,9 +293,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             loss_foot_contact = torch.nn.functional.binary_cross_entropy(foot_contact_prob, foot_contact_gt)
 
             # 7. Trans-B2多尺度速度损失
-            loss_tran_b2 = compute_multi_scale_velocity_loss(
-                pred_dict["tran_b2_vel"], root_vel
-            )
+            # loss_tran_b2 = compute_multi_scale_velocity_loss(
+            #     pred_dict["tran_b2_vel"], root_vel
+            # )
             
             # 8. 根关节速度损失 (L1)， 真值：全局根关节速度
             loss_root_vel = torch.nn.functional.l1_loss(pred_dict["root_vel"], root_vel)
@@ -314,7 +327,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             w_root_pos = cfg.loss_weights.root_pos if hasattr(cfg.loss_weights, 'root_pos') else 1
             w_leaf_pos = cfg.loss_weights.leaf_pos if hasattr(cfg.loss_weights, 'leaf_pos') else 1
             w_full_pos = cfg.loss_weights.full_pos if hasattr(cfg.loss_weights, 'full_pos') else 1
-            w_tran_b2 = cfg.loss_weights.tran_b2 if hasattr(cfg.loss_weights, 'tran_b2') else 1
+            # w_tran_b2 = cfg.loss_weights.tran_b2 if hasattr(cfg.loss_weights, 'tran_b2') else 1
             w_root_vel = cfg.loss_weights.root_vel if hasattr(cfg.loss_weights, 'root_vel') else 1
             w_hand_contact = cfg.loss_weights.hand_contact if hasattr(cfg.loss_weights, 'hand_contact') else 1
             w_obj_trans = cfg.loss_weights.obj_trans if hasattr(cfg.loss_weights, 'obj_trans') else 1
@@ -333,7 +346,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             weighted_loss_root_pos = w_root_pos * loss_root_pos
             weighted_loss_leaf_pos = w_leaf_pos * loss_leaf_pos
             weighted_loss_full_pos = w_full_pos * loss_full_pos
-            weighted_loss_tran_b2 = w_tran_b2 * loss_tran_b2
+            # weighted_loss_tran_b2 = w_tran_b2 * loss_tran_b2
             weighted_loss_root_vel = w_root_vel * loss_root_vel
             weighted_loss_hand_contact = w_hand_contact * loss_hand_contact
             weighted_loss_obj_trans = w_obj_trans * loss_obj_trans
@@ -346,7 +359,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     weighted_loss_root_pos + 
                     weighted_loss_leaf_pos + 
                     weighted_loss_full_pos + 
-                    weighted_loss_tran_b2 +
+                    # weighted_loss_tran_b2 +
                     weighted_loss_root_vel +
                     weighted_loss_hand_contact +
                     weighted_loss_obj_trans +
@@ -367,7 +380,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             train_loss_root_pos += weighted_loss_root_pos.item()
             train_loss_leaf_pos += weighted_loss_leaf_pos.item()
             train_loss_full_pos += weighted_loss_full_pos.item()
-            train_loss_tran_b2 += weighted_loss_tran_b2.item()
+            # train_loss_tran_b2 += weighted_loss_tran_b2.item()
             train_loss_root_vel += weighted_loss_root_vel.item()
             train_loss_hand_contact += weighted_loss_hand_contact.item()
             train_loss_obj_trans += weighted_loss_obj_trans.item()
@@ -381,7 +394,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 'loss': loss.item(),
                 'rot': weighted_loss_rot.item(), 
                 'root_pos': weighted_loss_root_pos.item(), 
-                'tran_b2': weighted_loss_tran_b2.item(),
+                # 'tran_b2': weighted_loss_tran_b2.item(),
                 'root_vel': weighted_loss_root_vel.item(),
                 'hand_contact': weighted_loss_hand_contact.item(),
                 'obj_trans': weighted_loss_obj_trans.item(),
@@ -403,7 +416,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 writer.add_scalar('train/loss_root_pos', weighted_loss_root_pos.item(), n_iter)
                 writer.add_scalar('train/loss_leaf_pos', weighted_loss_leaf_pos.item(), n_iter)
                 writer.add_scalar('train/loss_full_pos', weighted_loss_full_pos.item(), n_iter)
-                writer.add_scalar('train/loss_tran_b2', weighted_loss_tran_b2.item(), n_iter)
+                # writer.add_scalar('train/loss_tran_b2', weighted_loss_tran_b2.item(), n_iter)
                 writer.add_scalar('train/loss_root_vel', weighted_loss_root_vel.item(), n_iter)
                 writer.add_scalar('train/loss_hand_contact', weighted_loss_hand_contact.item(), n_iter)
                 writer.add_scalar('train/loss_obj_trans', weighted_loss_obj_trans.item(), n_iter)
@@ -416,7 +429,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 writer.add_scalar('train_raw/loss_root_pos_raw', loss_root_pos.item(), n_iter)
                 writer.add_scalar('train_raw/loss_leaf_pos_raw', loss_leaf_pos.item(), n_iter)
                 writer.add_scalar('train_raw/loss_full_pos_raw', loss_full_pos.item(), n_iter)
-                writer.add_scalar('train_raw/loss_tran_b2_raw', loss_tran_b2.item(), n_iter)
+                # writer.add_scalar('train_raw/loss_tran_b2_raw', loss_tran_b2.item(), n_iter)
                 writer.add_scalar('train_raw/loss_root_vel_raw', loss_root_vel.item(), n_iter)
                 writer.add_scalar('train_raw/loss_hand_contact_raw', loss_hand_contact.item(), n_iter)
                 writer.add_scalar('train_raw/loss_obj_trans_raw', loss_obj_trans.item(), n_iter)
@@ -444,7 +457,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_loss_root_pos /= len(train_loader)
         train_loss_leaf_pos /= len(train_loader)
         train_loss_full_pos /= len(train_loader)
-        train_loss_tran_b2 /= len(train_loader)
+        # train_loss_tran_b2 /= len(train_loader)
         train_loss_root_vel /= len(train_loader)
         train_loss_hand_contact /= len(train_loader)
         train_loss_obj_trans /= len(train_loader)
@@ -458,7 +471,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_losses['loss_root_pos'].append(train_loss_root_pos)
         train_losses['loss_leaf_pos'].append(train_loss_leaf_pos)
         train_losses['loss_full_pos'].append(train_loss_full_pos)
-        train_losses['loss_tran_b2'].append(train_loss_tran_b2)
+        # train_losses['loss_tran_b2'].append(train_loss_tran_b2)
         train_losses['loss_root_vel'].append(train_loss_root_vel)
         train_losses['loss_hand_contact'].append(train_loss_hand_contact)
         train_losses['loss_obj_trans'].append(train_loss_obj_trans)
@@ -473,7 +486,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                    f'Root Pos Loss: {train_loss_root_pos:.6f}, '
                    f'Leaf Pos Loss: {train_loss_leaf_pos:.6f}, '
                    f'Full Pos Loss: {train_loss_full_pos:.6f}, '
-                   f'Trans-B2 Loss: {train_loss_tran_b2:.6f}, '
+                   # f'Trans-B2 Loss: {train_loss_tran_b2:.6f}, '
                    f'Root Vel Loss: {train_loss_root_vel:.6f}, '
                    f'Hand Contact Loss: {train_loss_hand_contact:.6f}, '
                    f'Obj Trans Loss: {train_loss_obj_trans:.6f}, '
@@ -515,13 +528,20 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     root_vel = batch["root_vel"].to(device)
                     
                     bs, seq = human_imu.shape[:2]
-                    obj_imu = batch.get("obj_imu", None).to(device)
-                    obj_rot = batch.get("obj_rot", None).to(device)
-                    obj_trans = batch.get("obj_trans", None).to(device) # 新增
+                    obj_imu = batch.get("obj_imu", None)
+                    obj_rot = batch.get("obj_rot", None)
+                    obj_trans = batch.get("obj_trans", None) # 新增
+
+                    if obj_imu is not None: obj_imu = obj_imu.to(device)
+                    else: obj_imu = torch.zeros((bs, seq, 1, cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9), device=device, dtype=human_imu.dtype)
+                    if obj_rot is not None: obj_rot = obj_rot.to(device)
+                    else: obj_rot = torch.zeros((bs, seq, 6), device=device, dtype=motion.dtype)
+                    if obj_trans is not None: obj_trans = obj_trans.to(device)
+                    else: obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
 
                     # 获取速度真值（测试）
-                    obj_vel_eval = batch.get("obj_vel").to(device) # [bs, seq, 3]
-                    leaf_vel_eval = batch.get("leaf_vel").to(device) # [bs, seq, n_leaf, 3]
+                    obj_vel_eval = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, 3]
+                    leaf_vel_eval = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device) # [bs, seq, n_leaf, 3]
                     
                     # --- 获取手部接触真值 (评估) ---
                     lhand_contact_gt_eval = batch.get("lhand_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device)
@@ -546,7 +566,6 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         "obj_trans": obj_trans          # 新增
                     }
                     
-
                     # TransPose直接输出预测结果
                     pred_dict = model(data_dict_eval)
                     
@@ -588,10 +607,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     weights_full_eval[:, :, [19, 20], :] = 4.0
                     loss_full_pos = (l1_diff_full_eval * weights_full_eval).mean()
                     
-                    # 5. Trans-B2多尺度速度损失(m/s)
-                    loss_tran_b2 = compute_multi_scale_velocity_loss(
-                        pred_dict["tran_b2_vel"], root_vel
-                    )
+                    # # 5. Trans-B2多尺度速度损失(m/s)
+                    # loss_tran_b2 = compute_multi_scale_velocity_loss(
+                    #     pred_dict["tran_b2_vel"], root_vel
+                    # )
                     
                     # 7. 根关节速度损失 (L1)， 真值：全局根关节速度
                     loss_root_vel = torch.nn.functional.l1_loss(pred_dict["root_vel"], root_vel)
@@ -660,7 +679,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     weighted_loss_root_pos_eval = w_root_pos * loss_root_pos
                     weighted_loss_leaf_pos_eval = w_leaf_pos * loss_leaf_pos
                     weighted_loss_full_pos_eval = w_full_pos * loss_full_pos
-                    weighted_loss_tran_b2_eval = w_tran_b2 * loss_tran_b2
+                    # weighted_loss_tran_b2_eval = w_tran_b2 * loss_tran_b2
                     weighted_loss_root_vel_eval = w_root_vel * loss_root_vel
                     weighted_loss_hand_contact_eval = w_hand_contact * loss_hand_contact
                     weighted_loss_obj_trans_eval = w_obj_trans * loss_obj_trans
@@ -673,7 +692,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                                    weighted_loss_root_pos_eval + 
                                    weighted_loss_leaf_pos_eval + 
                                    weighted_loss_full_pos_eval + 
-                                   weighted_loss_tran_b2_eval +
+                                   # weighted_loss_tran_b2_eval +
                                    weighted_loss_root_vel_eval +
                                    weighted_loss_hand_contact_eval +
                                    weighted_loss_obj_trans_eval +
@@ -706,7 +725,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                     test_loss_root_pos += weighted_loss_root_pos_eval.item()
                     test_loss_leaf_pos += weighted_loss_leaf_pos_eval.item()
                     test_loss_full_pos += weighted_loss_full_pos_eval.item()
-                    test_loss_tran_b2 += weighted_loss_tran_b2_eval.item()
+                    # test_loss_tran_b2 += weighted_loss_tran_b2_eval.item()
                     test_loss_root_vel += weighted_loss_root_vel_eval.item()
                     test_loss_hand_contact += weighted_loss_hand_contact_eval.item()
                     test_loss_obj_trans += weighted_loss_obj_trans_eval.item()
@@ -722,7 +741,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                         'loss_root_pos': weighted_loss_root_pos_eval.item(),
                         'loss_leaf_pos': weighted_loss_leaf_pos_eval.item(),
                         'loss_full_pos': weighted_loss_full_pos_eval.item(),
-                        'loss_tran_b2': weighted_loss_tran_b2_eval.item(),
+                        # 'loss_tran_b2': weighted_loss_tran_b2_eval.item(),
                         'loss_root_vel': weighted_loss_root_vel_eval.item(),
                         'hand_contact': weighted_loss_hand_contact_eval.item(),
                         'obj_trans': weighted_loss_obj_trans_eval.item(),
@@ -743,7 +762,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             test_loss_root_pos /= len(test_loader)
             test_loss_leaf_pos /= len(test_loader)
             test_loss_full_pos /= len(test_loader)
-            test_loss_tran_b2 /= len(test_loader)
+            # test_loss_tran_b2 /= len(test_loader)
             test_loss_root_vel /= len(test_loader)
             test_loss_hand_contact /= len(test_loader)
             test_loss_obj_trans /= len(test_loader)
@@ -757,7 +776,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             test_losses['loss_root_pos'].append(test_loss_root_pos)
             test_losses['loss_leaf_pos'].append(test_loss_leaf_pos)
             test_losses['loss_full_pos'].append(test_loss_full_pos)
-            test_losses['loss_tran_b2'].append(test_loss_tran_b2)
+            # test_losses['loss_tran_b2'].append(test_loss_tran_b2)
             test_losses['loss_root_vel'].append(test_loss_root_vel)
             test_losses['loss_hand_contact'].append(test_loss_hand_contact)
             test_losses['loss_obj_trans'].append(test_loss_obj_trans)
@@ -772,7 +791,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                             f'Root Pos Loss: {test_loss_root_pos:.6f}, '
                             f'Leaf Pos Loss: {test_loss_leaf_pos:.6f}, '
                             f'Full Pos Loss: {test_loss_full_pos:.6f}, '
-                            f'Trans-B2 Loss: {test_loss_tran_b2:.6f}, '
+                            # f'Trans-B2 Loss: {test_loss_tran_b2:.6f}, '
                             f'Root Vel Loss: {test_loss_root_vel:.6f}, '
                             f'Hand Contact Loss: {test_loss_hand_contact:.6f}, '
                             f'Obj Trans Loss: {test_loss_obj_trans:.6f}, '
@@ -792,7 +811,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 writer.add_scalar('test/loss_root_pos', test_loss_root_pos, n_iter)
                 writer.add_scalar('test/loss_leaf_pos', test_loss_leaf_pos, n_iter)
                 writer.add_scalar('test/loss_full_pos', test_loss_full_pos, n_iter)
-                writer.add_scalar('test/loss_tran_b2', test_loss_tran_b2, n_iter)
+                # writer.add_scalar('test/loss_tran_b2', test_loss_tran_b2, n_iter)
                 writer.add_scalar('test/loss_root_vel', test_loss_root_vel, n_iter)
                 writer.add_scalar('test/loss_hand_contact', test_loss_hand_contact, n_iter)
                 writer.add_scalar('test/loss_obj_trans', test_loss_obj_trans, n_iter)

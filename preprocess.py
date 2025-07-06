@@ -373,7 +373,6 @@ def apply_transformation_to_obj_geometry(obj_mesh_verts, obj_rot, obj_trans, sca
 
     return transformed_obj_verts
 
-
 def compute_foot_contact_labels(position_global_full_gt_world, foot_velocity_threshold=0.008):
     """
     计算左脚和右脚的地面接触标签
@@ -577,14 +576,38 @@ def preprocess_amass(args):
     
     # 加载SMPL模型
     bm_fname_male = os.path.join(args.support_dir, f"smplh/male/model.npz")
+    num_betas = 16
     body_model = BodyModel(
         bm_fname=bm_fname_male,
-        num_betas=16,
+        num_betas=num_betas,
+        model_type='smplh'
     ).to(device)
     
-    # 创建保存目录
-    amass_dir = args.save_dir_train
-    os.makedirs(amass_dir, exist_ok=True)
+    # 创建AMASS独立的保存目录
+    # 将普通处理目录转换为AMASS处理目录
+    if "processed_data" in args.save_dir_train:
+        # 替换 processed_data 为 processed_amass_data
+        amass_base_dir = args.save_dir_train.replace("processed_data", "processed_amass_data").replace("/train", "")
+    else:
+        # 如果目录名不包含 processed_data，则在目录前添加 amass_ 前缀
+        dir_parts = args.save_dir_train.split('/')
+        if dir_parts[-1] == "train":
+            dir_parts = dir_parts[:-1]  # 移除train部分
+        dir_parts[-1] = f"amass_{dir_parts[-1]}"
+        amass_base_dir = '/'.join(dir_parts)
+    
+    # 创建训练集、测试集和debug目录
+    amass_train_dir = os.path.join(amass_base_dir, "train")
+    amass_test_dir = os.path.join(amass_base_dir, "test") 
+    amass_debug_dir = os.path.join(amass_base_dir, "debug")
+    
+    os.makedirs(amass_train_dir, exist_ok=True)
+    os.makedirs(amass_test_dir, exist_ok=True)
+    os.makedirs(amass_debug_dir, exist_ok=True)
+    
+    print(f"AMASS训练数据将保存到: {amass_train_dir}")
+    print(f"AMASS测试数据将保存到: {amass_test_dir}")
+    print(f"AMASS调试数据将保存到: {amass_debug_dir}")
     
     # 定义AMASS数据集路径
     amass_dirs = []
@@ -597,7 +620,10 @@ def preprocess_amass(args):
     
     # 创建单独的聚合数据文件
     sequence_index = 0
-    amass_summary = {'datasets': [], 'total_sequences': 0, 'total_frames': 0}
+    train_count = 0
+    test_count = 0
+    train_test_split_ratio = 0.9  # 90%训练，10%测试
+    amass_summary = {'datasets': [], 'total_sequences': 0, 'total_frames': 0, 'train_sequences': 0, 'test_sequences': 0}
     
     # 遍历所有数据集目录
     for ds_name in amass_dirs:
@@ -631,7 +657,6 @@ def preprocess_amass(args):
                 # 获取姿势、平移和体形参数
                 poses_data = cdata['poses'][::step].astype(np.float32)
                 trans_data = cdata['trans'][::step].astype(np.float32)
-                betas_data = cdata['betas'][:10].astype(np.float32)
                 
                 # 检查序列长度
                 seq_len = poses_data.shape[0]
@@ -639,75 +664,54 @@ def preprocess_amass(args):
                     print(f"\t丢弃太短的序列: {npz_fname}，长度为 {seq_len}")
                     continue
                 
-                # 转换为PyTorch张量
-                pose = torch.tensor(poses_data, device=device).view(-1, 52, 3)
-                tran = torch.tensor(trans_data, device=device)
-                shape = torch.tensor(betas_data, device=device).unsqueeze(0)  # 添加批次维度
+                # 构建序列数据字典，适配 process_sequence 的格式
+                seq_name = f"amass_{ds_name}_{sequence_index}"
                 
-                # 只使用身体的22个关节，不包括手指
-                pose = pose[:, :22].clone()  # 只使用躯干
+                # 将poses_data分解为root_orient和pose_body
+                root_orient = poses_data[:, :3]  # 根关节方向
+                pose_body = poses_data[:, 3:66]  # 身体姿态 (前21个关节，每个3维)
                 
-                # # 对齐AMASS全局坐标系
-                # amass_rot = torch.tensor([[[1, 0, 0], [0, 0, 1], [0, -1, 0.]]], device=device)
-                # tran = torch.matmul(amass_rot, tran.unsqueeze(-1)).squeeze(-1)
-                
-                # # 对根关节方向进行转换
-                # root_orient = pose[:, 0]
-                # root_rotmat = transforms.axis_angle_to_matrix(root_orient)
-                # aligned_root_rotmat = torch.matmul(amass_rot, root_rotmat)
-                # pose[:, 0] = transforms.matrix_to_axis_angle(aligned_root_rotmat)
-                
-                # 将轴角转换为旋转矩阵
-                pose_rotmat = transforms.axis_angle_to_matrix(pose.reshape(-1, 3)).reshape(seq_len, 22, 3, 3)
-                
-                # 通过body model计算全局关节位置和旋转
-                body_output = body_model(
-                    pose_body=pose[:, 1:22].reshape(-1, 63),  # 身体姿态
-                    root_orient=pose[:, 0],                  # 根关节方向
-                    trans=tran                               # 平移
-                )
-                
-                # 获取关节位置和全局旋转
-                joints = body_output.Jtr[:, :22, :]  # 关节位置
-                
-                # 计算全局旋转矩阵
-                kintree_table = body_model.kintree_table[0].long()[:22]
-                global_rotmat = local2global_pose(
-                    pose_rotmat.reshape(seq_len, -1, 9),  # 重塑为 [seq_len, joints, 9]
-                    kintree_table
-                ).reshape(seq_len, 22, 3, 3)
-                
-
-                # 计算头部全局变换矩阵
-                position_head_world = joints[:, 15, :].to(device)
-                head_global_trans = torch.eye(4, device=device).repeat(position_head_world.shape[0], 1, 1)
-                head_global_trans[:, :3, :3] = global_rotmat[:, 15, :, :].squeeze()
-                head_global_trans[:, :3, 3] = position_head_world
-                
-                # 创建和保存单个序列数据
                 seq_data = {
-                    "seq_name": f"amass_{ds_name}_{sequence_index}",
-                    "rotation_local_full_gt_list": transforms.matrix_to_rotation_6d(pose_rotmat.cpu()).reshape(seq_len, -1),
-                    "position_global_full_gt_world": joints.cpu(),  # 使用实际计算的关节位置
-                    "head_global_trans": head_global_trans.cpu(),
-                    # "imu_global_full_gt": {
-                    #     "accelerations": imu_data['accelerations'],
-                    #     "orientations": imu_data['orientations']
-                    # },
-                    "gender": "neutral",
-                    "rotation_global": global_rotmat.cpu()
+                    'seq_name': seq_name,
+                    'root_orient': root_orient,
+                    'pose_body': pose_body,
+                    'trans': trans_data,
+                    'gender': 'neutral'
                 }
                 
-                # 保存这个序列
-                seq_file = os.path.join(amass_dir, f"seq_{sequence_index}.pt")
-                torch.save(seq_data, seq_file)
+                # 决定分配到训练集还是测试集
+                # 使用简单的取模方式：每10个序列中前9个分配给训练集，最后1个分配给测试集
+                is_train = (sequence_index % 10) < (train_test_split_ratio * 10)
+                target_dir = amass_train_dir if is_train else amass_test_dir
+                seq_prefix = "train" if is_train else "test"
                 
-                # 更新统计信息
-                sequence_index += 1
-                ds_summary['sequences'] += 1
-                ds_summary['frames'] += seq_len
-                amass_summary['total_sequences'] += 1
-                amass_summary['total_frames'] += seq_len
+                # 使用 process_sequence 函数处理序列
+                # 注意：不传递物体相关参数
+                success = process_sequence(
+                    seq_data=seq_data, 
+                    seq_key=f"{seq_prefix}_{sequence_index}", 
+                    save_dir=target_dir, 
+                    bm=body_model, 
+                    device=device,
+                    bps_dir=None,  # AMASS不使用BPS
+                    bps_points=None,  # AMASS不使用BPS
+                    obj_mesh_dir=None  # AMASS不包含物体
+                )
+                
+                if success:
+                    # 更新统计信息
+                    sequence_index += 1
+                    ds_summary['sequences'] += 1
+                    ds_summary['frames'] += seq_len
+                    amass_summary['total_sequences'] += 1
+                    amass_summary['total_frames'] += seq_len
+                    
+                    if is_train:
+                        train_count += 1
+                        amass_summary['train_sequences'] += 1
+                    else:
+                        test_count += 1
+                        amass_summary['test_sequences'] += 1
                 
             except Exception as e:
                 print(f"处理文件时出错 {npz_fname}: {e}")
@@ -719,13 +723,41 @@ def preprocess_amass(args):
         print(f"完成处理数据集 {ds_name}: {ds_summary['sequences']} 个序列, {ds_summary['frames']} 帧")
     
     print(f"AMASS数据处理完成，共处理了 {amass_summary['total_sequences']} 个序列")
-    print(f"预处理后的AMASS数据集保存在 {amass_dir}")
+    print(f"  训练集: {amass_summary['train_sequences']} 个序列")
+    print(f"  测试集: {amass_summary['test_sequences']} 个序列")
+    print(f"预处理后的AMASS数据集保存在:")
+    print(f"  训练集: {amass_train_dir}")
+    print(f"  测试集: {amass_test_dir}")
+    
+    # 从训练集中提取前10个文件到debug目录
+    print("\n开始创建debug数据集...")
+    import shutil
+    
+    train_files = [f for f in os.listdir(amass_train_dir) if f.endswith('.pt')]
+    train_files.sort()  # 按文件名排序
+    
+    debug_count = min(10, len(train_files))  # 最多10个文件
+    for i in range(debug_count):
+        src_file = os.path.join(amass_train_dir, train_files[i])
+        dst_file = os.path.join(amass_debug_dir, train_files[i])
+        shutil.copy2(src_file, dst_file)
+        print(f"  复制调试文件: {train_files[i]}")
+    
+    print(f"调试数据集创建完成，共 {debug_count} 个文件保存在: {amass_debug_dir}")
 
 def main(args):
     # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
+    # 处理AMASS数据集
+    if args.process_amass:
+        print("开始处理AMASS数据集...")
+        preprocess_amass(args)
+        print("AMASS数据集处理完成!")
+        return
+    
+    # 处理常规数据集（带有物体交互的数据）
     # 设置SMPL模型
     print("加载SMPL模型...")
     bm_fname_male = os.path.join(args.support_dir, f"smplh/male/model.npz")
@@ -748,32 +780,29 @@ def main(args):
     # print("准备BPS基础点云...")
     # bps_points = prep_bps_data(n_bps_points=args.n_bps_points, radius=args.bps_radius, device=device)
 
-    # 处理AMASS数据集
-    if args.process_amass:
-        preprocess_amass(args)
-    
     # 加载数据集
-    else:
-        print(f"正在加载数据集：{args.data_path_train}")
-        data_dict_train = joblib.load(args.data_path_train)
-        print(f"数据集加载完成，共有{len(data_dict_train)}个序列")
-        
-        print(f"正在加载数据集：{args.data_path_test}")
-        data_dict_test = joblib.load(args.data_path_test)
-        print(f"数据集加载完成，共有{len(data_dict_test)}个序列")
-        
-        # 处理所有序列
-        print("开始处理序列...")
-        
-        for seq_key in tqdm(data_dict_train, desc="处理序列"):
-            process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
-        
-        print(f"所有序列处理完成，结果保存在：{args.save_dir_train}")
+    print(f"正在加载训练数据集：{args.data_path_train}")
+    data_dict_train = joblib.load(args.data_path_train)
+    print(f"训练数据集加载完成，共有{len(data_dict_train)}个序列")
+    
+    print(f"正在加载测试数据集：{args.data_path_test}")
+    data_dict_test = joblib.load(args.data_path_test)
+    print(f"测试数据集加载完成，共有{len(data_dict_test)}个序列")
+    
+    # 处理所有序列
+    print("开始处理训练序列...")
+    
+    for seq_key in tqdm(data_dict_train, desc="处理训练序列"):
+        process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+    
+    print(f"训练序列处理完成，结果保存在：{args.save_dir_train}")
 
-        for seq_key in tqdm(data_dict_test, desc="处理序列"):
-            process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
-        
-        print(f"所有序列处理完成，结果保存在：{args.save_dir_test}")
+    print("开始处理测试序列...")
+    for seq_key in tqdm(data_dict_test, desc="处理测试序列"):
+        process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+    
+    print(f"测试序列处理完成，结果保存在：{args.save_dir_test}")
+    print("所有数据处理完成!")
 
 
 if __name__ == "__main__":
@@ -782,9 +811,9 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0701/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_0703/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0701/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_0703/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")

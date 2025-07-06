@@ -112,21 +112,36 @@ class IMUDataset(Dataset):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
         Args:
-            data_dir: 数据目录
+            data_dir: 数据目录，可以是字符串（单个目录）或列表（多个目录）
             window_size: 窗口大小
             normalize: 是否对数据进行标准化
             debug: 是否在调试模式
             min_obj_contact_frames: 序列中至少需要的物体接触帧数，少于此值的序列将被过滤掉
         """
-        self.data_dir = data_dir
+        # 支持单个目录或多个目录
+        if isinstance(data_dir, str):
+            self.data_dirs = [data_dir]
+        elif isinstance(data_dir, list):
+            self.data_dirs = data_dir
+        else:
+            raise ValueError("data_dir must be a string or a list of strings")
+        
         self.window_size = window_size
         self.normalize = normalize
         self.debug = debug
         self.min_obj_contact_frames = min_obj_contact_frames
 
-        # 查找序列文件
-        self.sequence_files = glob.glob(os.path.join(data_dir, "*.pt"))
-        print(f"找到{len(self.sequence_files)}个序列文件")
+        # 查找所有目录中的序列文件
+        self.sequence_files = []
+        for data_dir_path in self.data_dirs:
+            if os.path.exists(data_dir_path):
+                dir_files = glob.glob(os.path.join(data_dir_path, "*.pt"))
+                self.sequence_files.extend(dir_files)
+                print(f"从目录 {data_dir_path} 找到 {len(dir_files)} 个序列文件")
+            else:
+                print(f"警告: 目录 {data_dir_path} 不存在，跳过")
+        
+        print(f"总共找到 {len(self.sequence_files)} 个序列文件")
 
         # 初始化用于存储预加载数据和序列信息的容器
         self.loaded_data = {}
@@ -137,8 +152,8 @@ class IMUDataset(Dataset):
         print(f"预加载并收集信息完成，共找到{len(self.sequence_info)}个有效序列")
         print(f"过滤条件：序列长度 >= {self.window_size + 1}，物体接触帧数 >= {self.min_obj_contact_frames}")
 
-        # 检查BPS文件夹
-        self.bps_dir = os.path.join(os.path.dirname(data_dir), "bps_features")
+        # 检查BPS文件夹 - 对于多个数据目录，检查第一个目录的BPS文件夹
+        self.bps_dir = os.path.join(os.path.dirname(self.data_dirs[0]), "bps_features")
         self.use_bps = os.path.exists(self.bps_dir)
         if self.use_bps:
             print(f"使用BPS特征从 {self.bps_dir}")
@@ -186,12 +201,8 @@ class IMUDataset(Dataset):
                         contact_count = np.sum(obj_contact_frames)
                     
                     if contact_count < self.min_obj_contact_frames:
-                        print(f"跳过文件 {file_path}，物体接触帧数 {contact_count} 少于最小要求 {self.min_obj_contact_frames}")
+                        # print(f"跳过文件 {file_path}，物体接触帧数 {contact_count} 少于最小要求 {self.min_obj_contact_frames}")
                         continue
-                else:
-                    # 如果没有物体接触数据，也跳过（根据需要可以调整这个行为）
-                    print(f"跳过文件 {file_path}，缺少物体接触数据")
-                    continue
 
                 # 将所有Tensor移动到共享内存
                 for key, value in seq_data.items():
@@ -267,7 +278,6 @@ class IMUDataset(Dataset):
             motion = seq_data["rotation_local_full_gt_list"][start_idx:end_idx]
             # human_imu_acc = seq_data["imu_global_full_gt"]["accelerations"][start_idx:end_idx]
             # human_imu_ori = seq_data["imu_global_full_gt"]["orientations"][start_idx:end_idx]
-            seq_len = motion.shape[0]
 
             # --- 动态计算人类 IMU 数据 ---
             position_global_full = seq_data["position_global_full_gt_world"][start_idx:end_idx] # [seq, J, 3]
@@ -282,7 +292,7 @@ class IMUDataset(Dataset):
             # --- 结束动态计算 ---
 
             # 将旋转矩阵转换为6D旋转表示
-            human_imu_ori_flat = human_imu_ori.reshape(seq_len, -1, 3, 3)
+            human_imu_ori_flat = human_imu_ori.reshape(self.window_size, -1, 3, 3)
             human_imu_ori_6d = transforms.matrix_to_rotation_6d(human_imu_ori_flat)
             human_imu = torch.cat([human_imu_acc, human_imu_ori_6d], dim=-1)  # [T, num_imus, 9]
 
@@ -319,9 +329,13 @@ class IMUDataset(Dataset):
 
             # 对数据进行归一化（如果需要）
             norm_human_imu = human_imu.float()
+            norm_root_pos = root_pos.float()
+            norm_motion = motion.float()
             norm_obj_imu = obj_imu.float()
-            if self.normalize:  
+            norm_obj_trans = obj_trans.float()
+            norm_obj_rot = transforms.matrix_to_rotation_6d(obj_rot).float()
 
+            if self.normalize:  
                 root_imu_acc_start = human_imu_acc[0, -1] # [3]
                 root_imu_ori_start = human_imu_ori_flat[0, -1] # [3, 3]
                 root_imu_ori_start_inv = torch.inverse(root_imu_ori_start)
@@ -330,11 +344,12 @@ class IMUDataset(Dataset):
                 norm_human_imu_acc = norm_human_imu_acc.squeeze(-1) / acc_scale
                 norm_human_imu_ori = root_imu_ori_start_inv @ human_imu_ori_flat
                 norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
-                # norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
-                norm_obj_acc = root_imu_ori_start_inv @ obj_imu_acc.unsqueeze(-1)
-                norm_obj_acc = norm_obj_acc.squeeze(-1) / acc_scale
-                norm_obj_ori = root_imu_ori_start_inv @ obj_imu_ori
-                norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
+                if has_object:
+                    # norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                    norm_obj_acc = root_imu_ori_start_inv @ obj_imu_acc.unsqueeze(-1)
+                    norm_obj_acc = norm_obj_acc.squeeze(-1) / acc_scale
+                    norm_obj_ori = root_imu_ori_start_inv @ obj_imu_ori
+                    norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
 
                 # norm_human_imu_acc = torch.cat((human_imu_acc[:, :5] - human_imu_acc[:, 5:], human_imu_acc[:, 5:]), dim=1).bmm(human_imu_ori_flat[:, -1]) / acc_scale
                 # norm_human_imu_ori = torch.cat((human_imu_ori_flat[:, 5:].transpose(2, 3).matmul(human_imu_ori_flat[:, :5]), human_imu_ori_flat[:, 5:]), dim=1)
@@ -407,86 +422,43 @@ class IMUDataset(Dataset):
             leaf_vel = torch.einsum('ij,tnj->tni', root_start_rot_invert, leaf_vel_global)  # [seq, n_leaf, 3]
             # --- 结束计算速度 ---
 
-            # 加载BPS特征（如果有）
-            bps_features = None
-            if self.use_bps and has_object:
-                 bps_path = os.path.join(self.bps_dir, f"{seq_name}.npy")
-                 if os.path.exists(bps_path):
-                     try:
-                         bps_data = np.load(bps_path)
-                         bps_features = torch.from_numpy(bps_data).float()
-                         # 切片 BPS 特征
-                         # 注意：原始 OMOMO BPS 是按窗口保存的，这里假设是按完整序列保存
-                         # 如果 BPS 文件已经是窗口化的，可能不需要切片
-                         if bps_features.shape[0] == seq_data["rotation_local_full_gt_list"].shape[0]: # 假设 BPS 与完整序列对齐
-                             bps_features = bps_features[start_idx:end_idx]
-                         elif bps_features.shape[0] != motion.shape[0]: # 如果长度不匹配窗口
-                             print(f"警告：BPS 特征长度 ({bps_features.shape[0]}) 与窗口 ({motion.shape[0]}) 不匹配，路径：{bps_path}")
-                             bps_features = None # 忽略不匹配的 BPS
-                     except Exception as e:
-                         if self.debug:
-                             print(f"无法加载或切片 BPS 特征 {bps_path}: {e}")
-                         bps_features = None # 失败时置空
-
             # 构建结果字典
             # --- 加载足部接触标签 ---
-            lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(motion.shape[0], dtype=torch.float))[start_idx:end_idx]
-            rfoot_contact_window = seq_data.get("rfoot_contact", torch.zeros(motion.shape[0], dtype=torch.float))[start_idx:end_idx]
-            
-            if has_object:
-                # --- 直接使用预处理计算好的接触标签 ---
-                lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
-                rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
-                obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
+            rfoot_contact_window = seq_data.get("rfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
 
-                result = {
-                    "root_pos": norm_root_pos.float(),
-                    "motion": norm_motion.float(),  # [seq, 132]
-                    "root_pos_start": root_global_pos_start.float(),  # [3]
-                    "root_rot_start": root_global_rot_start.float(),  # [3, 3]
-                    "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
-                    "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
-                    "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
-                    "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
-                    "obj_scale": obj_scale.float() , # [seq] (单独返回)
-                    "obj_name": obj_name,
-                    "has_object": has_object,
-                    "root_vel": root_vel.float(), # [seq, 3] - 单位: m/s
-                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度 (m/s)
-                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度 (m/s)
-                    "lhand_contact": lhand_contact_window.bool(), # [seq]
-                    "rhand_contact": rhand_contact_window.bool(), # [seq]
-                    "obj_contact": obj_contact_window.bool(), # [seq]
-                    "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
-                    "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
-                }
-            else:
-                result = {
-                    "root_pos": norm_root_pos.float(),
-                    "motion": norm_motion.float(),
-                    # "head_global_trans_start": seq_data["head_global_trans"][start_idx:start_idx+1].float(),
-                    "root_pos_start": root_global_pos_start.float(), # Need to ensure this is available or handled if no object
-                    "root_rot_start": root_global_rot_start.float(), # Same as above
-                    "human_imu": norm_human_imu.float(),
-                    "imu_global_positions": imu_global_positions.float(),  # [seq, num_imus, 3] - IMU关节全局位置
-                    "imu_global_rotations": imu_global_rotations.float(),  # [seq, num_imus, 3, 3] - IMU关节全局旋转
-                    "root_vel": root_vel.float(),
-                    "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度（无物体时为零，m/s）
-                    "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度 (m/s)
-                    "has_object": has_object, # Indicate no object
-                    "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
-                    "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
-                }
+            # --- 直接使用预处理计算好的接触标签 ---
+            lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
 
-            if bps_features is not None:
-                result["bps_features"] = bps_features
-                
+            result = {
+                "root_pos": norm_root_pos.float(),
+                "motion": norm_motion.float(),  # [seq, 132]
+                "root_pos_start": root_global_pos_start.float(),  # [3]
+                "root_rot_start": root_global_rot_start.float(),  # [3, 3]
+                "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
+                "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
+                "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
+                "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
+                "obj_scale": obj_scale.float() , # [seq] (单独返回)
+                "obj_name": obj_name,
+                "has_object": has_object,
+                "root_vel": root_vel.float(), # [seq, 3] - 单位: m/s
+                "obj_vel": obj_vel.float(), # [seq, 3] - 物体速度 (m/s)
+                "leaf_vel": leaf_vel.float(), # [seq, n_leaf, 3] - 叶子节点速度 (m/s)
+                "lhand_contact": lhand_contact_window.bool(), # [seq]
+                "rhand_contact": rhand_contact_window.bool(), # [seq]
+                "obj_contact": obj_contact_window.bool(), # [seq]
+                "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
+                "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
+            }
+
             return result
 
         except Exception as e:
             print(f"处理预加载数据时出错，文件: {file_path}, 窗口索引: {idx}, Start: {start_idx}, End: {end_idx}: {e}")
             import traceback
             traceback.print_exc() # 打印详细错误
-            seq_len = self.window_size
             # 返回包含正确键但值为默认值的字典，以避免后续代码出错
             return 

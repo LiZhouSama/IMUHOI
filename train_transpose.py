@@ -98,8 +98,24 @@ def main():
         train_path = os.path.join(base_dir, cfg.train.debug_data_path)
         test_path = os.path.join(base_dir, cfg.train.debug_data_path)  # 使用相同数据进行测试
     else:
-        train_path = os.path.join(base_dir, cfg.train.data_path)
-        test_path = os.path.join(base_dir, cfg.test.data_path) if hasattr(cfg.test, 'data_path') else None
+        # 处理多个数据路径（支持列表格式）
+        if isinstance(cfg.train.data_path, list):
+            # 如果是列表，将每个路径与base_dir拼接
+            train_path = [os.path.join(base_dir, path) for path in cfg.train.data_path]
+        else:
+            # 如果是字符串，保持原有逻辑
+            train_path = os.path.join(base_dir, cfg.train.data_path)
+        
+        # 处理测试数据路径
+        if hasattr(cfg.test, 'data_path') and cfg.test.data_path:
+            if isinstance(cfg.test.data_path, list):
+                # 如果是列表，将每个路径与base_dir拼接
+                test_path = [os.path.join(base_dir, path) for path in cfg.test.data_path]
+            else:
+                # 如果是字符串，保持原有逻辑
+                test_path = os.path.join(base_dir, cfg.test.data_path)
+        else:
+            test_path = None
     
     print(f"训练数据路径: {train_path}")
     if test_path:
