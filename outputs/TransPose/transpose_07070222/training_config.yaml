@@ -1,0 +1,263 @@
+augmentation: !!python/object/new:easydict.EasyDict
+  dictitems:
+    noise_augmentation: true
+    noise_std: 0.01
+    rotation_augmentation: true
+    use_augmentation: true
+  state:
+    noise_augmentation: true
+    noise_std: 0.01
+    rotation_augmentation: true
+    use_augmentation: true
+batch_size: 50
+bm_path: body_models/smplh/male/model.npz
+cfg_file: configs/TransPose_train.yaml
+contact_distance: 0.1
+contact_loss_weights: !!python/object/new:easydict.EasyDict
+  dictitems:
+    approach_smoothness: 0.3
+    contact_consistency: 0.2
+    contact_distance: 1.0
+    contact_velocity: 0.5
+  state:
+    approach_smoothness: 0.3
+    contact_consistency: 0.2
+    contact_distance: 1.0
+    contact_velocity: 0.5
+contact_ramp_up_steps: 10000
+datasets: !!python/object/new:easydict.EasyDict
+  dictitems:
+    amass: &id001 !!python/object/new:easydict.EasyDict
+      dictitems:
+        debug_path: processed_amass_data_0703/debug
+        test_path: processed_amass_data_0703/test
+        train_path: processed_amass_data_0703/train
+      state:
+        debug_path: processed_amass_data_0703/debug
+        test_path: processed_amass_data_0703/test
+        train_path: processed_amass_data_0703/train
+    omomo: &id002 !!python/object/new:easydict.EasyDict
+      dictitems:
+        debug_path: processed_data_0701/debug
+        test_path: processed_data_0701/test
+        train_path: processed_data_0701/train
+      state:
+        debug_path: processed_data_0701/debug
+        test_path: processed_data_0701/test
+        train_path: processed_data_0701/train
+  state:
+    amass: *id001
+    omomo: *id002
+debug: false
+device: cuda:0
+epoch: 400
+gamma: 0.1
+gpus:
+- 0
+hand_contact_distance: 0.1
+hidden_dim_multiplier: 1
+imu_dim: 9
+joint_dim: 6
+loss_weights: !!python/object/new:easydict.EasyDict
+  dictitems:
+    contact_aware: 1.0
+    foot_contact: 1
+    full_pos: 1.0
+    hand_contact: 1
+    leaf_pos: 1.0
+    leaf_vel: 10
+    obj_rot: 1.0
+    obj_trans: 10
+    obj_vel: 1
+    root_pos: 10
+    root_vel: 10
+    rot: 10
+    tran_b2: 0.001
+  state:
+    contact_aware: 1.0
+    foot_contact: 1
+    full_pos: 1.0
+    hand_contact: 1
+    leaf_pos: 1.0
+    leaf_vel: 10
+    obj_rot: 1.0
+    obj_trans: 10
+    obj_vel: 1
+    root_pos: 10
+    root_vel: 10
+    rot: 10
+    tran_b2: 0.001
+lr: 0.0004
+milestones:
+- 150
+- 250
+- 350
+- 450
+model_name: TransPose_IMU
+model_type: TransPose
+num_human_imus: 6
+num_joints: 22
+num_workers: 12
+obj_contact_threshold: 0.3
+obj_imu_change_threshold: 0.1
+obj_rot_weight: 0.5
+save_dir: outputs/TransPose/transpose_07070222
+seed: 10
+staged_training: !!python/object/new:easydict.EasyDict
+  dictitems:
+    debug_stages: &id027
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id003
+        - mixed
+        epochs: &id004
+        - 0
+        - 4
+        modules: &id005
+        - velocity_contact
+        name: velocity_contact
+      state:
+        datasets: *id003
+        epochs: *id004
+        modules: *id005
+        name: velocity_contact
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id006
+        - mixed
+        epochs: &id007
+        - 5
+        - 9
+        modules: &id008
+        - human_pose
+        name: human_pose
+      state:
+        datasets: *id006
+        epochs: *id007
+        modules: *id008
+        name: human_pose
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id009
+        - omomo
+        epochs: &id010
+        - 10
+        - 14
+        modules: &id011
+        - object_trans
+        name: object_trans
+      state:
+        datasets: *id009
+        epochs: *id010
+        modules: *id011
+        name: object_trans
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id012
+        - omomo
+        epochs: &id013
+        - 15
+        - 29
+        modules: &id014
+        - human_pose
+        - object_trans
+        name: joint_training
+      state:
+        datasets: *id012
+        epochs: *id013
+        modules: *id014
+        name: joint_training
+    enabled: true
+    stages: &id028
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id015
+        - mixed
+        epochs: &id016
+        - 0
+        - 99
+        modules: &id017
+        - velocity_contact
+        name: velocity_contact
+      state:
+        datasets: *id015
+        epochs: *id016
+        modules: *id017
+        name: velocity_contact
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id018
+        - mixed
+        epochs: &id019
+        - 100
+        - 299
+        modules: &id020
+        - human_pose
+        name: human_pose
+      state:
+        datasets: *id018
+        epochs: *id019
+        modules: *id020
+        name: human_pose
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id021
+        - omomo
+        epochs: &id022
+        - 300
+        - 349
+        modules: &id023
+        - object_trans
+        name: object_trans
+      state:
+        datasets: *id021
+        epochs: *id022
+        modules: *id023
+        name: object_trans
+    - !!python/object/new:easydict.EasyDict
+      dictitems:
+        datasets: &id024
+        - omomo
+        epochs: &id025
+        - 350
+        - 399
+        modules: &id026
+        - human_pose
+        - object_trans
+        name: joint_training
+      state:
+        datasets: *id024
+        epochs: *id025
+        modules: *id026
+        name: joint_training
+  state:
+    debug_stages: *id027
+    enabled: true
+    stages: *id028
+tensorboard_project_name: imu_transpose
+test: !!python/object/new:easydict.EasyDict
+  dictitems:
+    data_path: processed_data_0701/test
+    normalize: true
+    window: 120
+  state:
+    data_path: processed_data_0701/test
+    normalize: true
+    window: 120
+train: !!python/object/new:easydict.EasyDict
+  dictitems:
+    data_path: processed_data_0701/train
+    debug_data_path: processed_data_0701/debug
+    normalize: true
+    window: 120
+  state:
+    data_path: processed_data_0701/train
+    debug_data_path: processed_data_0701/debug
+    normalize: true
+    window: 120
+use_contact_aware_loss: false
+use_multi_gpu: false
+use_tensorboard: true
+use_transpose_model: true
+vel_scale: 3
+weight_decay: 5.0e-05

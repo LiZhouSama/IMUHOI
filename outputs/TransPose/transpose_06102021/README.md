@@ -1,2 +1,0 @@
-- fixed hands pos to calculate from s5(root trans) and s3(pose) output
-- obj trans input: HOI contact input cat output

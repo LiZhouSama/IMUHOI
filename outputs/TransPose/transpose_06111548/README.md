@@ -1,2 +1,0 @@
-- Removed sequences without contact
-- contact est input -> only imu feat

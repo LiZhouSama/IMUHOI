@@ -1,1 +1,0 @@
-- obj trans est without contact

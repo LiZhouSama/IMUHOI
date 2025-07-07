@@ -1,1 +1,0 @@
-- s1&s2 gt pos local->global

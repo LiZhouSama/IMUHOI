@@ -1,1 +1,0 @@
-- HOI contact input: imu feat + hands_pos_feat (removed the hands_rot_feat)

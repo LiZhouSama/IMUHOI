@@ -16,11 +16,11 @@ bm_path: body_models/smplh/male/model.npz
 use_transpose_model: True
 
 # 训练超参数
-epoch: 300  # 训练轮数
+epoch: 500  # 训练轮数
 batch_size: 50  # 批大小（多GPU时会自动分配到各GPU）
 lr: 0.0004  # 学习率（多GPU时会自动按GPU数量线性缩放）
 weight_decay: 0.00005  # 权重衰减
-milestones: [150,250,350,450]  # 学习率调整节点
+milestones: []  # 学习率调整节点
 gamma: 0.1  # 学习率衰减系数
 seed: 42  # 随机种子
 num_workers: 12  # 数据加载线程数（多GPU时建议增加）
@@ -50,9 +50,65 @@ contact_loss_weights:
   approach_smoothness: 0.3   # 接近平滑性权重
   contact_consistency: 0.2   # 接触状态一致性权重
 
-
 # 手部接触相关参数
 hand_contact_distance: 0.1   # 10cm目标距离
+
+# 分阶段训练配置
+staged_training:
+  enabled: True  # 是否启用分阶段训练
+  stages:
+    - name: "velocity_contact"
+      epochs: [0, 99]  # epoch范围：0-49 (共50个epoch)
+      modules: ["velocity_contact"]  # 激活的模块
+      datasets: ["mixed"]  # 使用的数据集类型：amass、omomo、mixed
+    - name: "human_pose_amass"  
+      epochs: [100, 199]  # epoch范围：50-149 (共100个epoch) - 先用AMASS训练基础人体姿态
+      modules: ["human_pose"]  # 激活的模块
+      datasets: ["amass"]  # 只使用AMASS数据集
+    - name: "human_pose_omomo"  
+      epochs: [200, 299]  # epoch范围：150-199 (共50个epoch) - 再用OMOMO微调
+      modules: ["human_pose"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集
+    - name: "object_trans"
+      epochs: [300, 349]  # epoch范围：200-249 (共50个epoch)
+      modules: ["object_trans"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+    - name: "joint_training"
+      epochs: [350, 499]  # epoch范围：250-399 (共150个epoch)
+      modules: ["human_pose", "object_trans"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+  debug_stages:
+    - name: "velocity_contact"
+      epochs: [0, 2]  # epoch范围：0-2 (共3个epoch)
+      modules: ["velocity_contact"]  # 激活的模块
+      datasets: ["mixed"]  # 使用的数据集类型：amass、omomo、mixed
+    - name: "human_pose_amass"  
+      epochs: [3, 5]  # epoch范围：3-5 (共3个epoch) - 先用AMASS训练基础人体姿态
+      modules: ["human_pose"]  # 激活的模块
+      datasets: ["amass"]  # 只使用AMASS数据集
+    - name: "human_pose_omomo"  
+      epochs: [6, 8]  # epoch范围：6-8 (共3个epoch) - 再用OMOMO微调
+      modules: ["human_pose"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集
+    - name: "object_trans"
+      epochs: [9, 11]  # epoch范围：9-11 (共3个epoch)
+      modules: ["object_trans"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+    - name: "joint_training"
+      epochs: [12, 19]  # epoch范围：12-19 (共8个epoch)
+      modules: ["human_pose", "object_trans"]  # 激活的模块
+      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+
+# 数据集配置
+datasets:
+  amass:
+    train_path: "processed_amass_data_0703/train"
+    test_path: "processed_amass_data_0703/test"
+    debug_path: "processed_amass_data_0703/debug"  # AMASS调试数据路径
+  omomo:
+    train_path: "processed_data_0701/train"
+    test_path: "processed_data_0701/test"
+    debug_path: "processed_data_0701/debug"  # OMOMO调试数据路径
 
 # 损失权重配置
 loss_weights:
@@ -69,13 +125,14 @@ loss_weights:
   obj_vel: 1  # 物体速度损失权重
   leaf_vel: 10  # 叶子节点速度损失权重
   foot_contact: 1  # 足部接触损失权重
+
 # 训练窗口配置
 train:
   window: 120  # 训练时使用的时间窗口长度
   # window_stride: 60  # 训练时窗口步长
   normalize: True  # 是否归一化数据
   data_path: 
-    "processed_data_0701/train"  # 训练数据路径1
+    "processed_data_0701/train"  # 训练数据路径1（传统模式使用）
   debug_data_path: "processed_data_0701/debug"  # 调试数据路径
 
 # 测试窗口配置
@@ -84,7 +141,7 @@ test:
   # window_stride: 120  # 测试时窗口步长
   normalize: True  # 是否归一化数据
   data_path: 
-    "processed_data_0701/test"  # 测试数据路径1
+    "processed_data_0701/test"  # 测试数据路径1（传统模式使用）
 
 # 数据增强配置
 augmentation:

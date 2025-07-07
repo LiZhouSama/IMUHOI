@@ -300,7 +300,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_obj_contact_labels_seq = None
 
         # --- Define a visual offset for predicted elements ---
-        pred_offset = torch.tensor([0.0, 0.0, 0.0], device=device)
+        pred_offset = torch.tensor([3.0, 0.0, 0.0], device=device)
 
         # 只有在非仅真值模式下才执行模型推理
         if not vis_gt_only:
@@ -952,7 +952,7 @@ def main():
     model.eval()
 
     # --- Load Test Dataset ---
-    test_data_dir = config.test.get('data_path', None)
+    test_data_dir = config.datasets.amass.get('test_path', None)
     if not test_data_dir or not os.path.exists(test_data_dir):
         print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
         return

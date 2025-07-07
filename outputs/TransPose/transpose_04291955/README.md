@@ -1,1 +1,0 @@
-- 修改reduce joints，把脚和手纳入预测

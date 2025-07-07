@@ -1,3 +1,0 @@
-- 加入了root trans的训练
-- 在DataLoader中对头1归一化，motion和imu
-- 结果中root rot非常差，平移也基本上没学到，并且由于可视化没有denomalization导致物体和手脱离

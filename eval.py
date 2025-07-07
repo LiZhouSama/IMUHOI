@@ -120,25 +120,29 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
 
             # --- Model Prediction ---
             # Prepare input dictionary
-            model_input = {"human_imu": gt_human_imu}
-            if obj_imu_input is not None:
-                model_input["obj_imu"] = obj_imu_input
-
             model_input = {
                 "human_imu": gt_human_imu,
-                "motion": gt_motion,             # 新增
-                "root_pos": gt_root_pos,           # 新增
+                "motion": gt_motion,             # 用于状态初始化
+                "root_pos": gt_root_pos,         # 用于状态初始化
             }
-            if obj_imu_input is not None:
-                model_input["obj_imu"] = obj_imu_input # [bs, T, 1, dim]
-                model_input["obj_rot"] = gt_obj_rot_6d # [bs, T, 6]
-                model_input["obj_trans"] = gt_obj_trans # [bs, T, 3]
+            
+            # 添加物体相关输入（如果有）
+            if has_object:
+                model_input["obj_imu"] = gt_obj_imu        # [bs, T, 1, dim]
+                model_input["obj_rot"] = gt_obj_rot_6d     # [bs, T, 6]
+                model_input["obj_trans"] = gt_obj_trans    # [bs, T, 3]
+            else:
+                # 为没有物体数据的情况提供默认值
+                device = gt_human_imu.device
+                model_input["obj_imu"] = torch.zeros(bs, seq_len, 1, gt_human_imu.shape[-1], device=device)
+                model_input["obj_rot"] = torch.zeros(bs, seq_len, 6, device=device)
+                model_input["obj_trans"] = torch.zeros(bs, seq_len, 3, device=device)
 
             try:
                 if hasattr(model, 'diffusion_reverse'):
                     pred_dict = model.diffusion_reverse(model_input)
                 else:
-                    pred_dict = model(model_input)
+                    pred_dict = model(model_input, use_object_data=has_object)
             except Exception as e:
                  print(f"Error during model inference in batch {batch_idx}: {e}")
                  continue
@@ -364,7 +368,7 @@ def main():
     print(f"Loading {model_type_str} model from: {model_path}")
     model = load_model(model_path, config, device)
 
-    test_data_dir = config.test.get('data_path', None)
+    test_data_dir = config.datasets.omomo.get('test_path', None)
     if test_data_dir is None or not os.path.exists(test_data_dir):
         print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
         print("Please provide the correct path in the config (test.data_path) or via --test_data_dir.")
