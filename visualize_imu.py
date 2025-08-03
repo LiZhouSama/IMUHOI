@@ -14,7 +14,7 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 import pytorch3d.transforms as transforms
 from dataloader.dataloader import IMUDataset
-from configs.global_config import IMU_JOINTS, IMU_JOINT_NAMES, FRAME_RATE
+from configs.global_config import IMU_JOINT_NAMES, FRAME_RATE
 import argparse
 
 # 设置字体支持

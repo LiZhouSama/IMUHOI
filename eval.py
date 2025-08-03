@@ -112,12 +112,6 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             # Determine if the batch contains object data
             has_object = gt_obj_imu is not None and gt_obj_trans is not None and gt_obj_rot_6d is not None
 
-            # Prepare dummy object IMU if needed by the model but not present in GT
-            if has_object:
-                obj_imu_input = gt_obj_imu
-            else:
-                obj_imu_input = None
-
             # --- Model Prediction ---
             # Prepare input dictionary
             model_input = {
@@ -126,6 +120,8 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 "root_pos": gt_root_pos,         # 用于状态初始化
             }
             
+            # 添加虚拟关节数据（TransPose模型需要）
+            
             # 添加物体相关输入（如果有）
             if has_object:
                 model_input["obj_imu"] = gt_obj_imu        # [bs, T, 1, dim]
@@ -133,16 +129,17 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 model_input["obj_trans"] = gt_obj_trans    # [bs, T, 3]
             else:
                 # 为没有物体数据的情况提供默认值
-                device = gt_human_imu.device
-                model_input["obj_imu"] = torch.zeros(bs, seq_len, 1, gt_human_imu.shape[-1], device=device)
-                model_input["obj_rot"] = torch.zeros(bs, seq_len, 6, device=device)
-                model_input["obj_trans"] = torch.zeros(bs, seq_len, 3, device=device)
+                device_model = gt_human_imu.device
+                model_input["obj_imu"] = torch.zeros(bs, seq_len, 1, gt_human_imu.shape[-1], device=device_model)
+                model_input["obj_rot"] = torch.zeros(bs, seq_len, 6, device=device_model)
+                model_input["obj_trans"] = torch.zeros(bs, seq_len, 3, device=device_model)
 
             try:
                 if hasattr(model, 'diffusion_reverse'):
                     pred_dict = model.diffusion_reverse(model_input)
                 else:
-                    pred_dict = model(model_input, use_object_data=has_object)
+                    model_input["use_object_data"] = has_object
+                    pred_dict = model(model_input)
             except Exception as e:
                  print(f"Error during model inference in batch {batch_idx}: {e}")
                  continue
@@ -150,7 +147,7 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             # --- Extract Predictions (Normalized) ---
             pred_root_pos_norm = pred_dict.get("root_pos", None)
             pred_motion_norm = pred_dict.get("motion", None)
-            pred_obj_trans_norm = pred_dict.get("pred_obj_trans", None)  # 注意键名变化
+            pred_obj_trans_norm = pred_dict.get("pred_obj_trans_from_fk", None)  # 更新键名
             pred_hand_contact_prob = pred_dict.get("pred_hand_contact_prob", None)  # [bs, T, 3]
 
             if pred_motion_norm is None:
@@ -358,7 +355,7 @@ def main():
     if model_path is None or not os.path.exists(model_path):
         print(f"Error: Evaluation model path not found or invalid: {model_path}")
         print("Please provide the correct path in the config (model_path) or via --model_path.")
-        return
+        # return
 
     # Determine model type for logging message (can be refined)
     model_type_str = "Unknown"

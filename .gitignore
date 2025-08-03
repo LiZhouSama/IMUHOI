@@ -111,8 +111,8 @@ checkpoints/
 logs/
 *.pt
 *.pth
-output/
-processed_data*/
+outputs/
+processed_*/
 evaluation_results/
 wandb/
 

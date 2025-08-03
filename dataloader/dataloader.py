@@ -36,14 +36,15 @@ def _syn_acc_optimized(v, smooth_n=4):
     
     # 使用张量索引实现二阶差分
     if T > 2:
-        acc[1:-1] = (v_flat[:-2] + v_flat[2:] - 2 * v_flat[1:-1]) * FRAME_RATE ** 2
+        acc[2:] = (v_flat[:-2] + v_flat[2:] - 2 * v_flat[1:-1]) * FRAME_RATE ** 2
+        acc[1] = (v_flat[1] - v_flat[0]) * FRAME_RATE ** 2
     
     # 应用平滑
-    mid = smooth_n // 2
-    if mid != 0 and T > smooth_n * 2:
-        # 使用张量索引实现平滑计算
-        smooth_range = slice(smooth_n, -smooth_n)
-        acc[smooth_range] = (v_flat[:-smooth_n*2] + v_flat[smooth_n*2:] - 2 * v_flat[smooth_n:-smooth_n]) * FRAME_RATE ** 2 / smooth_n ** 2
+    # mid = smooth_n // 2
+    # if mid != 0 and T > smooth_n * 2:
+    #     # 使用张量索引实现平滑计算
+    #     smooth_range = slice(smooth_n, -smooth_n)
+    #     acc[smooth_range] = (v_flat[:-smooth_n*2] + v_flat[smooth_n*2:] - 2 * v_flat[smooth_n:-smooth_n]) * FRAME_RATE ** 2 / smooth_n ** 2
     
     # 恢复原始形状
     return acc.reshape(orig_shape)
@@ -99,6 +100,8 @@ def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
     
     # 计算物体加速度
     obj_accel = _syn_acc_optimized(obj_trans, smooth_n=4)  # [T, 3]
+    # obj_accel_watch = obj_accel.detach().cpu().numpy()
+    # obj_trans_watch = obj_trans.detach().cpu().numpy()
 
     # 返回物体IMU数据
     return {
@@ -106,6 +109,98 @@ def compute_object_imu(obj_trans, obj_rot_mat, smooth_n=4):
         'orientations': obj_rot_mat.reshape(T, 1, 3, 3)  # [T, 1, 3, 3]
     }
 # --- 结束 IMU 计算函数 ---
+
+def find_contact_segments(contact_mask):
+    """找到连续的接触段"""
+    segments = []
+    contact_indices = torch.where(contact_mask)[0]
+    
+    if len(contact_indices) == 0:
+        return segments
+    
+    start = contact_indices[0].item()
+    end = start
+    
+    for i in range(1, len(contact_indices)):
+        if contact_indices[i] == contact_indices[i-1] + 1:
+            end = contact_indices[i].item()
+        else:
+            segments.append((start, end))
+            start = contact_indices[i].item()
+            end = start
+    
+    segments.append((start, end))
+    return segments
+
+def compute_obj_direction_supervision(position_global_norm, obj_trans_norm, obj_rot_norm, 
+                                    lhand_contact, rhand_contact):
+    """
+    计算物体坐标系下的方向向量监督标签
+    
+    Args:
+        position_global_norm: [seq, J, 3] - 归一化到首帧根坐标系的全局位置
+        obj_trans_norm: [seq, 3] - 归一化到首帧根坐标系的物体位置
+        obj_rot_norm: [seq, 6] - 归一化到首帧根坐标系的物体旋转（6D表示）
+        lhand_contact/rhand_contact: [seq] - 接触标签
+    
+    Returns:
+        dict: 包含物体坐标系下的方向向量
+    """
+    device = position_global_norm.device
+    seq_len = obj_trans_norm.shape[0]
+    
+    # 将6D旋转表示转换为旋转矩阵
+    obj_rot_norm_mat = transforms.rotation_6d_to_matrix(obj_rot_norm)  # [seq, 3, 3]
+    
+    # 初始化结果
+    result = {
+        "lhand_obj_direction": torch.zeros(seq_len, 3, device=device),
+        "rhand_obj_direction": torch.zeros(seq_len, 3, device=device),
+    }
+    
+    # 提取手腕位置
+    wrist_pos = {
+        'left': position_global_norm[:, 20, :],   # [seq, 3] - 左手腕位置（关节20）
+        'right': position_global_norm[:, 21, :]  # [seq, 3] - 右手腕位置（关节21）
+    }
+    
+    contacts = {'left': lhand_contact, 'right': rhand_contact}
+    
+    for hand_name in ['left', 'right']:
+        contact_mask = contacts[hand_name]
+        
+        if not contact_mask.any():
+            continue
+        
+        # 找到接触段
+        contact_segments = find_contact_segments(contact_mask)
+        
+        for seg_start, seg_end in contact_segments:
+            # 获取接触段的索引
+            seg_indices = torch.arange(seg_start, seg_end + 1, device=obj_trans_norm.device)
+            
+            # 批量获取接触段的数据
+            wrist_pos_seg = wrist_pos[hand_name][seg_indices]  # [seg_len, 3]
+            obj_trans_seg = obj_trans_norm[seg_indices]  # [seg_len, 3]
+            obj_rot_mat_seg = obj_rot_norm_mat[seg_indices]  # [seg_len, 3, 3]
+            
+            # 1. 计算世界坐标系下手腕指向物体的向量
+            v_HO_world = obj_trans_seg - wrist_pos_seg  # [seg_len, 3]
+            
+            # 2. 归一化得到世界坐标系下的单位向量
+            v_HO_world_unit = v_HO_world / (torch.norm(v_HO_world, dim=1, keepdim=True) + 1e-8)  # [seg_len, 3]
+            
+            # 3. 转换到物体坐标系：^Ov_{HO} = ^WR_O^T * ^Wv_{HO}
+            obj_rot_mat_inv_seg = obj_rot_mat_seg.transpose(-1, -2)  # [seg_len, 3, 3]
+            v_HO_obj = torch.bmm(obj_rot_mat_inv_seg, v_HO_world_unit.unsqueeze(-1)).squeeze(-1)  # [seg_len, 3]
+            
+            # 4. 存储结果
+            if hand_name == 'left':
+                result["lhand_obj_direction"][seg_indices] = v_HO_obj
+            else:
+                result["rhand_obj_direction"][seg_indices] = v_HO_obj
+    
+    return result
 
 class IMUDataset(Dataset):
     def __init__(self, data_dir, window_size=60, normalize=True, debug=False, min_obj_contact_frames=10):
@@ -223,6 +318,23 @@ class IMUDataset(Dataset):
                 print(f"处理文件 {file_path} 时出错: {e}")
                 import traceback
                 traceback.print_exc() # 打印更详细的错误追踪
+
+    def cleanup(self):
+        """清理共享内存和缓存数据"""
+        print(f"清理IMUDataset，释放{len(self.loaded_data)}个序列的共享内存...")
+        self.loaded_data.clear()
+        self.sequence_info.clear()
+        
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+        
+        print("IMUDataset清理完成")
+
+    def __del__(self):
+        """析构函数，确保在对象被删除时清理共享内存"""
+        if hasattr(self, 'loaded_data') and self.loaded_data:
+            self.cleanup()
 
     def __len__(self):
         # 返回独立序列的数量
@@ -346,7 +458,9 @@ class IMUDataset(Dataset):
                 norm_human_imu = torch.cat([norm_human_imu_acc, transforms.matrix_to_rotation_6d(norm_human_imu_ori)], dim=-1)
                 if has_object:
                     # norm_obj_acc = root_imu_ori_start_inv @ (obj_imu_acc - root_imu_acc_start).unsqueeze(-1)
+                    obj_imu_acc_watch = obj_imu_acc.detach().cpu().numpy()
                     norm_obj_acc = root_imu_ori_start_inv @ obj_imu_acc.unsqueeze(-1)
+                    norm_obj_acc_watch = norm_obj_acc.squeeze(-1).detach().cpu().numpy()
                     norm_obj_acc = norm_obj_acc.squeeze(-1) / acc_scale
                     norm_obj_ori = root_imu_ori_start_inv @ obj_imu_ori
                     norm_obj_imu = torch.cat([norm_obj_acc, transforms.matrix_to_rotation_6d(norm_obj_ori)], dim=-1)
@@ -401,6 +515,7 @@ class IMUDataset(Dataset):
                 obj_vel = torch.cat([torch.zeros_like(obj_vel[:1]), obj_vel], dim=0)
             else:
                 obj_vel = torch.zeros(norm_root_pos.shape[0], 3)
+                print("obj_vel = 0 ----------------> dataloader")
                 
             # 3. 叶子节点速度 (从position_global_full计算)
             from configs.global_config import joint_set
@@ -422,14 +537,56 @@ class IMUDataset(Dataset):
             leaf_vel = torch.einsum('ij,tnj->tni', root_start_rot_invert, leaf_vel_global)  # [seq, n_leaf, 3]
             # --- 结束计算速度 ---
 
+            # --- 计算虚拟关节数据 ---
+            # 使用归一化后的数据计算虚拟关节
+            # 首先需要对全局位置和旋转进行归一化
+
+            # 对关节位置进行归一化：转换到初始根坐标系
+            root_start_rot_invert = root_global_rot_start.swapaxes(-2,-1)  # [3, 3]
+            # 先减去根位置，再旋转
+            position_centered = position_global_full - root_global_pos_start.unsqueeze(0).unsqueeze(0)  # [seq, J, 3]
+            position_global_norm = torch.einsum('ij,tkl->tki', root_start_rot_invert, position_centered)  # [seq, J, 3]
+            
+            # 对关节旋转进行归一化
+            rotation_global_norm = torch.einsum('ij,tkjl->tkil', root_start_rot_invert, 
+                                                rotation_global_full)  # [seq, J, 3, 3]
+
+            # 计算物体坐标系下的方向向量（用于监督学习）
+            lhand_obj_direction = torch.zeros(seq_len, 3)
+            rhand_obj_direction = torch.zeros(seq_len, 3)
+            
+            if has_object:
+                try:
+                    # 获取接触标签（窗口内的）
+                    lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+                    rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+                    
+                    virtual_joint_data = compute_obj_direction_supervision(
+                        position_global_norm, norm_obj_trans, norm_obj_rot,
+                        lhand_contact_window, rhand_contact_window
+                    )
+                    
+                    lhand_obj_direction = virtual_joint_data["lhand_obj_direction"]
+                    rhand_obj_direction = virtual_joint_data["rhand_obj_direction"]
+
+                except Exception as e:
+                    print(f"计算虚拟关节数据时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 使用默认值（零向量）
+                    lhand_obj_direction = torch.zeros(seq_len, 3)
+                    rhand_obj_direction = torch.zeros(seq_len, 3)
+            # --- 结束虚拟关节计算 ---
+
             # 构建结果字典
             # --- 加载足部接触标签 ---
             lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
             rfoot_contact_window = seq_data.get("rfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
 
             # --- 直接使用预处理计算好的接触标签 ---
-            lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
-            rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            if not has_object or 'lhand_contact_window' not in locals():
+                lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+                rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
             obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
 
             result = {
@@ -440,7 +597,8 @@ class IMUDataset(Dataset):
                 "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
                 "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
                 "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
-                "obj_rot": norm_obj_rot.float() ,  # [seq, 6]
+                "obj_rot": norm_obj_rot.float() ,  # [seq, 6] - 归一化后的旋转
+                "obj_rot_original": transforms.matrix_to_rotation_6d(obj_rot).float(), # [seq, 6] - 原始旋转(用于测试)
                 "obj_scale": obj_scale.float() , # [seq] (单独返回)
                 "obj_name": obj_name,
                 "has_object": has_object,
@@ -452,6 +610,18 @@ class IMUDataset(Dataset):
                 "obj_contact": obj_contact_window.bool(), # [seq]
                 "lfoot_contact": lfoot_contact_window.float(), # [seq] - 左脚接触标签
                 "rfoot_contact": rfoot_contact_window.float(), # [seq] - 右脚接触标签
+
+                # "imu_global_positions": imu_global_positions.float(), # [seq, num_imus, 3]
+                # "imu_global_rotations": imu_global_rotations.float(), # [seq, num_imus, 3, 3]
+                "position_global_norm": position_global_norm.float(), # [seq, J, 3]
+                "rotation_global_norm": rotation_global_norm.float(), # [seq, J, 3, 3]
+                "lhand_obj_direction": lhand_obj_direction.float(), # [seq, 3] - 左手物体坐标系下的方向向量
+                "rhand_obj_direction": rhand_obj_direction.float(), # [seq, 3] - 右手物体坐标系下的方向向量
+
+                ##################debug##################
+                'obj_imu_acc_raw': obj_imu_acc.float(), # [seq, 1, 3]
+                'obj_trans_raw': obj_trans.float(), # [seq, 3]
+                'obj_vel_raw': torch.cat([torch.zeros_like(obj_vel[:1]), (obj_trans[1:] - obj_trans[:-1]) * FRAME_RATE], dim=0).float(), # [seq, 3]
             }
 
             return result
@@ -462,3 +632,5 @@ class IMUDataset(Dataset):
             traceback.print_exc() # 打印详细错误
             # 返回包含正确键但值为默认值的字典，以避免后续代码出错
             return 
+
+

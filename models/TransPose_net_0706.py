@@ -236,14 +236,23 @@ class TransPoseNet(torch.nn.Module):
 
         # --- 处理 IMU 数据 ---
         human_imu_flat_seq = human_imu.reshape(batch_size, seq_len, -1) # [bs, seq, num_imus*imu_dim]
-        obj_imu_flat_seq = obj_imu.reshape(batch_size, seq_len, -1) # [bs, seq, 1*imu_dim]
+        if obj_imu is not None:
+            obj_imu_flat_seq = obj_imu.reshape(batch_size, seq_len, -1) # [bs, seq, 1*imu_dim]
+        else:
+            obj_imu_flat_seq = torch.zeros(batch_size, seq_len, self.imu_dim).to(self.device)
         imu_data = torch.cat([human_imu_flat_seq, obj_imu_flat_seq], dim=2) # [bs, seq, n_imu]
 
         # --- 处理第一帧状态信息 ---
         motion_start = motion[:, 0].reshape(batch_size, -1) # [bs, num_joints * joint_dim]
         root_pos_start = root_pos[:, 0]                   # [bs, 3]
-        obj_rot_start = obj_rot[:, 0]                 # [bs, 6]
-        obj_trans_start = obj_trans[:, 0]             # [bs, 3]
+        if obj_rot is not None:
+            obj_rot_start = obj_rot[:, 0]                 # [bs, 6]
+        else:
+            obj_rot_start = torch.zeros(batch_size, 6).to(self.device)
+        if obj_trans is not None:
+            obj_trans_start = obj_trans[:, 0]             # [bs, 3]
+        else:
+            obj_trans_start = torch.zeros(batch_size, 3).to(self.device)
 
         initial_state_flat = torch.cat([
             motion_start,

@@ -33,8 +33,7 @@ def merge_file(args):
     # 添加调试模式参数
     cfg.debug = args.debug
     if args.debug:
-        cfg.epochs = 1
-        cfg.batch_size = 1
+        cfg.batch_size = 2
     # 保存配置文件路径
     cfg.cfg_file = args.cfg
     

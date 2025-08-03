@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader
 from datetime import datetime
 
 from dataloader.dataloader import IMUDataset
-from models.do_train_imu_TransPose import do_train_imu_TransPose, load_transpose_model
-# from models.do_train_imu_TransPose_humanOnly import do_train_imu_TransPose_humanOnly, load_transpose_model_humanOnly
+# from models.do_train_imu_TransPose import do_train_imu_TransPose, load_transpose_model
+from models.do_train_imu_TransPose_simpleObjT import do_train_imu_TransPose, load_transpose_model
 from utils.parser_util import get_args, merge_file
 
 
@@ -29,6 +29,14 @@ def create_staged_dataloaders(cfg, stage_info):
     """
     datasets = stage_info['datasets']
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 从阶段配置中获取特定的超参数，如果没有则使用全局默认值
+    stage_batch_size = stage_info.get('batch_size', getattr(cfg, 'batch_size', 50))
+    stage_num_workers = stage_info.get('num_workers', getattr(cfg, 'num_workers', 12))
+    
+    print(f"阶段 '{stage_info['name']}' 超参数:")
+    print(f"  batch_size: {stage_batch_size}")
+    print(f"  num_workers: {stage_num_workers}")
     
     # 根据阶段确定数据路径
     train_paths = []
@@ -164,9 +172,9 @@ def create_staged_dataloaders(cfg, stage_info):
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg.batch_size,
+        batch_size=stage_batch_size,  # 使用阶段特定的batch_size
         shuffle=True,
-        num_workers=cfg.num_workers,
+        num_workers=stage_num_workers,  # 使用阶段特定的num_workers
         pin_memory=True,
         drop_last=True
     )
@@ -187,9 +195,9 @@ def create_staged_dataloaders(cfg, stage_info):
         if len(test_dataset) > 0:
             test_loader = DataLoader(
                 test_dataset,
-                batch_size=cfg.batch_size,
+                batch_size=stage_batch_size,  # 测试也使用阶段特定的batch_size
                 shuffle=False,
-                num_workers=cfg.num_workers,
+                num_workers=stage_num_workers,  # 使用阶段特定的num_workers
                 pin_memory=True,
                 drop_last=False
             )
@@ -205,7 +213,7 @@ def create_staged_dataloaders(cfg, stage_info):
 def main():
     """
     TransPose模型主训练函数：解析参数、准备数据集、初始化训练
-    支持分阶段训练和数据集切换
+    支持分阶段训练和数据集切换，以及模块化训练
     """
     # 解析命令行参数
     cfg_args = get_args()
@@ -262,6 +270,14 @@ def main():
     cfg.save_dir = save_dir if not cfg.debug else None
     if not cfg.debug:
         os.makedirs(save_dir, exist_ok=True)
+        # 创建modules子目录用于保存单个模块
+        modules_dir = os.path.join(save_dir, "modules")
+        os.makedirs(modules_dir, exist_ok=True)
+    
+    # 检查是否启用模块化训练
+    modular_training_config = None
+    if hasattr(cfg, 'staged_training') and cfg.staged_training.get('enabled', False):
+        modular_training_config = cfg.staged_training.get('modular_training', {})
     
     # 打印训练配置
     print("=" * 50)
@@ -276,7 +292,11 @@ def main():
     # 检查是否启用分阶段训练
     staged_training_config = getattr(cfg, 'staged_training', None)
     if staged_training_config and staged_training_config.get('enabled', False):
-        print("\n分阶段训练已启用:")
+        if modular_training_config and modular_training_config.get('enabled', False):
+            start_stage_name = modular_training_config.get('start_from_stage', 'velocity_contact')
+            print(f"\n启用模块化分阶段训练，从阶段 '{start_stage_name}' 开始:")
+        else:
+            print("\n分阶段训练已启用:")
         
         # 根据是否为debug模式显示相应的stages
         if cfg.debug and 'debug_stages' in staged_training_config:
@@ -291,23 +311,8 @@ def main():
         # 分阶段训练模式
         print("\n开始分阶段训练...")
         
-        # 检查是否从预训练模型继续训练
-        model = None
-        optimizer = None
-        if hasattr(cfg, 'pretrained_checkpoint') and cfg.pretrained_checkpoint:
-            pretrained_path = cfg.pretrained_checkpoint
-            print(f"从预训练模型继续训练: {pretrained_path}")
-            model = load_transpose_model(cfg, pretrained_path)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        
-        # 创建一个包装函数来处理分阶段数据加载
-        def staged_train_wrapper():
-            # 这个函数将在训练过程中被调用，根据不同阶段提供不同的数据加载器
-            # 实际的数据加载器创建将在do_train_imu_TransPose中处理
-            return None, None
-        
         # 开始分阶段训练（数据加载器将在训练过程中动态创建）
-        model, optimizer = do_train_imu_TransPose(cfg, None, None, model=model, optimizer=optimizer)
+        model, optimizer = do_train_imu_TransPose(cfg, None, None, model=None, optimizer=None)
         
     else:
         # 传统训练模式：使用固定的数据集

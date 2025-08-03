@@ -7,749 +7,1028 @@ import yaml
 from aitviewer.renderables.meshes import Meshes
 from aitviewer.renderables.point_clouds import PointClouds
 from aitviewer.viewer import Viewer
+from aitviewer.scene.camera import Camera
+from moderngl_window.context.base import KeyModifiers
 import pytorch3d.transforms as transforms
 import trimesh
 
-# 导入SMPLH模型处理库
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 from easydict import EasyDict as edict
 
-# 导入数据加载相关库
-# from torch.utils.data import DataLoader # 不再需要
-# from dataloader.dataloader import IMUDataset # 不再需要，因为我们在本地处理
+from torch.utils.data import DataLoader
+from dataloader.dataloader import IMUDataset # 从 eval.py 引入
 
-# 导入所有需要的模型
-from models.DiT_model import MotionDiffusion
-# 添加对 TransPose 模型的支持
-from models.do_train_imu_TransPose import load_transpose_model
-from models.do_train_imu_TransPose_humanOnly import load_transpose_model_humanOnly
+# 导入模型相关 - 根据需要选择正确的模型加载方式
+# from models.DiT_model import MotionDiffusion # 如果要用 DiT
+from models.TransPose_net import TransPoseNet # 明确使用 TransPose
+from models.do_train_imu_TransPose import load_transpose_model # 或者使用这个加载函数
 
-# 加载配置
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+import imgui
+from aitviewer.renderables.spheres import Spheres
 
-vis_config = load_config('configs/vis.yaml')
-
-# 加载SMPLH模型
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-body_model = BodyModel(bm_fname=vis_config.get('bm_path', 'body_models/smplh/neutral/model.npz'), 
-                       num_betas=16, model_type='smplh').to(device)
 
 # --- 定义 Z-up 到 Y-up 的旋转矩阵 ---
-R_yup = torch.tensor([[1.0, 0.0, 0.0], 
-                    [0.0, 0.0, 1.0], 
-                    [0.0, -1.0, 0.0]], dtype=torch.float32) # -90度绕X轴
-# --- 结束定义 ---
+R_yup = torch.tensor([[1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0],
+                      [0.0, -1.0, 0.0]], dtype=torch.float32)
 
-def find_pt_files(directory):
-    """查找目录下所有.pt文件"""
-    pt_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.pt'):
-                pt_files.append(os.path.join(root, file))
-    return pt_files
+# R_yup = torch.tensor([[1.0, 0.0, 0.0],
+#                       [0.0, 1.0, 0.0],
+#                       [0.0, 0.0, 1.0]], dtype=torch.float32)
 
-def process_loaded_data(seq_data, normalize=True):
+# === 辅助函数 (来自 eval.py 和 vis.py) ===
+
+def load_config(config_path):
+    """加载配置文件"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    config = edict(config)
+    return config
+
+def load_smpl_model(smpl_model_path, device):
+    """加载 SMPL 模型 using human_body_prior"""
+    print(f"Loading SMPL model from: {smpl_model_path}")
+    if not os.path.exists(smpl_model_path):
+        print(f"Error: SMPL model path not found: {smpl_model_path}")
+        raise FileNotFoundError(f"SMPL model not found at {smpl_model_path}")
+    smpl_model = BodyModel(
+        bm_fname=smpl_model_path,
+        num_betas=16,
+        model_type='smplh' # 明确使用 smplh
+    ).to(device)
+    return smpl_model
+
+def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu'):
     """
-    处理从 .pt 文件直接加载的原始数据，模拟 DataLoader 的行为。
-    Args:
-        seq_data: 从 torch.load() 加载的原始字典。
-        normalize: 是否对 IMU 数据进行归一化。 
-    Returns:
-        处理后的数据字典。
-    """
-    processed = {}
-    seq_len = seq_data.get("rotation_local_full_gt_list", torch.empty(0)).shape[0]
-    if seq_len == 0:
-        print("警告：序列长度为 0")
-        return {} # 返回空字典或引发错误
-
-    # 提取基本数据
-    processed["root_pos"] = seq_data.get("position_global_full_gt_world", torch.zeros(seq_len, 1, 3))[:, 0, :] # [T, 3]
-    processed["motion"] = seq_data.get("rotation_local_full_gt_list", torch.zeros(seq_len, 132)) # [T, 132]
-    processed["head_global_trans"] = seq_data["head_global_trans"] # [T, 4, 4]
-
-    # 提取和组合人体 IMU
-    human_imu = None
-    if "imu_global_full_gt" in seq_data:
-        human_imu_acc = seq_data["imu_global_full_gt"].get("accelerations", None)
-        # 修改：读取方向而不是角速度
-        human_imu_ori = seq_data["imu_global_full_gt"].get("orientations", None)
-        # 将方向矩阵展平为 9D 向量
-        human_imu_ori_flat = human_imu_ori.reshape(seq_len, -1, 9) # [T, num_imus, 9]
-        # 将加速度 (3D) 和展平的方向 (9D) 拼接
-        human_imu = torch.cat([human_imu_acc, human_imu_ori_flat], dim=-1)  # [T, num_imus, 12]
-    else:
-        num_imus = 6 # 假设默认 6 个 IMU
-        # 修改：调整默认形状以匹配 acc (3) + ori_flat (9) = 12
-        human_imu = torch.zeros(seq_len, num_imus, 12)
-    
-    # 处理物体数据
-    has_object = "obj_trans" in seq_data and seq_data["obj_trans"] is not None
-    processed["has_object"] = has_object
-
-    obj_imu = None
-
-    if has_object:
-        obj_scale = seq_data.get("obj_scale", None)
-        obj_trans = seq_data.get("obj_trans", None)
-        obj_rot = seq_data.get("obj_rot", None)
-
-        if "obj_imu" in seq_data:
-            obj_imu_acc = seq_data["obj_imu"].get("accelerations", None)
-            # 获取物体IMU方向 - 应该是6D表示
-            obj_imu_ori = seq_data["obj_imu"].get("orientations", None)
-            obj_imu_ori_flat = obj_imu_ori.reshape(seq_len, -1, 9) # [T, num_imus, 9]
-            # 将加速度 (3D) 和 6D旋转表示 拼接
-            obj_imu = torch.cat([obj_imu_acc, obj_imu_ori_flat], dim=-1) # [T, num_imus, 12]
-        else:
-            # 修改：调整默认形状以匹配 acc (3) + ori (6) = 9
-            obj_imu = torch.zeros(seq_len, 1, 9)
-
-    # 注意：归一化逻辑
-    if normalize:
-        # 对人体IMU归一化 - 现在已经是9D数据(加速度3D + 旋转6D)
-        if human_imu is not None:
-            T, num_imus, _ = human_imu.shape
-            # 分离加速度和旋转
-            human_acc = human_imu[..., :3]  # [T, num_imus, 3]
-            human_ori = human_imu[..., 3:12].reshape(T, -1, 3, 3)  # [T, num_imus, 3, 3]
-            
-            # 对加速度归一化 - 减去第一帧
-            norm_human_acc = human_acc - human_acc[0:1]
-            
-            # 对于6D旋转表示，归一化方法需要先转换回矩阵，然后应用相对旋转
-            norm_human_ori = torch.zeros(T, num_imus, 6)
-            
-            for i in range(num_imus):
-                # 将6D转换为旋转矩阵
-                human_ori_mat = human_ori[:, i]  # [T, 3, 3]
-                
-                # 获取第一帧的旋转矩阵并计算其逆
-                first_orient = human_ori_mat[0]  # [3, 3]
-                first_orient_inv = torch.inverse(first_orient)  # [3, 3]
-                
-                # 计算相对旋转
-                rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), human_ori_mat)  # [T, 3, 3]
-                
-                # 转回6D表示
-                rel_rotations_6d = transforms.matrix_to_rotation_6d(rel_rotations)  # [T, 6]
-                norm_human_ori[:, i] = rel_rotations_6d
-            
-            # 重新组合IMU数据
-            processed_human_imu = torch.cat([norm_human_acc, norm_human_ori], dim=-1)  # [T, num_imus, 9]
-        else:
-            processed_human_imu = None
-            
-        # 对物体IMU做相同处理    
-        if obj_imu is not None and has_object:
-            # 分离加速度和旋转
-            obj_acc = obj_imu[..., :3]  # [T, 1, 3]
-            obj_ori = obj_imu[..., 3:12]  # [T, 1, 9]
-            
-            # 对加速度归一化
-            norm_obj_acc = obj_acc - obj_acc[0:1]
-            
-            # 对旋转归一化
-            T = obj_acc.shape[0]
-            obj_ori_mat = obj_ori.reshape(T, 3, 3)
-            first_orient = obj_ori_mat[0]  # [3, 3]
-            first_orient_inv = torch.inverse(first_orient)  # [3, 3]
-            rel_rotations = torch.matmul(first_orient_inv.unsqueeze(0), obj_ori_mat)  # [T, 3, 3]
-            rel_rotations_6d = transforms.matrix_to_rotation_6d(rel_rotations)  # [T, 6]
-            
-            # 重新组合
-            processed_obj_imu = torch.cat([norm_obj_acc, rel_rotations_6d.reshape(T, 1, 6)], dim=-1)  # [T, 1, 9]
-        else:
-            processed_obj_imu = None
-    else:
-        processed_human_imu = human_imu.float() if human_imu is not None else None
-        processed_obj_imu = obj_imu.float() if obj_imu is not None else None
-    
-    processed["human_imu"] = processed_human_imu
-    processed["root_pos"] = processed["root_pos"].float()
-    processed["motion"] = processed["motion"].float()
-
-    if has_object:
-        processed["obj_imu"] = processed_obj_imu
-        processed["obj_scale"] = obj_scale
-        processed["obj_trans"] = obj_trans
-        processed["obj_rot"] = obj_rot
-        processed["obj_name"] = seq_data.get("obj_name", "unknown")
-        processed["gender"] = seq_data.get("gender", "neutral") # 或其他默认值
-        # 转换其他字段为 float
-        if processed["obj_trans"] is not None:
-            processed["obj_trans"] = processed["obj_trans"].float()
-        if processed["obj_rot"] is not None:
-            processed["obj_rot"] = processed["obj_rot"].float()
-        if processed["obj_scale"] is not None:
-            processed["obj_scale"] = processed["obj_scale"].float() # 确保 scale 也是 float
-
-    return processed
-
-def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None):
-    """
-    应用变换到物体网格 (OMOMO 方式)
+    应用变换到物体网格 (遵循 hand_foot_dataset.py 的逻辑: Rotate -> Scale -> Translate)
 
     参数:
         obj_mesh_path: 物体网格路径
-        obj_rot: 旋转矩阵 [T, 3, 3]
-        obj_trans: 平移向量 [T, 3] (不含缩放)
-        scale: 缩放因子 [T] 或 [T, 1] 或 [T, 1, 1]
+        obj_rot: 旋转矩阵 [T, 3, 3] (torch tensor on device)
+        obj_trans: 平移向量 [T, 3] (torch tensor on device)
+        scale: 缩放因子 [T] (torch tensor on device)
 
     返回:
-        transformed_obj_verts: 变换后的顶点 [T, Nv, 3]
-        obj_mesh_faces: 物体网格的面 [Nf, 3]
+        transformed_obj_verts: 变换后的顶点 [T, Nv, 3] (torch tensor on device)
+        obj_mesh_faces: 物体网格的面 [Nf, 3] (numpy array)
     """
     try:
         mesh = trimesh.load_mesh(obj_mesh_path)
-        obj_mesh_verts = np.asarray(mesh.vertices) # Nv X 3
+        obj_mesh_verts_np = np.asarray(mesh.vertices) # Nv X 3
         obj_mesh_faces = np.asarray(mesh.faces) # Nf X 3
 
-        ori_obj_verts = torch.from_numpy(obj_mesh_verts).float()[None].repeat(obj_trans.shape[0], 1, 1) # T X Nv X 3
-
-        # --- 首先应用缩放 (如果提供) ---
+        # 确保输入在正确的设备上且为 float 类型
+        obj_mesh_verts = torch.from_numpy(obj_mesh_verts_np).float().to(device) # Nv X 3
+        seq_rot_mat = obj_rot.float().to(device) # T X 3 X 3
+        seq_trans = obj_trans.float().to(device) # T X 3
         if scale is not None:
-            # 确保 scale 是 tensor 并且在正确的 device 上
-            if not torch.is_tensor(scale):
-                scale_tensor = torch.tensor(scale).float()
-            else:
-                scale_tensor = scale.float()
-            scale_tensor = scale_tensor.to(ori_obj_verts.device)
+            seq_scale = scale.float().to(device) # T
+        else:
+            seq_scale = None
 
-            # 确保 scale_tensor 可以广播: [T, 1, 1]
-            if scale_tensor.dim() == 1:
-                 scale_tensor = scale_tensor.unsqueeze(-1).unsqueeze(-1) # T -> T x 1 x 1
-            elif scale_tensor.dim() == 2 and scale_tensor.shape[1] == 1:
-                 scale_tensor = scale_tensor.unsqueeze(-1) # T x 1 -> T x 1 x 1
-            elif scale_tensor.dim() == 3 and scale_tensor.shape[1:] == (1, 1):
-                 pass # 已经是 T x 1 x 1
-            else:
-                 print(f"警告: scale 维度无法处理 {scale_tensor.shape}, 将不应用缩放。")
-                 scale_tensor = None # 重置以跳过缩放
+        T = seq_trans.shape[0]
+        ori_obj_verts = obj_mesh_verts[None].repeat(T, 1, 1) # T X Nv X 3
 
-            if scale_tensor is not None:
-                 ori_obj_verts = ori_obj_verts * scale_tensor
-        # --- 结束缩放应用 ---
+        # --- 遵循参考代码的顺序：Rotate -> Scale -> Translate ---
+        
+        # 1. 旋转 (Rotate)
+        verts_rotated = torch.bmm(seq_rot_mat, ori_obj_verts.transpose(1, 2)) # T X 3 X Nv
 
-        seq_rot_mat = torch.tensor(obj_rot).float() # T X 3 X 3
-        seq_trans = torch.tensor(obj_trans).float() # T X 3 (不含缩放)
+        # 2. 缩放 (Scale)
+        if seq_scale is not None:
+            scale_factor = seq_scale.unsqueeze(-1).unsqueeze(-1) # T X 1 X 1
+            verts_scaled = scale_factor * verts_rotated
+        else:
+            verts_scaled = verts_rotated # No scaling
+        # Result shape: T X 3 X Nv
 
-        # 确保trans的维度正确
-        if seq_trans.dim() == 1:
-             if seq_trans.shape[0] == obj_rot.shape[0] * 3:
-                 seq_trans = seq_trans.reshape(obj_rot.shape[0], 3)
-             else:
-                 print(f"警告：物体平移维度无法解析 {seq_trans.shape}，将使用零向量")
-                 seq_trans = torch.zeros((seq_rot_mat.shape[0], 3), dtype=torch.float32)
-        elif seq_trans.shape[1] != 3:
-             print(f"警告：物体平移维度错误 {seq_trans.shape}，将使用零向量")
-             seq_trans = torch.zeros((seq_rot_mat.shape[0], 3), dtype=torch.float32)
+        # 3. 平移 (Translate)
+        trans_vector = seq_trans.unsqueeze(-1) # T X 3 X 1
+        verts_translated = verts_scaled + trans_vector # T X 3 X Nv
 
-        # seq_trans = seq_trans[:, :, None]  # T X 3 X 1
+        # 4. Transpose back to T X Nv X 3
+        transformed_obj_verts = verts_translated.transpose(1, 2)
 
-        # --- 应用旋转和平移到 (可能) 已缩放的顶点 ---
-        transformed_obj_verts = seq_rot_mat.bmm(ori_obj_verts.transpose(1, 2)) + seq_trans
-        transformed_obj_verts = transformed_obj_verts.transpose(1, 2) # T X Nv X 3
     except Exception as e:
-        print(f"应用变换到物体几何体失败: {e}")
-        transformed_obj_verts = torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3))
+        print(f"应用变换到物体几何体失败 for {obj_mesh_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return dummy data on the correct device
+        transformed_obj_verts = torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device)
         obj_mesh_faces = np.zeros((1, 3), dtype=np.int64)
 
     return transformed_obj_verts, obj_mesh_faces
 
-# --- (保留 merge_two_parts) ---
-def merge_two_parts(verts_list, faces_list):
-    """
-    合并两个网格部分
-    
-    参数:
-        verts_list: 顶点列表，每个元素形状为 [T, Nv, 3]
-        faces_list: 面列表，每个元素形状为 [Nf, 3]
-        
-    返回:
-        merged_verts: 合并后的顶点 [T, Nv_total, 3]
-        merged_faces: 合并后的面 [Nf_total, 3]
-    """
+
+def merge_two_parts(verts_list, faces_list, device='cpu'):
+    """ 合并两个网格部分 """
     verts_num = 0
     merged_verts_list = []
     merged_faces_list = []
     for p_idx in range(len(verts_list)):
-        part_verts = verts_list[p_idx] # T X Nv X 3 
-        part_faces = torch.from_numpy(faces_list[p_idx]) # Nf X 3 
+        part_verts = verts_list[p_idx].to(device) # T X Nv X 3
+        part_faces = torch.from_numpy(faces_list[p_idx]).long().to(device) # Nf X 3
 
-        if p_idx == 0:
-            merged_verts_list.append(part_verts)
-            merged_faces_list.append(part_faces)
-        else:
-            merged_verts_list.append(part_verts)
-            merged_faces_list.append(part_faces+verts_num)
-
-        verts_num += part_verts.shape[1] 
+        merged_verts_list.append(part_verts)
+        merged_faces_list.append(part_faces + verts_num)
+        verts_num += part_verts.shape[1]
 
     merged_verts = torch.cat(merged_verts_list, dim=1)
     merged_faces = torch.cat(merged_faces_list, dim=0).cpu().numpy()
-
     return merged_verts, merged_faces
 
-# --- 恢复 load_object_geometry 以接收 obj_scale ---
-def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_bottom_trans=None, obj_bottom_rot=None):
-    """
-    加载物体几何体并应用变换 (OMOMO 方式)
-
-    参数:
-        obj_name: 物体名称
-        obj_rot: 旋转矩阵
-        obj_trans: 平移向量(不含缩放)
-        obj_scale: 物体缩放因子
-        obj_bottom_trans: 底部平移向量（不含缩放，除非 process_loaded_data 中处理了）
-        obj_bottom_rot: 底部旋转矩阵
-    """
+def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_bottom_trans=None, obj_bottom_rot=None, obj_geo_root='./dataset/captured_objects', device='cpu'):
+    """ 加载物体几何体并应用变换 (OMOMO 方式) """
     if obj_name is None:
         print("警告: 物体名称为 None，无法加载几何体。")
-        return torch.zeros((1, 1, 3)), np.zeros((1, 3), dtype=np.int64)
+        return torch.zeros((1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
 
-    obj_geo_root_folder = os.path.join('./dataset/captured_objects')
-    obj_mesh_path = os.path.join(obj_geo_root_folder, f"{obj_name}_cleaned_simplified.obj")
+    # Ensure transformations are tensors on the correct device
+    obj_rot = torch.as_tensor(obj_rot, dtype=torch.float32, device=device)
+    obj_trans = torch.as_tensor(obj_trans, dtype=torch.float32, device=device)
+    if obj_scale is not None:
+        obj_scale = torch.as_tensor(obj_scale, dtype=torch.float32, device=device)
+    if obj_bottom_rot is not None:
+        obj_bottom_rot = torch.as_tensor(obj_bottom_rot, dtype=torch.float32, device=device)
+    if obj_bottom_trans is not None:
+        obj_bottom_trans = torch.as_tensor(obj_bottom_trans, dtype=torch.float32, device=device)
 
-    # 检查是否是有两部分的物体
-    # 假设如果存在 bottom_trans，那么也应该存在 bottom_rot (并且 process_loaded_data 提供了它们)
+
+    obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj")
     two_parts = obj_name in ["vacuum", "mop"] and obj_bottom_trans is not None and obj_bottom_rot is not None
 
     if two_parts:
-        top_obj_mesh_path = os.path.join(obj_geo_root_folder, f"{obj_name}_cleaned_simplified_top.obj")
-        bottom_obj_mesh_path = os.path.join(obj_geo_root_folder, f"{obj_name}_cleaned_simplified_bottom.obj")
+        top_obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified_top.obj")
+        bottom_obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified_bottom.obj")
 
         if not os.path.exists(top_obj_mesh_path) or not os.path.exists(bottom_obj_mesh_path):
              print(f"警告: 找不到物体 {obj_name} 的两部分几何文件。将尝试加载整体文件。")
              two_parts = False
-             obj_mesh_path = os.path.join(obj_geo_root_folder, f"{obj_name}_cleaned_simplified.obj")
+             obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj") # Fallback
         else:
-            # --- 传递 scale 给 apply_transformation_to_obj_geometry ---
-            # 假设 bottom part 使用与 top part 相同的 scale
-            top_obj_mesh_verts, top_obj_mesh_faces = apply_transformation_to_obj_geometry(top_obj_mesh_path,
-                                                                                        obj_rot,
-                                                                                        obj_trans,
-                                                                                        scale=obj_scale)
-            bottom_obj_mesh_verts, bottom_obj_mesh_faces = apply_transformation_to_obj_geometry(bottom_obj_mesh_path,
-                                                                                             obj_bottom_rot,
-                                                                                             obj_bottom_trans, # 假设已缩放 (来自 process_loaded_data)
-                                                                                             scale=obj_scale) # 不再对底部应用 scale? 或使用 bottom_scale?
-                                                                                             # OMOMO 原始代码似乎在这里也传递了 scale，我们先保持一致
-                                                                                             # scale=obj_scale) # 假设底部也用相同 scale
-            # 注意：如果 bottom_trans 确实需要单独的 scale，这里的逻辑可能需要调整以匹配 OMOMO 的精确实现
-
-            obj_mesh_verts, obj_mesh_faces = merge_two_parts([top_obj_mesh_verts, bottom_obj_mesh_verts],
-                                                            [top_obj_mesh_faces, bottom_obj_mesh_faces])
+            top_obj_mesh_verts, top_obj_mesh_faces = apply_transformation_to_obj_geometry(top_obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
+            # Assume bottom uses the same scale, pass bottom transforms
+            bottom_obj_mesh_verts, bottom_obj_mesh_faces = apply_transformation_to_obj_geometry(bottom_obj_mesh_path, obj_bottom_rot, obj_bottom_trans, scale=obj_scale, device=device)
+            obj_mesh_verts, obj_mesh_faces = merge_two_parts([top_obj_mesh_verts, bottom_obj_mesh_verts], [top_obj_mesh_faces, bottom_obj_mesh_faces], device=device)
 
     if not two_parts:
         if not os.path.exists(obj_mesh_path):
              print(f"警告: 找不到物体几何文件: {obj_mesh_path}")
-             return torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3)), np.zeros((1, 3), dtype=np.int64)
-
-        # --- 传递 scale 给 apply_transformation_to_obj_geometry ---
-        obj_mesh_verts, obj_mesh_faces = apply_transformation_to_obj_geometry(obj_mesh_path,
-                                                                          obj_rot,
-                                                                          obj_trans,
-                                                                          scale=obj_scale)
+             return torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
+        obj_mesh_verts, obj_mesh_faces = apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
 
     return obj_mesh_verts, obj_mesh_faces
 
-# --- 修改 visualize_human_and_objects 以使用新的 scale/trans 逻辑 ---
-def visualize_human_and_objects(args, model, data, show_objects=True):
-    """
-    可视化人体和物体的真值和预测值
-    
-    参数:
-        model: EgoIMU模型实例，如果为None则从config.model_path加载
-        cfg: 配置字典 (来自 diffusion_config)
-    """
 
-    if data is None:
-        print("错误：未能加载任何数据。")
-        return
+def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False):
+    """ 在 aitviewer 场景中可视化单个批次的数据 (真值和预测) """
+    # --- Revised Clearing Logic (Attempt 5 - Using Scene.remove) ---
+    try:
+        # Use collect_nodes to get all nodes currently managed by the scene
+        # We filter based on name to identify previously added GT/Pred meshes and all contact indicators
+        nodes_to_remove = [
+            node for node in viewer.scene.collect_nodes()
+            if hasattr(node, 'name') and node.name is not None and 
+               (node.name.startswith("GT-") or 
+                node.name.startswith("Pred-") or
+                node.name == "GT-LHandContact" or  # 明确手部接触名称
+                node.name == "GT-RHandContact" or  # 明确手部接触名称
+                node.name == "ObjContactIndicator" or # 物体运动指示器名称
+                node.name == "Pred-LHandContact" or # 预测左手接触
+                node.name == "Pred-RHandContact" or # 预测右手接触
+                node.name == "Pred-ObjContactIndicator" or # 预测物体接触
+                node.name == "GT-LFootContact" or  # 真值左脚接触
+                node.name == "GT-RFootContact" or  # 真值右脚接触
+                node.name == "Pred-LFootContact" or # 预测左脚接触
+                node.name == "Pred-RFootContact") # 预测右脚接触
+        ]
 
-    v = Viewer(fps=1) # Viewer 初始化
+        # Call viewer.scene.remove() for each identified node
+        removed_count = 0
+        if nodes_to_remove:
+            # print(f"Attempting to remove {len(nodes_to_remove)} nodes from the scene.")
+            for node_to_remove in nodes_to_remove:
+                try:
+                    # print(f"  Removing: {node_to_remove.name}")
+                    viewer.scene.remove(node_to_remove)
+                    removed_count += 1
+                except Exception as e:
+                    # This might happen if the node was already removed or detached somehow
+                    print(f"Error removing node '{node_to_remove.name}' from scene: {e}")
+            # print(f"Successfully removed {removed_count} nodes.")
+        # else:
+            # print("No old GT/Pred nodes found to remove.")
 
-    # 处理真值数据 (现在使用处理后的 'data' 字典)
-    has_gt = False
-    verts_gt_yup = None
-    faces_gt = None
-    if 'motion' in data and data['motion'][0].numel() > 0: # 检查 motion 是否有效
-        has_gt = True
-        motion = data['motion'][0].to(device)  # [T, 132]
-        gt_root_pos = data['root_pos'][0].to(device)  # [T, 3]
-        
-        # --- (SMPLH 模型输入准备 - 这部分逻辑不变) ---
-        gt_rot_matrices = transforms.rotation_6d_to_matrix(motion.reshape(-1, 22, 6))  # [T, 22, 3, 3]
-        gt_root_orient_mat = gt_rot_matrices[:, 0, :, :].to(device)
-        gt_pose_body_mat = gt_rot_matrices[:, 1:, :, :].reshape(-1, 21, 3, 3).to(device)
-        gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat) # [T, 3]
-        gt_pose_body_axis = transforms.matrix_to_axis_angle(gt_pose_body_mat.reshape(-1, 3, 3)).reshape(motion.shape[0], -1) # [T, 63]
+    except AttributeError as e:
+        print(f"Error accessing scene nodes or methods (maybe collect_nodes or remove doesn't exist?): {e}")
+    except Exception as e:
+        print(f"Error during scene clearing: {e}")
+    # --- End Revised Clearing Logic ---
+
+    with torch.no_grad():
+        bs = 0
+        # --- 1. 准备数据 ---
+        gt_root_pos = batch["root_pos"].to(device)         # [bs, T, 3]
+        gt_motion = batch["motion"].to(device)           # [bs, T, 132]
+        human_imu = batch["human_imu"].to(device)        # [bs, T, num_imus, 9/12]
+        # head_global_rot_start = batch["head_global_trans_start"][..., :3, :3].to(device)  # [bs, 1, 3, 3]
+        # head_global_pos_start = batch["head_global_trans_start"][..., :3, 3].to(device)  # [bs, 1, 3]
+        root_global_pos_start = batch["root_pos_start"].to(device)  # [bs, 3]
+        root_global_rot_start = batch["root_rot_start"].to(device)  # [bs, 3, 3]
+        obj_imu = batch.get("obj_imu", None)             # [bs, T, 1, 9/12] or None
+        gt_obj_trans = batch.get("obj_trans", None)      # [bs, T, 3] or None
+        gt_obj_rot_6d = batch.get("obj_rot", None)       # [bs, T, 6] or None
+        obj_name = batch.get("obj_name", [None])[0]      # 物体名称 (取列表第一个)
+        gt_obj_scale = batch.get("obj_scale", None)      # [bs, T] or [bs, T, 1]? Check dataloader
+        gt_obj_bottom_trans = batch.get("obj_bottom_trans", None) # [bs, T, 3] or None
+        gt_obj_bottom_rot = batch.get("obj_bottom_rot", None)     # [bs, T, 3, 3] or None
+
+        # 获取用于可视化的接触标志 (由dataloader预处理)
+        lhand_contact_viz_seq = batch.get("lhand_contact") [bs].to(device)
+        rhand_contact_viz_seq = batch.get("rhand_contact")[bs].to(device)
+        obj_contact_viz_seq = batch.get("obj_contact")[bs].to(device)
+
+        if obj_imu is not None: obj_imu = obj_imu.to(device)
+        if gt_obj_trans is not None: gt_obj_trans = gt_obj_trans.to(device)
+        if gt_obj_rot_6d is not None: gt_obj_rot_6d = gt_obj_rot_6d.to(device)
+        if gt_obj_scale is not None: gt_obj_scale = gt_obj_scale.to(device)
+        if gt_obj_bottom_trans is not None: gt_obj_bottom_trans = gt_obj_bottom_trans.to(device)
+        if gt_obj_bottom_rot is not None: gt_obj_bottom_rot = gt_obj_bottom_rot.to(device)
+
+        # 仅处理批次中的第一个序列 (bs=0)
+        T = gt_motion.shape[1]
+        gt_root_pos_seq = gt_root_pos[bs]           # [T, 3]
+        gt_motion_seq = gt_motion[bs]             # [T, 132]
+        # head_global_rot_start = head_global_rot_start[bs]  # [1, 3, 3]
+        # head_global_pos_start = head_global_pos_start[bs]  # [1, 3]
+        root_global_rot_start = root_global_rot_start[bs]  # [3, 3]
+        root_global_pos_start = root_global_pos_start[bs]  # [3]
+
+        # --- 2. 获取真值 SMPL ---
+        gt_rot_matrices = transforms.rotation_6d_to_matrix(gt_motion_seq.reshape(T, 22, 6)) # [T, 22, 3, 3]
+        gt_root_orient_mat_norm = gt_rot_matrices[:, 0]                         # [T, 3, 3]
+        gt_pose_body_mat = gt_rot_matrices[:, 1:].reshape(T * 21, 3, 3)    # [T*21, 3, 3]
+        # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat_norm) # [T, 3]
+        gt_pose_body_axis = transforms.matrix_to_axis_angle(gt_pose_body_mat).reshape(T, -1) # [T, 63]
+
+        # Denormalization
+        # gt_root_orient_mat = head_global_rot_start @ gt_root_orient_mat_norm
+        # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(T, 3)
+        # gt_root_pos_seq = (head_global_rot_start @ gt_root_pos_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
+
+        gt_root_orient_mat = root_global_rot_start @ gt_root_orient_mat_norm
+        gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(T, 3)
+        gt_root_pos_seq = (root_global_rot_start @ gt_root_pos_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+        # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat_norm)
+
         gt_smplh_input = {
             'root_orient': gt_root_orient_axis,
             'pose_body': gt_pose_body_axis,
-            'trans': gt_root_pos
+            'trans': gt_root_pos_seq
         }
-        body_pose_gt = body_model(**gt_smplh_input)
-        verts_gt = body_pose_gt.v.detach().cpu()
-        faces_gt = body_model.f.detach().cpu().numpy() if isinstance(body_model.f, torch.Tensor) else body_model.f
-        # --- 结束 SMPLH 输入准备 ---
-    else:
-         print("警告：未找到有效的 'motion' 数据，无法显示真值人体。")
+        body_pose_gt = smpl_model(**gt_smplh_input)
+        verts_gt_seq = body_pose_gt.v                          # [T, Nv, 3]
+        faces_gt_np = smpl_model.f.cpu().numpy() if isinstance(smpl_model.f, torch.Tensor) else smpl_model.f
 
-    # 处理预测数据
-    has_pred = False
-    pred_obj_rot = None
-    verts_pred = None
+        # --- 3. 模型预测 ---
+        pred_motion_seq = None
+        pred_obj_rot_6d_seq = None
+        pred_obj_trans_seq = None # 现在模型会预测物体平移
+        pred_root_pos_seq = None
+        pred_lhand_contact_labels_seq = None
+        pred_rhand_contact_labels_seq = None
+        pred_obj_contact_labels_seq = None
 
-    if model is not None:
-        # 如果提供了模型，使用模型进行预测
-        try:
-            # --- 准备模型输入 (现在使用处理后的 'data' 字典) ---
-            # 应该使用 process_loaded_data 返回的规范化 IMU 数据
-            human_imu_input = data['human_imu'][0].to(device)  # [T, num_imus, 9]
-            # 检查并确保维度符合模型预期: [bs, seq, num_imus, 9] 和 [bs, seq, 1, 9]
-            if human_imu_input.dim() == 3: # 已经是 [T, num_imus, 9]
-                human_imu_input = human_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, num_imus, 9]
-            elif human_imu_input.dim() == 4: # 已经是 [1, T, num_imus, 9]
-                 pass # 维度正确
-            else:
-                 print(f"警告：human_imu 输入维度不正确: {human_imu_input.shape}")
-                 # 尝试修正或跳过预测
-                 raise ValueError("human_imu 维度错误")
+        # --- Define a visual offset for predicted elements ---
+        pred_offset = torch.tensor([0.0, 0.0, 0.0], device=device)
 
-            if data.get('has_object', [False])[0]:
-                obj_imu_input = data['obj_imu'][0].to(device)      # [T, 1, 9]
-                if obj_imu_input.dim() == 3: # 已经是 [T, 1, 9]
-                 obj_imu_input = obj_imu_input.unsqueeze(0) # 添加批次维度 -> [1, T, 1, 9]
-                elif obj_imu_input.dim() == 4: # 已经是 [1, T, 1, 9]
-                    pass # 维度正确
-                else:
-                    print(f"警告：obj_imu 输入维度不正确: {obj_imu_input.shape}")
-                    # 尝试修正或跳过预测
-                    raise ValueError("obj_imu 维度错误")
-
-            if args.use_transpose_humanOnly_model:
-                model_input = {
-                    "human_imu": human_imu_input
-                }
-            else:
-                model_input = {
-                    "human_imu": human_imu_input,
-                    "obj_imu": obj_imu_input
+        # 只有在非仅真值模式下才执行模型推理
+        if not vis_gt_only:
+            model_input = {
+                    "human_imu": human_imu,
+                    "motion": gt_motion,             # 新增
+                    "root_pos": gt_root_pos,           # 新增
                 }
             
-            # 如果有BPS特征，添加到输入中 (当前省略 BPS 处理)
-            # if 'bps_features' in data:
-            #     model_input['bps_features'] = data['bps_features'][0].unsqueeze(0).to(device)
-            # --- 结束模型输入准备 ---
-
-            # 运行模型推理
-            with torch.no_grad():
-                # 检查模型类型并进行相应的推理
-                if hasattr(model, 'diffusion_reverse'):
-                    # DiT 模型使用 diffusion_reverse 方法
-                    pred_dict = model.diffusion_reverse(model_input)
-                else:
-                    # TransPose 模型直接前向传播
-                    pred_dict = model(model_input)
+            # 添加虚拟关节数据（TransPose模型需要）
             
-            # --- (提取预测结果 - 这部分逻辑不变) ---
-            pred_motion = pred_dict.get("motion", None)        # [1, T, 132]
-            pred_root_pos = pred_dict.get("root_pos", None)    # [1, T, 3]
-            pred_obj_trans = pred_dict.get("obj_trans", None)  # [T, 3]
-            if pred_obj_trans is not None:
-                pred_obj_trans = pred_obj_trans.squeeze(0).unsqueeze(-1).cpu().numpy()  # [T, 3]
-            pred_obj_rot = pred_dict.get("obj_rot", None)      # [1, T, 6] 或 [1, T, 3, 3]
+            has_object_data_for_model = obj_imu is not None
+            if has_object_data_for_model:
+                model_input["obj_imu"] = obj_imu # [bs, T, 1, dim]
+                model_input["obj_rot"] = gt_obj_rot_6d # [bs, T, 6]
+                model_input["obj_trans"] = gt_obj_trans # [bs, T, 3]
 
-            # --- 结束提取 ---
+            try:
+                pred_dict = model(model_input)
+                pred_motion = pred_dict.get("motion") # [bs, T, 132]
+                pred_obj_rot = pred_dict.get("obj_rot") # [bs, T, 6] (TransPose 输出 6D)
+                pred_obj_trans = pred_dict.get("pred_obj_trans_from_contact") # [bs, T, 3] (使用新的基于接触的FK方法)
+                pred_root_pos = pred_dict.get("root_pos") # [bs, T, 3]
 
-            if pred_motion is None:
-                print("模型输出缺少 'motion'")
-            else:
-                pred_motion = pred_motion.squeeze(0).cpu() # [T, 132]
-                pred_rot_matrices = transforms.rotation_6d_to_matrix(pred_motion.reshape(-1, 22, 6))  # [T, 22, 3, 3]
-                pred_root_orient_mat = pred_rot_matrices[:, 0, :, :].to(device)
-                pred_pose_body_mat = pred_rot_matrices[:, 1:, :, :].reshape(-1, 21, 3, 3).to(device)
+                # --- Get predicted contact probabilities ---
+                pred_hand_contact_prob_batch = pred_dict.get("pred_hand_contact_prob") # [bs, T, 3]
+                if pred_hand_contact_prob_batch is not None:
+                    pred_hand_contact_prob_seq = pred_hand_contact_prob_batch[bs].to(device) # [T, 3]
+                    # Convert probabilities to 0/1 labels
+                    pred_contact_labels = (pred_hand_contact_prob_seq > 0.5).bool()
+                    pred_lhand_contact_labels_seq = pred_contact_labels[:, 0]
+                    pred_rhand_contact_labels_seq = pred_contact_labels[:, 1]
+                    pred_obj_contact_labels_seq = pred_contact_labels[:, 2]
+                else:
+                    print("Warning: Model did not output 'pred_hand_contact_prob'.")
+                
+                # --- Get predicted foot contact probabilities ---
+                pred_foot_contact_prob_batch = pred_dict.get("contact_probability") # [bs, T, 2]
+                pred_lfoot_contact_labels_seq = None
+                pred_rfoot_contact_labels_seq = None
+                if pred_foot_contact_prob_batch is not None:
+                    pred_foot_contact_prob_seq = pred_foot_contact_prob_batch[bs].to(device) # [T, 2]
+                    # Convert probabilities to 0/1 labels
+                    pred_foot_contact_labels = (pred_foot_contact_prob_seq > 0.5).bool()
+                    pred_lfoot_contact_labels_seq = pred_foot_contact_labels[:, 0]
+                    pred_rfoot_contact_labels_seq = pred_foot_contact_labels[:, 1]
+                else:
+                    print("Warning: Model did not output 'contact_probability' for foot contact.")
+                # --- End predicted contact probabilities ---
 
-                head_global_trans_start = data['head_global_trans'][0, 0].to(device) # [4, 4]
-                head_global_rot_start = head_global_trans_start[:3, :3]
-                head_global_pos_start = head_global_trans_start[:3, 3]
+                if pred_motion is not None:
+                    pred_motion_seq = pred_motion[bs] # [T, 132]
+                else:
+                    print("警告: 模型未输出 'motion'")
 
-                pred_root_pos = pred_root_pos + head_global_pos_start if pred_root_pos is not None else gt_root_pos
-                pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat
-                pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat) # [T, 3]
-                # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(pred_motion.shape[0], -1) # [T, 3]
-                pred_pose_body_axis = transforms.matrix_to_axis_angle(pred_pose_body_mat.reshape(-1, 3, 3)).reshape(pred_motion.shape[0], -1) # [T, 63]
-
-                # --- DEBUG WATCH BEGIN ---
-                debug_pred_smplh_input = {
-                    'root_orient': pred_root_orient_axis.detach().cpu().numpy(),
-                    'pose_body': pred_pose_body_axis.detach().cpu().numpy()
-                }
-                debug_gt_smplh_input = {
-                    'root_orient': gt_root_orient_axis.detach().cpu().numpy(),
-                    'pose_body': gt_pose_body_axis.detach().cpu().numpy()
-                }
-                # --- DEBUG WATCH END ---
-
-                pred_smplh_input = {
-                    'root_orient': pred_root_orient_axis,
-                    'pose_body': pred_pose_body_axis,
-                    'trans': pred_root_pos.squeeze(0).to(device)  # 使用真值的 root_pos
-                }
-                body_pose_pred = body_model(**pred_smplh_input)
-                verts_pred = body_pose_pred.v.detach().cpu()
-                # --- 结束预测 SMPLH 输入准备 ---
-                has_pred = True # 只有在成功生成顶点后才设置为 True
+                if pred_root_pos is not None:
+                    pred_root_pos_seq = pred_root_pos[bs] # [T, 3]
+                else:
+                    print("警告: 模型未输出 'root_pos'")
 
                 if pred_obj_rot is not None:
-                    pred_obj_rot = pred_obj_rot.squeeze(0).cpu() # [T, 6] 或 [T, 3, 3]
-                    # 如果 obj_rot 是 6D 表示，转换为旋转矩阵
-                    if pred_obj_rot.shape[-1] == 6:
-                        pred_obj_rot = transforms.rotation_6d_to_matrix(pred_obj_rot)
-                    pred_obj_rot = head_global_rot_start @ pred_obj_rot
+                    pred_obj_rot_6d_seq = pred_obj_rot[bs] # [T, 6]
+                elif has_object_data_for_model:
+                    print("警告: 模型未输出 'obj_rot'，即使有物体 IMU 输入")
 
+                # 新增：获取预测的物体平移
+                if pred_obj_trans is not None:
+                    pred_obj_trans_seq = pred_obj_trans[bs] # [T, 3]
+                elif has_object_data_for_model:
+                    print("警告: 模型未输出 'obj_trans'，即使有物体 IMU 输入")
 
-        except Exception as e:
-            print(f"模型预测失败: {e}")
-            import traceback
-            traceback.print_exc()
-            # 不设置 has_pred = True
-    
-    # --- 可视化添加 ---
-    # 如果有真值，添加到场景
-    if has_gt:
-        # 添加真值人体网格 (不偏移, Y轴朝上)
-        verts_gt_yup = torch.matmul(verts_gt, R_yup.T.cpu())
-        gt_mesh = Meshes(
-                    verts_gt_yup.numpy(), # 使用旋转后的 GT verts
-                    faces_gt,
-                    is_selectable=False,
-                    gui_affine=False,
-                    name="GT-Human",
-                    color=(0.1, 0.8, 0.3, 0.8)  # 绿色
-                )
-        v.scene.add(gt_mesh)
-    
-    # 如果有预测结果，添加到场景
-    if has_pred and verts_pred is not None:
-        # 添加预测的人体网格 (偏移, Y轴朝上)
-        # verts_pred_shifted = verts_pred + torch.tensor([1.0, 0, 0])
-        verts_pred_yup = torch.matmul(verts_pred, R_yup.T.cpu())
-        body_mesh = Meshes(
-                    verts_pred_yup.numpy(),
-                    faces_gt, # 使用 GT 的 faces
-                    is_selectable=False,
-                    gui_affine=False,
-                    name="Pred-Human (Shifted)",
-                    color=(0.9, 0.2, 0.2, 0.8)  # 红色
-                )
-        v.scene.add(body_mesh)
-    
-    # 可视化物体
-    if show_objects and data.get('has_object', [False])[0]:
-        # --- 使用来自 'data' 的未缩放 trans 和单独的 scale ---
-        gt_obj_trans = data['obj_trans'][0].cpu().numpy() # 未缩放
-        gt_obj_rot = data['obj_rot'][0].cpu().numpy()
-        gt_obj_scale = data['obj_scale'][0].cpu().numpy() # 单独的 scale
-        obj_name = data.get('obj_name', [None])[0]
-        gt_obj_bottom_trans = data.get('obj_bottom_trans', [None])[0] # 假设已缩放 (来自 process_loaded_data)
-        gt_obj_bottom_rot = data.get('obj_bottom_rot', [None])[0]
+            except Exception as e:
+                print(f"模型推理失败: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("仅真值模式：跳过模型推理")
 
-        # 转换 bottom parts 为 numpy
-        gt_obj_bottom_trans_np = gt_obj_bottom_trans.cpu().numpy() if torch.is_tensor(gt_obj_bottom_trans) else gt_obj_bottom_trans
-        gt_obj_bottom_rot_np = gt_obj_bottom_rot.cpu().numpy() if torch.is_tensor(gt_obj_bottom_rot) else gt_obj_bottom_rot
-        # --- 结束数据提取 ---
+        # --- 4. 获取预测 SMPL (使用预测 motion + 真值 trans) ---
+        verts_pred_seq = None
+        if pred_motion_seq is not None and not vis_gt_only:
+            pred_rot_matrices = transforms.rotation_6d_to_matrix(pred_motion_seq.reshape(T, 22, 6)) # [T, 22, 3, 3]
+            pred_root_orient_mat_norm = pred_rot_matrices[:, 0]                         # [T, 3, 3]
+            pred_pose_body_mat = pred_rot_matrices[:, 1:].reshape(T * 21, 3, 3)    # [T*21, 3, 3]
+            pred_pose_body_axis = transforms.matrix_to_axis_angle(pred_pose_body_mat).reshape(T, -1) # [T, 63]
 
-        print(f"物体名称: {obj_name}")
-        
-        # --- 加载真值物体几何体 (传递 scale) ---
-        gt_obj_verts, obj_faces = load_object_geometry(
-            obj_name,
-            gt_obj_rot,
-            gt_obj_trans, # 未缩放
-            obj_scale=gt_obj_scale, # 传递 scale
-            obj_bottom_trans=gt_obj_bottom_trans_np, 
-            obj_bottom_rot=gt_obj_bottom_rot_np
-        )
-        
-        # --- 添加真值物体网格 (应用 Y-up) ---
-        if gt_obj_verts.numel() > 3:
-            gt_obj_verts_yup = torch.matmul(gt_obj_verts.cpu(), R_yup.T.cpu())
-            gt_obj_mesh = Meshes(
-                gt_obj_verts_yup.numpy(),
-                obj_faces,
-                is_selectable=False,
-                gui_affine=False,
-                name=f"GT-{obj_name}",
-                color=(0.1, 0.8, 0.3, 0.8)  # 绿色
-            )
-            v.scene.add(gt_obj_mesh)
-        
-        # --- 添加预测物体网格 ---
-        if has_pred and pred_obj_rot is not None:
-            # 使用 GT trans (未缩放), GT scale, Pred rot
-            pred_obj_verts, _ = load_object_geometry(
-                obj_name,
-                pred_obj_rot, # 使用真值的旋转
-                gt_obj_trans,         # 使用GT平移 (未缩放)
-                obj_scale=gt_obj_scale, # 传递 GT scale
-                obj_bottom_trans=gt_obj_bottom_trans_np,
-                obj_bottom_rot=gt_obj_bottom_rot_np
-            )
+            # Denormalization
+            # pred_root_orient_mat = head_global_rot_start @ pred_root_orient_mat_norm
+            # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(T, 3)
+            # pred_root_pos_seq = (head_global_rot_start @ pred_root_pos_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
+
+            pred_root_orient_mat = root_global_rot_start @ pred_root_orient_mat_norm
+            pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(T, 3)
+            pred_root_pos_seq = (root_global_rot_start @ pred_root_pos_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+            # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat_norm)
+
+            pred_smplh_input = {
+                'root_orient': pred_root_orient_axis,
+                'pose_body': pred_pose_body_axis,
+                'trans': pred_root_pos_seq
+            }
+            body_pose_pred = smpl_model(**pred_smplh_input)
+            verts_pred_seq = body_pose_pred.v # [T, Nv, 3]
+
+        # --- 5. 获取物体几何体 ---
+        gt_obj_verts_seq = None
+        pred_obj_verts_seq = None
+        obj_faces_np = None
+        has_object_gt = gt_obj_trans is not None and gt_obj_rot_6d is not None and obj_name is not None
+
+        if show_objects and has_object_gt:
+            gt_obj_trans_seq = gt_obj_trans[bs]     # [T, 3]
+            gt_obj_rot_6d_seq = gt_obj_rot_6d[bs]   # [T, 6]
+            gt_obj_rot_mat_seq = transforms.rotation_6d_to_matrix(gt_obj_rot_6d_seq) # [T, 3, 3]
+            gt_obj_scale_seq = gt_obj_scale[bs] if gt_obj_scale is not None else None # [T] or [T, 1]?
+            # Handle bottom parts if they exist
+            gt_obj_bottom_trans_seq = gt_obj_bottom_trans[bs] if gt_obj_bottom_trans is not None else None
+            gt_obj_bottom_rot_seq = gt_obj_bottom_rot[bs] if gt_obj_bottom_rot is not None else None
+
+            # Denormalization
+            # gt_obj_rot_mat_seq = head_global_rot_start @ gt_obj_rot_mat_seq
+            # gt_obj_trans_seq = (head_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
             
-            # --- 添加预测物体网格 (应用偏移和 Y-up) ---
-            if pred_obj_verts.numel() > 3:
-                # pred_obj_verts_shifted = pred_obj_verts + torch.tensor([1.0, 0, 0])
-                pred_obj_verts_yup = torch.matmul(pred_obj_verts.cpu(), R_yup.T.cpu())
-                pred_obj_mesh = Meshes(
-                    pred_obj_verts_yup.numpy(),
-                    obj_faces,
-                    is_selectable=False,
+            gt_obj_rot_mat_seq = root_global_rot_start @ gt_obj_rot_mat_seq
+            gt_obj_trans_seq = (root_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+            # gt_obj_rot_mat_seq = gt_obj_rot_mat_seq
+
+            # 获取真值物体
+            gt_obj_verts_seq, obj_faces_np = load_object_geometry(
+                obj_name, gt_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq, device=device
+            )
+
+            # 获取预测物体 (使用真值旋转 + 预测平移) - 只在非仅真值模式下执行
+            if not vis_gt_only:
+                if pred_obj_trans_seq is not None:
+                    # 对预测的物体平移进行反归一化
+                    pred_obj_trans_seq_denorm = (root_global_rot_start @ pred_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+                    # pred_obj_trans_seq_denorm = pred_obj_trans_seq
+                    
+                    # 使用真值旋转 + 预测平移
+                    pred_obj_verts_seq, _ = load_object_geometry(
+                        obj_name, 
+                        gt_obj_rot_mat_seq, # 使用真值旋转
+                        pred_obj_trans_seq_denorm, # 使用预测平移
+                        gt_obj_scale_seq, 
+                        device=device
+                    )
+                else:
+                    # 如果没有预测平移，回退到使用真值平移
+                    print("警告: 没有预测的物体平移，使用真值平移进行可视化")
+                    pred_obj_verts_seq, _ = load_object_geometry(
+                        obj_name, 
+                        gt_obj_rot_mat_seq, # 使用真值旋转
+                        gt_obj_trans_seq,   # 使用真值平移
+                        gt_obj_scale_seq, 
+                        device=device
+                    )
+
+        # --- 6. 添加到 aitviewer 场景 ---
+        global R_yup # 使用全局定义的 Y-up 旋转
+
+        # 添加真值人体 (绿色, 不偏移)
+        if verts_gt_seq is not None:
+            verts_gt_yup = torch.matmul(verts_gt_seq, R_yup.T.to(device))
+            gt_human_mesh = Meshes(
+                verts_gt_yup.cpu().numpy(), faces_gt_np,
+                name="GT-Human", color=(0.1, 0.8, 0.3, 0.8), gui_affine=False, is_selectable=False
+            )
+            viewer.scene.add(gt_human_mesh)
+
+        # 添加预测人体 (红色, 偏移 x=1.0) - 只在非仅真值模式下执行
+        if verts_pred_seq is not None and not vis_gt_only:
+            verts_pred_shifted = verts_pred_seq + pred_offset # 使用定义的偏移
+            verts_pred_yup = torch.matmul(verts_pred_shifted, R_yup.T.to(device))
+            pred_human_mesh = Meshes(
+                verts_pred_yup.cpu().numpy(), faces_gt_np,
+                name="Pred-Human", color=(0.9, 0.2, 0.2, 0.8), gui_affine=False, is_selectable=False
+            )
+            viewer.scene.add(pred_human_mesh)
+
+        # 添加真值物体 (绿色, 不偏移)
+        if gt_obj_verts_seq is not None and obj_faces_np is not None:
+            gt_obj_verts_yup = torch.matmul(gt_obj_verts_seq, R_yup.T.to(device))
+            gt_obj_mesh = Meshes(
+                gt_obj_verts_yup.cpu().numpy(), obj_faces_np,
+                name=f"GT-{obj_name}", color=(0.1, 0.8, 0.3, 0.8), gui_affine=False, is_selectable=False
+            )
+            viewer.scene.add(gt_obj_mesh)
+
+        # 添加预测物体 (红色, 偏移 x=1.0) - 只在非仅真值模式下执行
+        if pred_obj_verts_seq is not None and obj_faces_np is not None and not vis_gt_only:
+            pred_obj_verts_shifted = pred_obj_verts_seq + pred_offset # 使用定义的偏移
+            pred_obj_verts_yup = torch.matmul(pred_obj_verts_shifted, R_yup.T.to(device))
+            pred_obj_mesh = Meshes(
+                pred_obj_verts_yup.cpu().numpy(), obj_faces_np,
+                name=f"Pred-{obj_name}", color=(0.9, 0.2, 0.2, 0.8), gui_affine=False, is_selectable=False
+            )
+            viewer.scene.add(pred_obj_mesh)
+
+        lhand_contact_seq = batch["lhand_contact"][bs] # [T]
+        rhand_contact_seq = batch["rhand_contact"][bs] # [T]
+        obj_contact_seq = batch["obj_contact"][bs] # [T]
+        
+        # --- 获取足部接触真值数据 ---
+        lfoot_contact_seq = batch.get("lfoot_contact", None)
+        rfoot_contact_seq = batch.get("rfoot_contact", None)
+        if lfoot_contact_seq is not None:
+            lfoot_contact_seq = lfoot_contact_seq[bs] # [T]
+        if rfoot_contact_seq is not None:
+            rfoot_contact_seq = rfoot_contact_seq[bs] # [T]
+        # --- 获取 GT 关节点位置 ---
+        Jtr_gt_seq = body_pose_gt.Jtr # [T, J, 3]
+
+        # --- 获取 Pred 关节点位置 (如果预测了 pose) ---
+        Jtr_pred_seq = None
+        if verts_pred_seq is not None and not vis_gt_only: # 仅当有预测姿态且非仅真值模式时才计算
+            Jtr_pred_seq = body_pose_pred.Jtr # [T, J, 3]
+
+
+        # --- 定义手腕关节点索引 (请根据你的模型确认) ---
+        lhand_idx = 20
+        rhand_idx = 21
+        
+        # --- 定义足踝关节点索引 ---
+        lfoot_idx = 7  # 左脚踝
+        rfoot_idx = 8  # 右脚踝
+
+        # --- 应用新的接触可视化逻辑 ---
+        contact_radius = 0.03 # 可调整
+
+        # --- 可视化左手接触 (红球) ---
+        gt_lhand_contact_points_list = []
+        for t in range(T): # 遍历每一帧
+            if lhand_contact_viz_seq[t]: # 使用预处理的标志
+                gt_lhand_contact_points_list.append(Jtr_gt_seq[t, lhand_idx])
+        
+        if gt_lhand_contact_points_list:
+            gt_lhand_contact_points = torch.stack(gt_lhand_contact_points_list, dim=0)
+            if gt_lhand_contact_points.numel() > 0:
+                gt_lhand_points_yup_tensor = torch.matmul(gt_lhand_contact_points, R_yup.T.to(device))
+                gt_lhand_points_yup_np = gt_lhand_points_yup_tensor.cpu().numpy()
+                gt_lhand_spheres = Spheres(
+                    positions=gt_lhand_points_yup_np,
+                    radius=contact_radius,
+                    name="GT-LHandContact",
+                    color=(1.0, 0.0, 0.0, 0.8), # 红色
                     gui_affine=False,
-                    name=f"Pred-{obj_name}",
-                    color=(0.9, 0.2, 0.2, 0.8)  # 红色
+                    is_selectable=False
                 )
-                v.scene.add(pred_obj_mesh)
-    
-    # 运行可视化
-    v.run()
+                viewer.scene.add(gt_lhand_spheres)
+
+        # --- 可视化右手接触 (蓝球) ---
+        gt_rhand_contact_points_list = []
+        for t in range(T):
+             if rhand_contact_viz_seq[t]: # 使用预处理的标志
+                 gt_rhand_contact_points_list.append(Jtr_gt_seq[t, rhand_idx])
+
+        if gt_rhand_contact_points_list:
+             gt_rhand_contact_points = torch.stack(gt_rhand_contact_points_list, dim=0)
+             if gt_rhand_contact_points.numel() > 0:
+                gt_rhand_points_yup_tensor = torch.matmul(gt_rhand_contact_points, R_yup.T.to(device))
+                gt_rhand_points_yup_np = gt_rhand_points_yup_tensor.cpu().numpy()
+                gt_rhand_spheres = Spheres(
+                    positions=gt_rhand_points_yup_np,
+                    radius=contact_radius,
+                    name="GT-RHandContact", # 确保名称一致
+                    color=(0.0, 0.0, 1.0, 0.8), # 蓝色
+                    gui_affine=False,
+                    is_selectable=False
+                )
+                viewer.scene.add(gt_rhand_spheres)
+
+        # --- 可视化物体移动指示 (黄球) ---
+        # 确保 gt_obj_trans_seq 可用
+        if gt_obj_trans_seq is not None:
+            obj_indicator_points_list = []
+            for t in range(T):
+                if obj_contact_viz_seq[t]: # 使用预处理的标志
+                    obj_indicator_points_list.append(gt_obj_trans_seq[t])
+            
+            if obj_indicator_points_list:
+                contact_positions = torch.stack(obj_indicator_points_list, dim=0)
+                contact_positions_yup_tensor = torch.matmul(contact_positions, R_yup.T.to(device))
+                contact_positions_yup_np = contact_positions_yup_tensor.cpu().numpy()
+
+                contact_indicator_radius = 0.04 # 可调整大小
+                contact_indicator_color = (1.0, 1.0, 0.0, 0.8) # 黄色
+
+                obj_contact_spheres = Spheres(
+                    positions=contact_positions_yup_np,
+                    radius=contact_indicator_radius,
+                    name="ObjContactIndicator", # 用于场景清理
+                    color=contact_indicator_color,
+                    gui_affine=False,
+                    is_selectable=False
+                )
+                viewer.scene.add(obj_contact_spheres)
+        # --- 结束物体接触可视化 ---
+        
+        # --- 可视化预测的接触标签 - 只在非仅真值模式下执行 ---
+        if not vis_gt_only:
+            contact_radius_pred = 0.03 # Can be same or different from GT
+
+            # 预测左手接触
+            if pred_lhand_contact_labels_seq is not None and Jtr_pred_seq is not None:
+                pred_lhand_contact_points_list = []
+                for t in range(T):
+                    if pred_lhand_contact_labels_seq[t]:
+                        point_on_pred_human = Jtr_pred_seq[t, lhand_idx]
+                        pred_lhand_contact_points_list.append(point_on_pred_human + pred_offset)
+                
+                if pred_lhand_contact_points_list:
+                    pred_lhand_contact_points = torch.stack(pred_lhand_contact_points_list, dim=0)
+                    if pred_lhand_contact_points.numel() > 0:
+                        pred_lhand_points_yup_tensor = torch.matmul(pred_lhand_contact_points, R_yup.T.to(device))
+                        pred_lhand_points_yup_np = pred_lhand_points_yup_tensor.cpu().numpy()
+                        pred_lhand_spheres = Spheres(
+                            positions=pred_lhand_points_yup_np,
+                            radius=contact_radius_pred,
+                            name="Pred-LHandContact",
+                            color=(1.0, 0.0, 0.0, 0.8), # 红色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(pred_lhand_spheres)
+
+            # 预测右手接触
+            if pred_rhand_contact_labels_seq is not None and Jtr_pred_seq is not None:
+                pred_rhand_contact_points_list = []
+                for t in range(T):
+                    if pred_rhand_contact_labels_seq[t]:
+                        point_on_pred_human = Jtr_pred_seq[t, rhand_idx]
+                        pred_rhand_contact_points_list.append(point_on_pred_human + pred_offset)
+                
+                if pred_rhand_contact_points_list:
+                    pred_rhand_contact_points = torch.stack(pred_rhand_contact_points_list, dim=0)
+                    if pred_rhand_contact_points.numel() > 0:
+                        pred_rhand_points_yup_tensor = torch.matmul(pred_rhand_contact_points, R_yup.T.to(device))
+                        pred_rhand_points_yup_np = pred_rhand_points_yup_tensor.cpu().numpy()
+                        pred_rhand_spheres = Spheres(
+                            positions=pred_rhand_points_yup_np,
+                            radius=contact_radius_pred,
+                            name="Pred-RHandContact",
+                            color=(0.0, 0.0, 1.0, 0.8), # 蓝色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(pred_rhand_spheres)
+            # 预测物体移动指示
+            if pred_obj_contact_labels_seq is not None: # 检查是否有预测的物体接触标签
+                # 优先使用预测的物体平移，如果没有则使用真值
+                obj_trans_for_pred_contact = pred_obj_trans_seq_denorm if pred_obj_trans_seq is not None else gt_obj_trans_seq
+                
+                if obj_trans_for_pred_contact is not None:
+                    pred_obj_indicator_points_list = []
+                    for t in range(T):
+                        if pred_obj_contact_labels_seq[t]:
+                            # 使用预测的物体平移位置 + 预测偏移
+                            pred_obj_indicator_points_list.append(obj_trans_for_pred_contact[t] + pred_offset)
+                    
+                    if pred_obj_indicator_points_list:
+                        pred_obj_contact_positions = torch.stack(pred_obj_indicator_points_list, dim=0)
+                        if pred_obj_contact_positions.numel() > 0:
+                            pred_obj_contact_positions_yup_tensor = torch.matmul(pred_obj_contact_positions, R_yup.T.to(device))
+                            pred_obj_contact_positions_yup_np = pred_obj_contact_positions_yup_tensor.cpu().numpy()
+                            pred_obj_contact_spheres = Spheres(
+                                positions=pred_obj_contact_positions_yup_np,
+                                radius=contact_radius_pred, # Can use same or different radius
+                                name="Pred-ObjContactIndicator",
+                                color=(1.0, 1.0, 0.0, 0.8), # 黄色
+                                gui_affine=False,
+                                is_selectable=False
+                            )
+                            viewer.scene.add(pred_obj_contact_spheres)
+            # --- 结束预测接触可视化 ---
+        
+        # --- 足部接触可视化 (只在启用时执行) ---
+        if show_foot_contact:
+            foot_contact_radius = 0.04  # 稍大一些的半径来区分手部接触
+            
+            # --- 可视化真值左脚接触 (紫色立方体) ---
+            if lfoot_contact_seq is not None:
+                gt_lfoot_contact_points_list = []
+                for t in range(T):
+                    if lfoot_contact_seq[t] > 0.5:  # 处理可能的浮点数标签
+                        gt_lfoot_contact_points_list.append(Jtr_gt_seq[t, lfoot_idx])
+                
+                if gt_lfoot_contact_points_list:
+                    gt_lfoot_contact_points = torch.stack(gt_lfoot_contact_points_list, dim=0)
+                    if gt_lfoot_contact_points.numel() > 0:
+                        gt_lfoot_points_yup_tensor = torch.matmul(gt_lfoot_contact_points, R_yup.T.to(device))
+                        gt_lfoot_points_yup_np = gt_lfoot_points_yup_tensor.cpu().numpy()
+                        gt_lfoot_spheres = Spheres(
+                            positions=gt_lfoot_points_yup_np,
+                            radius=foot_contact_radius,
+                            name="GT-LFootContact",
+                            color=(0.5, 0.0, 0.5, 0.8),  # 紫色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(gt_lfoot_spheres)
+            
+            # --- 可视化真值右脚接触 (橙色立方体) ---
+            if rfoot_contact_seq is not None:
+                gt_rfoot_contact_points_list = []
+                for t in range(T):
+                    if rfoot_contact_seq[t] > 0.5:  # 处理可能的浮点数标签
+                        gt_rfoot_contact_points_list.append(Jtr_gt_seq[t, rfoot_idx])
+                
+                if gt_rfoot_contact_points_list:
+                    gt_rfoot_contact_points = torch.stack(gt_rfoot_contact_points_list, dim=0)
+                    if gt_rfoot_contact_points.numel() > 0:
+                        gt_rfoot_points_yup_tensor = torch.matmul(gt_rfoot_contact_points, R_yup.T.to(device))
+                        gt_rfoot_points_yup_np = gt_rfoot_points_yup_tensor.cpu().numpy()
+                        gt_rfoot_spheres = Spheres(
+                            positions=gt_rfoot_points_yup_np,
+                            radius=foot_contact_radius,
+                            name="GT-RFootContact",
+                            color=(1.0, 0.5, 0.0, 0.8),  # 橙色
+                            gui_affine=False,
+                            is_selectable=False
+                        )
+                        viewer.scene.add(gt_rfoot_spheres)
+            
+            # --- 可视化预测的足部接触 (只在非仅真值模式下) ---
+            if not vis_gt_only and Jtr_pred_seq is not None:
+                pred_foot_contact_radius = 0.035  # 稍小一些来区分真值和预测
+                
+                # 预测左脚接触
+                if pred_lfoot_contact_labels_seq is not None:
+                    pred_lfoot_contact_points_list = []
+                    for t in range(T):
+                        if pred_lfoot_contact_labels_seq[t]:
+                            point_on_pred_human = Jtr_pred_seq[t, lfoot_idx]
+                            pred_lfoot_contact_points_list.append(point_on_pred_human + pred_offset)
+                    
+                    if pred_lfoot_contact_points_list:
+                        pred_lfoot_contact_points = torch.stack(pred_lfoot_contact_points_list, dim=0)
+                        if pred_lfoot_contact_points.numel() > 0:
+                            pred_lfoot_points_yup_tensor = torch.matmul(pred_lfoot_contact_points, R_yup.T.to(device))
+                            pred_lfoot_points_yup_np = pred_lfoot_points_yup_tensor.cpu().numpy()
+                            pred_lfoot_spheres = Spheres(
+                                positions=pred_lfoot_points_yup_np,
+                                radius=pred_foot_contact_radius,
+                                name="Pred-LFootContact",
+                                color=(0.8, 0.3, 0.8, 0.8),  # 浅紫色
+                                gui_affine=False,
+                                is_selectable=False
+                            )
+                            viewer.scene.add(pred_lfoot_spheres)
+                
+                # 预测右脚接触
+                if pred_rfoot_contact_labels_seq is not None:
+                    pred_rfoot_contact_points_list = []
+                    for t in range(T):
+                        if pred_rfoot_contact_labels_seq[t]:
+                            point_on_pred_human = Jtr_pred_seq[t, rfoot_idx]
+                            pred_rfoot_contact_points_list.append(point_on_pred_human + pred_offset)
+                    
+                    if pred_rfoot_contact_points_list:
+                        pred_rfoot_contact_points = torch.stack(pred_rfoot_contact_points_list, dim=0)
+                        if pred_rfoot_contact_points.numel() > 0:
+                            pred_rfoot_points_yup_tensor = torch.matmul(pred_rfoot_contact_points, R_yup.T.to(device))
+                            pred_rfoot_points_yup_np = pred_rfoot_points_yup_tensor.cpu().numpy()
+                            pred_rfoot_spheres = Spheres(
+                                positions=pred_rfoot_points_yup_np,
+                                radius=pred_foot_contact_radius,
+                                name="Pred-RFootContact",
+                                color=(1.0, 0.7, 0.3, 0.8),  # 浅橙色
+                                gui_affine=False,
+                                is_selectable=False
+                            )
+                            viewer.scene.add(pred_rfoot_spheres)
+        # --- 结束足部接触可视化 ---
+
+
+# === 自定义 Viewer 类 ===
+
+class InteractiveViewer(Viewer):
+    def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False, **kwargs):
+        super().__init__(**kwargs)
+        self.data_list = data_list # 直接使用加载到内存的列表
+        self.current_index = 0
+        self.model = model
+        self.smpl_model = smpl_model
+        self.config = config
+        self.device = device
+        self.show_objects = show_objects
+        self.vis_gt_only = vis_gt_only
+        self.show_foot_contact = show_foot_contact
+        self.obj_geo_root = obj_geo_root
+
+        # 设置初始相机位置 (可选)
+        # self.scene.camera.position = np.array([0.0, 1.0, 3.0])
+        # self.scene.camera.target = np.array([0.5, 0.8, 0.0]) # 对准偏移后的中间区域
+
+        # 初始可视化
+        self.visualize_current_sequence()
+
+    def visualize_current_sequence(self):
+        if not self.data_list:
+            print("错误：数据列表为空。")
+            return
+        if 0 <= self.current_index < len(self.data_list):
+            batch = self.data_list[self.current_index]
+            mode_str = " (仅真值)" if self.vis_gt_only else " (真值+预测)"
+            print(f"Visualizing sequence index: {self.current_index}{mode_str}")
+            try:
+                visualize_batch_data(self, batch, self.model, self.smpl_model, self.device, self.obj_geo_root, self.show_objects, self.vis_gt_only, self.show_foot_contact)
+                self.title = f"Sequence Index: {self.current_index}/{len(self.data_list)-1}{mode_str} (q/e:±1, Ctrl+q/e:±10, Alt+q/e:±50)"
+            except Exception as e:
+                 print(f"Error visualizing sequence {self.current_index}: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 self.title = f"Error visualizing index: {self.current_index}"
+        else:
+            print("Index out of bounds.")
+
+    # --- Rename to key_event and adjust logic --- 
+    # def key_press_event(self, key, scancode: int, mods: KeyModifiers): # Old name and signature
+    def key_event(self, key, action, modifiers):
+        # --- Call Parent First --- 
+        # Important: Call super first to allow base class and ImGui to process event
+        super().key_event(key, action, modifiers)
+
+        # --- Check if ImGui wants keyboard input --- 
+        # If ImGui is active and wants keyboard input, don't process our keys
+        io = imgui.get_io()
+        if self.render_gui and (io.want_capture_keyboard or io.want_text_input):
+             return # Let ImGui handle it
+
+        # --- Check for Key PRESS action --- 
+        is_press = action == self.wnd.keys.ACTION_PRESS
+
+        if is_press:
+            # Check for modifier keys
+            ctrl_pressed = modifiers.ctrl
+            alt_pressed = modifiers.alt
+            
+            # Compare using self.wnd.keys
+            if key == self.wnd.keys.Q:
+                if alt_pressed:
+                    # Alt + Q: 后退50个index
+                    step = 50
+                    new_index = max(0, self.current_index - step)
+                    if new_index != self.current_index:
+                        self.current_index = new_index
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0
+                        print(f"后退50个序列到索引: {self.current_index}")
+                    else:
+                        print("已经在最前面的序列。")
+                elif ctrl_pressed:
+                    # Ctrl + Q: 后退10个index
+                    step = 10
+                    new_index = max(0, self.current_index - step)
+                    if new_index != self.current_index:
+                        self.current_index = new_index
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0
+                        print(f"后退10个序列到索引: {self.current_index}")
+                    else:
+                        print("已经在最前面的序列。")
+                else:
+                    # Q: 后退1个index
+                    if self.current_index > 0:
+                        self.current_index -= 1
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0 # Reset scene frame id
+                    else:
+                        print("Already at the first sequence.")
+            elif key == self.wnd.keys.E:
+                if alt_pressed:
+                    # Alt + E: 前进50个index
+                    step = 50
+                    new_index = min(len(self.data_list) - 1, self.current_index + step)
+                    if new_index != self.current_index:
+                        self.current_index = new_index
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0
+                        print(f"前进50个序列到索引: {self.current_index}")
+                    else:
+                        print("已经在最后面的序列。")
+                elif ctrl_pressed:
+                    # Ctrl + E: 前进10个index
+                    step = 10
+                    new_index = min(len(self.data_list) - 1, self.current_index + step)
+                    if new_index != self.current_index:
+                        self.current_index = new_index
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0
+                        print(f"前进10个序列到索引: {self.current_index}")
+                    else:
+                        print("已经在最后面的序列。")
+                else:
+                    # E: 前进1个index
+                    if self.current_index < len(self.data_list) - 1:
+                        self.current_index += 1
+                        self.visualize_current_sequence()
+                        self.scene.current_frame_id = 0 # Reset scene frame id
+                    else:
+                        print("Already at the last sequence.")
+            
+
+# === 主函数 ===
+
+def main():
+    parser = argparse.ArgumentParser(description='Interactive EgoMotion Visualization Tool')
+    parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml', help='Path to the main configuration file (used for model, dataset params).')
+    parser.add_argument('--model_path', type=str, default=None, help='Path to the trained TransPose model checkpoint. Overrides config if provided.')
+    parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to the SMPLH model file. Overrides config if provided.')
+    parser.add_argument('--test_data_dir', type=str, default=None, help='Path to the test dataset directory. Overrides config if provided.')
+    parser.add_argument('--obj_geo_root', type=str, default='./dataset/captured_objects', help='Path to the object geometry root directory.')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for DataLoader (should be 1 for sequential vis).')
+    parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers.')
+    parser.add_argument('--no_objects', action='store_true', help='Do not load or visualize objects.')
+    parser.add_argument('--vis_gt_only', action='store_true', help='Only visualize ground truth, skip model inference and prediction visualization.')
+    parser.add_argument('--show_foot_contact', action='store_true', help='Visualize foot-ground contact indicators.')
+    parser.add_argument('--limit_sequences', type=int, default=None, help='Limit the number of sequences to load for visualization.')
+    args = parser.parse_args()
+
+    if args.batch_size != 1:
+        print("Warning: Setting batch_size to 1 for interactive visualization.")
+        args.batch_size = 1
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    print(f"Loading config from: {args.config}")
+    config = load_config(args.config)
+
+    # Override config with command line args
+    if args.model_path: config.model_path = args.model_path
+    if args.smpl_model_path: config.bm_path = args.smpl_model_path
+    if args.test_data_dir: config.test.data_path = args.test_data_dir
+    if args.num_workers is not None: config.num_workers = args.num_workers
+    # Ensure test config exists or copy from train
+    if 'test' not in config: config.test = config.train.copy()
+    config.test.batch_size = args.batch_size # Force batch size 1
+
+    # --- Load SMPL Model ---
+    smpl_model_path = config.get('bm_path', 'body_models/smplh/neutral/model.npz')
+    smpl_model = load_smpl_model(smpl_model_path, device)
+
+    # --- Load Trained Model ---
+    model_path = config.get('model_path', None)
+    if not model_path:
+        print("Error: No model path provided in config or via --model_path.")
+        # return
+    model = load_transpose_model(config, model_path)
+    model = model.to(device)
+    model.eval()
+
+    # --- Load Test Dataset ---
+    test_data_dir = config.test.data_path
+    if not test_data_dir or not os.path.exists(test_data_dir):
+        print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
+        return
+    print(f"Loading test dataset from: {test_data_dir}")
+
+    # Use test window size from config, default if not present
+    test_window_size = config.test.get('window', config.train.get('window', 60))
+
+    test_dataset = IMUDataset(
+        data_dir=test_data_dir,
+        window_size=test_window_size,
+        normalize=config.test.get('normalize', True),
+        debug=config.get('debug', False)
+    )
+
+    if len(test_dataset) == 0:
+         print("Error: Test dataset is empty.")
+         return
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.test.batch_size, # Should be 1
+        shuffle=False, # IMPORTANT: Keep order for navigation
+        num_workers=config.get('num_workers', 0), # Set workers based on args/config
+        pin_memory=True,
+        drop_last=False
+    )
+
+    print(f"Loading data into memory (limit={args.limit_sequences})...")
+    data_list = []
+    for i, batch in enumerate(test_loader):
+        if args.limit_sequences is not None and i >= args.limit_sequences:
+            print(f"Stopped loading after {args.limit_sequences} sequences.")
+            break
+        data_list.append(batch)
+        if i % 50 == 0 and i > 0:
+            print(f"  Loaded {i+1} sequences...")
+    print(f"Finished loading {len(data_list)} sequences.")
+
+    if not data_list:
+        print("Error: No data loaded into the list.")
+        return
+
+    # --- Initialize and Run Viewer ---
+    print("Initializing Interactive Viewer...")
+    if args.vis_gt_only:
+        print("仅真值模式：将只显示真值数据，跳过模型推理")
+    viewer_instance = InteractiveViewer(
+        data_list=data_list,
+        model=model,
+        smpl_model=smpl_model,
+        config=config,
+        device=device,
+        obj_geo_root=args.obj_geo_root,
+        show_objects=(not args.no_objects),
+        vis_gt_only=args.vis_gt_only,
+        show_foot_contact=args.show_foot_contact,
+        window_size=(1920, 1080) # Example window size
+        # Add other Viewer kwargs if needed (e.g., fps)
+    )
+    print("Viewer Initialized. Navigation controls:")
+    print("  q/e: 前进/后退 1个序列")
+    print("  Ctrl+q/e: 前进/后退 10个序列")
+    print("  Alt+q/e: 前进/后退 50个序列")
+    if args.show_foot_contact:
+        print("Foot contact visualization enabled:")
+        print("  GT Left Foot: Purple spheres")
+        print("  GT Right Foot: Orange spheres")
+        print("  Pred Left Foot: Light Purple spheres")
+        print("  Pred Right Foot: Light Orange spheres")
+    print("Other standard aitviewer controls should also work (e.g., mouse drag to rotate, scroll to zoom).")
+    viewer_instance.run()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="人体与物体姿态可视化工具")
-    parser.add_argument('--seq_path', type=str, default='processed_data_0408/test/0.pt',    # processed_data_0415/test/seq_8500.pt
-                        help='序列文件路径，如果不指定则从测试目录随机选择')
-    parser.add_argument('--model_path', type=str, default=None,
-                        help='模型路径，默认使用config中设置的路径')
-    parser.add_argument('--no_objects', action='store_true', 
-                        help='不显示物体')
-    parser.add_argument('--use_transpose_model', action='store_true', 
-                        help='使用TransPose模型类型')
-    parser.add_argument('--use_transpose_humanOnly_model', action='store_true', 
-                        help='使用TransPose人体姿态模型类型')
-    parser.add_argument('--use_diffusion_model', action='store_true', 
-                        help='使用Diffusion模型类型')
-    # Add argument for the diffusion config to load the model correctly
-    parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml',
-                        help='模型配置文件路径')
-    args = parser.parse_args()
-    
-    # 加载配置
-    try:
-        config_data = load_config(args.config)
-        config = edict(config_data)
-    except Exception as e:
-        print(f"错误：无法加载配置文件 {args.config}: {e}")
-        exit()
-
-    # --- 数据加载和处理 ---
-    seq_path = args.seq_path
-    data = None
-    if seq_path:
-        print(f"正在可视化: {seq_path}")
-        try:
-            raw_data = torch.load(seq_path)
-            # --- 处理数据 (现在 process_loaded_data 分离了 scale 和 trans) ---
-            processed_data = process_loaded_data(raw_data, normalize=config.test.normalize)
-            if not processed_data:
-                 print("错误：处理加载的数据失败。")
-                 exit()
-                 
-            # # --- 添加序列截断逻辑 ---
-            # # 获取配置中的目标序列长度
-            # target_length = config.test.window
-            # print(f"将序列截断到长度: {target_length}")
-            
-            # # 获取当前序列长度
-            # current_length = processed_data["motion"].shape[0]
-            
-            # # 如果当前序列长度超过目标长度，则截断所有相关数据
-            # if current_length > target_length:
-            #     for key in processed_data:
-            #         if isinstance(processed_data[key], torch.Tensor) and processed_data[key].dim() >= 1:
-            #             # 沿着第一个维度（时间维度）截断
-            #             processed_data[key] = processed_data[key][:target_length]
-            #     print(f"序列已从 {current_length} 帧截断到 {target_length} 帧")
-            # elif current_length < target_length:
-            #     print(f"警告: 序列长度 ({current_length}) 小于窗长 ({target_length})，程序退出")
-            #     exit()
-            # # --- 结束序列截断逻辑 ---
-
-            # 转换为批次格式 (添加批次维度)
-            batch_data = {}
-            for key, value in processed_data.items():
-                if isinstance(value, torch.Tensor):
-                    batch_data[key] = value.unsqueeze(0)
-                else:
-                    batch_data[key] = [value] # 将非张量值放入列表中以模拟批次
-            data = batch_data # 使用处理和批处理后的数据
-            
-        except Exception as e:
-            print(f"加载或处理文件 {seq_path} 失败: {e}")
-            import traceback
-            traceback.print_exc()
-            exit()
-    else:
-        # --- 如果没有提供 seq_path，则使用 DataLoader (旧逻辑，可能需要调整) ---
-        print("未提供 seq_path，将尝试从测试目录加载第一个样本 (需要 IMUDataset)")
-        # 重新启用 DataLoader (如果需要此功能)
-        # test_dir = cfg.test.data_path 
-        # test_dataset = IMUDataset( ... ) # 需要定义 IMUDataset 或导入
-        # test_loader = DataLoader( ... )
-        # data = next(iter(test_loader)) 
-        print("错误：当前版本不支持从目录加载，请提供 --seq_path。")
-        exit()
-        # --- 结束旧逻辑 ---
-
-    model = None
-    model_path = args.model_path
-    if model_path is None and 'model_path' in config: # 否则尝试从配置中获取
-        model_path = config.model_path
-
-    if model_path: # 只有在确定了 model_path 后才加载
-        try:
-            # 使用截断后的序列长度初始化模型
-            seq_len = data['human_imu'].shape[1]
-            
-            # 检查模型类型并加载相应的模型
-            if args.use_transpose_model:
-                # 加载 TransPose 模型
-                print(f"Loading TransPose model from: {model_path}")
-                model = load_transpose_model(config, model_path)
-                model = model.to(device)
-            elif args.use_transpose_humanOnly_model:
-                # 加载 TransPose 模型
-                print(f"Loading TransPose model from: {model_path}")
-                model = load_transpose_model_humanOnly(config, model_path)
-                model = model.to(device)
-            elif args.use_diffusion_model:
-                # 加载 DiT 模型
-                print(f"Loading DiT model from: {model_path}")
-                model = MotionDiffusion(config, input_length=seq_len, imu_input=True)
-                
-                # 加载预训练权重
-                checkpoint = torch.load(model_path, map_location=device)
-                
-                state_dict = checkpoint['model_state_dict']
-                if list(state_dict.keys())[0].startswith('module.'):
-                    state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-                model.load_state_dict(state_dict)
-                model = model.to(device)
-            
-            model.eval()
-            print(f"成功加载模型: {model_path}")
-        except Exception as e:
-            print(f"加载模型失败: {e}")
-            import traceback
-            traceback.print_exc()
-            model = None # 确保加载失败时 model 为 None
-    else:
-        print("未提供模型路径，将仅显示真值数据。")
-
-    # 传递配置给可视化函数
-    visualize_human_and_objects(args, model, data, not args.no_objects) 
+    main() 
