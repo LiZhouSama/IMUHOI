@@ -40,11 +40,11 @@ def _syn_acc_optimized(v, smooth_n=4):
         acc[1] = (v_flat[1] - v_flat[0]) * FRAME_RATE ** 2
     
     # 应用平滑
-    # mid = smooth_n // 2
-    # if mid != 0 and T > smooth_n * 2:
-    #     # 使用张量索引实现平滑计算
-    #     smooth_range = slice(smooth_n, -smooth_n)
-    #     acc[smooth_range] = (v_flat[:-smooth_n*2] + v_flat[smooth_n*2:] - 2 * v_flat[smooth_n:-smooth_n]) * FRAME_RATE ** 2 / smooth_n ** 2
+    mid = smooth_n // 2
+    if mid != 0 and T > smooth_n * 2:
+        # 使用张量索引实现平滑计算
+        smooth_range = slice(smooth_n, -smooth_n)
+        acc[smooth_range] = (v_flat[:-smooth_n*2] + v_flat[smooth_n*2:] - 2 * v_flat[smooth_n:-smooth_n]) * FRAME_RATE ** 2 / smooth_n ** 2
     
     # 恢复原始形状
     return acc.reshape(orig_shape)

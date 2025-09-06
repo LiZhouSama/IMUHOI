@@ -19,6 +19,51 @@ from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 
 
+_DEBUG_STAGES_PRINTED = False
+
+def compute_stage_schedule(staged_training_config, is_debug: bool = False):
+    """
+    将配置中的 stages/debug_stages 统一转换为带有 start/end/duration 的调度表。
+
+    仅支持新写法：epochs: <duration_int>（仅给出该阶段持续的 epoch 数）
+
+    返回：
+    - schedule: List[stage_dict]，每个元素包含：
+        - stage_start_epoch, stage_end_epoch, stage_duration
+      以及原 stage 中的其他键（浅拷贝）。
+    - total_epochs: int，总训练轮数（最后一个阶段的 end + 1）
+    """
+    if not staged_training_config or not staged_training_config.get('enabled', False):
+        return [], 0
+
+    stages_raw = staged_training_config.get('debug_stages' if is_debug else 'stages', [])
+    schedule = []
+    # 连续拼接的起点
+    running_start = 0
+
+    for stage in stages_raw:
+        stage_copy = dict(stage)
+        epochs_val = stage_copy.get('epochs', None)
+
+        if isinstance(epochs_val, int):
+            if epochs_val <= 0:
+                raise ValueError(f"阶段 {stage_copy.get('name', '?')} 的 epochs 时长应为正整数，收到: {epochs_val}")
+            duration = int(epochs_val)
+            start_epoch = running_start
+            end_epoch = start_epoch + duration - 1
+            running_start = end_epoch + 1
+        else:
+            raise ValueError(
+                f"阶段 {stage_copy.get('name', '?')} 的 epochs 配置必须为正整数时长，收到: {epochs_val}")
+
+        stage_copy['stage_start_epoch'] = start_epoch
+        stage_copy['stage_end_epoch'] = end_epoch
+        stage_copy['stage_duration'] = duration
+        schedule.append(stage_copy)
+
+    total_epochs = schedule[-1]['stage_end_epoch'] + 1 if schedule else 0
+    return schedule, total_epochs
+
 def flatten_lstm_parameters(module):
     """递归调用所有 LSTM 模块的 flatten_parameters()"""
     for child in module.children():
@@ -51,58 +96,58 @@ def get_training_stage(epoch, staged_training_config=None, is_debug=False):
             'stage_start_epoch': 0,  # 阶段起始epoch
         }
     
-    # 根据是否为debug模式选择相应的stages配置
-    if is_debug and 'debug_stages' in staged_training_config:
-        stages = staged_training_config.get('debug_stages', [])
-        print(f"Debug模式: 使用debug_stages配置 (共{len(stages)}个阶段)")
-    else:
-        stages = staged_training_config.get('stages', [])
-    
-    for stage in stages:
-        start_epoch, end_epoch = stage['epochs']
+    # 统一调度
+    schedule, _ = compute_stage_schedule(staged_training_config, is_debug=is_debug)
+    if is_debug:
+        global _DEBUG_STAGES_PRINTED
+        if not _DEBUG_STAGES_PRINTED:
+            print(f"Debug模式: 使用debug_stages配置 (共{len(schedule)}个阶段)")
+            _DEBUG_STAGES_PRINTED = True
+
+    for stage in schedule:
+        start_epoch, end_epoch = stage['stage_start_epoch'], stage['stage_end_epoch']
         if start_epoch <= epoch <= end_epoch:
             # 计算阶段内的epoch（从0开始）
             stage_epoch = epoch - start_epoch
-            
+
             stage_info = {
                 'name': stage['name'],
                 'active_modules': stage['modules'],
                 'frozen_modules': [],
                 'datasets': stage['datasets'],
-                'use_object_data': 'omomo' in stage['datasets'] or 'mixed' in stage['datasets'],
+                'use_object_data': ('omomo' in stage['datasets']) or ('mixed' in stage['datasets']) or ('hoi' in stage['datasets']),
                 'stage_epoch': stage_epoch,  # 阶段内的epoch
                 'stage_start_epoch': start_epoch,  # 阶段起始epoch
             }
-            
+
             # 添加阶段特定的超参数
             for param in ['batch_size', 'lr', 'weight_decay', 'milestones', 'gamma', 'num_workers']:
                 if param in stage:
                     stage_info[param] = stage[param]
-            
+
             return stage_info
-    
+
     # 如果没有匹配的阶段，默认返回最后一个阶段
-    if stages:
-        last_stage = stages[-1]
-        # 如果超出了最后阶段的范围，使用最后阶段的配置
-        stage_start_epoch = last_stage['epochs'][0]
+    if schedule:
+        last_stage = schedule[-1]
+        stage_start_epoch = last_stage['stage_start_epoch']
         stage_epoch = epoch - stage_start_epoch
-        
+
         stage_info = {
             'name': last_stage['name'],
             'active_modules': last_stage['modules'],
             'frozen_modules': [],
             'datasets': last_stage['datasets'],
-            'use_object_data': 'omomo' in last_stage['datasets'] or 'mixed' in last_stage['datasets'],
+            'use_object_data': ('omomo' in last_stage['datasets']) or ('mixed' in last_stage['datasets']) or ('hoi' in last_stage['datasets']),
             'stage_epoch': stage_epoch,
             'stage_start_epoch': stage_start_epoch,
         }
-        
+
         # 添加阶段特定的超参数
         for param in ['batch_size', 'lr', 'weight_decay', 'milestones', 'gamma', 'num_workers']:
             if param in last_stage:
                 stage_info[param] = last_stage[param]
-        
+
         return stage_info
     
     # 兜底情况
@@ -187,7 +232,7 @@ def build_modular_config_for_stage(new_stage_info, save_dir, initial_pretrained_
         tuple: (pretrained_modules, skip_modules)
     """
     all_modules = ['velocity_contact', 'human_pose', 'object_trans']
-    stage_order = ['velocity_contact', 'human_pose', 'object_trans', 'joint_training']
+    stage_order = ['velocity_contact', 'human_pose', 'object_trans_hoi', 'object_trans', 'joint_training']
     
     # 确定当前阶段在stage_order中的位置
     if new_stage_info['name'] in stage_order:
@@ -199,9 +244,13 @@ def build_modular_config_for_stage(new_stage_info, save_dir, initial_pretrained_
         elif 'human_pose' in new_stage_info['active_modules'] and 'object_trans' not in new_stage_info['active_modules']:
             current_stage_idx = 1
         elif 'object_trans' in new_stage_info['active_modules'] and 'human_pose' not in new_stage_info['active_modules']:
-            current_stage_idx = 2
+            # 根据数据集类型区分是object_trans_hoi还是object_trans
+            if 'hoi' in new_stage_info.get('datasets', []):
+                current_stage_idx = 2  # object_trans_hoi
+            else:
+                current_stage_idx = 3  # object_trans
         else:
-            current_stage_idx = 3  # joint_training
+            current_stage_idx = 4  # joint_training
     
     pretrained_modules = {}
     skip_modules = []
@@ -221,7 +270,7 @@ def build_modular_config_for_stage(new_stage_info, save_dir, initial_pretrained_
                     print(f"  - 自动检测到预训练模块: {module_name} <- {module_path}")
                 else:
                     # 如果模块目录没有，尝试从stage检查点提取模块权重
-                    stage_names = ['velocity_contact', 'human_pose', 'object_trans']
+                    stage_names = ['velocity_contact', 'human_pose', 'object_trans_hoi', 'object_trans']
                     if i < len(stage_names):
                         stage_path = os.path.join(save_dir, f"stage_best_{stage_names[i]}.pt")
                         if os.path.exists(stage_path):
@@ -244,7 +293,32 @@ def build_modular_config_for_stage(new_stage_info, save_dir, initial_pretrained_
                 
         elif module_name in new_stage_info['active_modules']:
             # 当前阶段需要训练的模块
-            print(f"  - 将训练模块: {module_name}")
+            # 特殊策略：object_trans 阶段从上一阶段 object_trans_hoi 初始化
+            if (
+                module_name == 'object_trans'
+                and current_stage_idx == 3  # object_trans阶段
+                and save_dir
+                and module_name not in pretrained_modules
+            ):
+                # 1) 优先从模块目录加载上一阶段保存的最佳权重
+                module_path = os.path.join(save_dir, "modules", f"{module_name}_best.pt")
+                if os.path.exists(module_path):
+                    pretrained_modules[module_name] = module_path
+                    print(f"  - 从object_trans_hoi阶段初始化模块: {module_name} <- {module_path}")
+                else:
+                    # 2) 回退：尝试从上一阶段的stage检查点提取（object_trans_hoi）
+                    stage_hoi_path = os.path.join(save_dir, "stage_best_object_trans_hoi.pt")
+                    if os.path.exists(stage_hoi_path):
+                        extracted_module_path = extract_module_from_checkpoint(stage_hoi_path, module_name, save_dir)
+                        if extracted_module_path:
+                            pretrained_modules[module_name] = extracted_module_path
+                            print(f"  - 从object_trans_hoi阶段检查点提取模块: {module_name} <- {extracted_module_path}")
+                        else:
+                            print(f"  - 将训练模块: {module_name} (未能从object_trans_hoi阶段提取，随机初始化)")
+                    else:
+                        print(f"  - 将训练模块: {module_name} (未检测到object_trans_hoi阶段权重，随机初始化)")
+            else:
+                print(f"  - 将训练模块: {module_name}")
             
         else:
             # 后面的模块暂时跳过
@@ -382,27 +456,98 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
         loss_dict['foot_contact'] = torch.nn.functional.binary_cross_entropy(pred_dict["contact_probability"], foot_contact_gt)
     
     if 'object_trans' in active_modules and use_object_data:
-        # # 物体全局平移损失
-        # loss_dict['obj_trans'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans)
-        
-        # 物体相对于根关节的平移损失（在根关节坐标系中）
-        # 计算真值：物体相对于根关节的全局相对位置
-        obj_relative_trans_global_gt = obj_trans - root_pos  # [bs, seq, 3]
-        
-        # 获取根关节旋转矩阵（从motion中提取）
-        gt_root_orient_6d = motion[:, :, :6]  # [bs, seq, 6]
-        gt_root_orient_mat = rotation_6d_to_matrix(gt_root_orient_6d.reshape(-1, 6)).reshape(bs, seq, 3, 3)  # [bs, seq, 3, 3]
-        
-        # 将物体相对位置转换到根关节坐标系
-        gt_root_orient_mat_flat = gt_root_orient_mat.reshape(bs * seq, 3, 3)
-        gt_root_orient_mat_inv = gt_root_orient_mat_flat.transpose(-1, -2)  # 旋转矩阵的逆等于转置
-        obj_relative_trans_global_gt_flat = obj_relative_trans_global_gt.reshape(bs * seq, 3)
-        
-        obj_relative_trans_local_gt_flat = torch.bmm(gt_root_orient_mat_inv, obj_relative_trans_global_gt_flat.unsqueeze(-1)).squeeze(-1)
-        obj_relative_trans_local_gt = obj_relative_trans_local_gt_flat.reshape(bs, seq, 3)
-        
-        # 计算损失 - obj_relative_trans已被移除
-        # loss_dict['obj_relative_trans'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_relative_trans_local"], obj_relative_trans_local_gt)
+        # 主输出：融合后的物体位置
+        if "pred_obj_trans" in pred_dict:
+            loss_dict['obj_trans_fused'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans)
+        else:
+            loss_dict['obj_trans_fused'] = torch.tensor(0.0, device=device)
+
+        # 方向（物体系单位向量）与长度（l_b）监督：只在HOI或接触帧上
+        is_hoi = ('hoi' in stage_info.get('datasets', []))
+        # 使用预测接触概率作为掩码（OMOMO避免GT泄露），HOI默认全1
+        if is_hoi:
+            contact_mask_l = torch.ones(bs, seq, device=device)
+            contact_mask_r = torch.ones(bs, seq, device=device)
+        else:
+            pred_hand_contact_prob = pred_dict.get('pred_hand_contact_prob', None)
+            if pred_hand_contact_prob is not None:
+                contact_mask_l = pred_hand_contact_prob[:, :, 0].detach()
+                contact_mask_r = pred_hand_contact_prob[:, :, 1].detach()
+            else:
+                contact_mask_l = torch.zeros(bs, seq, device=device)
+                contact_mask_r = torch.zeros(bs, seq, device=device)
+        if "pred_lhand_obj_direction" in pred_dict and "lhand_obj_direction" in batch:
+            lhand_dir_gt = batch["lhand_obj_direction"].to(device)
+            if is_hoi:
+                loss_dir_l = torch.nn.functional.mse_loss(pred_dict["pred_lhand_obj_direction"], lhand_dir_gt)
+            else:
+                mask = contact_mask_l.unsqueeze(-1)
+                loss_dir_l = ((pred_dict["pred_lhand_obj_direction"] - lhand_dir_gt).pow(2) * mask).sum() / (mask.sum() + 1e-6)
+            loss_dict['lhand_obj_direction'] = loss_dir_l
+        else:
+            loss_dict['lhand_obj_direction'] = torch.tensor(0.0, device=device)
+        if "pred_rhand_obj_direction" in pred_dict and "rhand_obj_direction" in batch:
+            rhand_dir_gt = batch["rhand_obj_direction"].to(device)
+            if is_hoi:
+                loss_dir_r = torch.nn.functional.mse_loss(pred_dict["pred_rhand_obj_direction"], rhand_dir_gt)
+            else:
+                mask = contact_mask_r.unsqueeze(-1)
+                loss_dir_r = ((pred_dict["pred_rhand_obj_direction"] - rhand_dir_gt).pow(2) * mask).sum() / (mask.sum() + 1e-6)
+            loss_dict['rhand_obj_direction'] = loss_dir_r
+        else:
+            loss_dict['rhand_obj_direction'] = torch.tensor(0.0, device=device)
+
+        # 骨长监督（l_b）：仅在HOI或接触帧用 GT = |p_O - p_H|
+        if "pred_lhand_lb" in pred_dict and "pred_rhand_lb" in pred_dict:
+            # 从GT位置计算骨长
+            # 需要hands_pos_gt：HOI时可从position_global_norm已生成的 gt_hands_pos
+            # 若无，则从模型输出的人手位置近似（但监督权重应降低，这里仅在HOI或接触帧启用）
+            if is_hoi and 'gt_hands_pos' in model.forward.__code__.co_varnames:
+                # 已在前向传入gt_hands_pos用于物体模块，但这里处于训练函数，直接从batch重算
+                # 使用 position_global_norm 计算手腕位置（已在 build_model_input_dict 中若可得就传给模块）
+                pass
+            # 优先GT，否则用human_pose输出
+            if 'position_global_norm' in batch:
+                pos_g = batch['position_global_norm'].to(device)
+                lhand_gt_pos = pos_g[:, :, 20, :]
+                rhand_gt_pos = pos_g[:, :, 21, :]
+            else:
+                # 回退：利用human_pose_outputs的pred_hand_pos不可在此作用域获取，改用 pred_dict 中可能包含的
+                if 'pred_hand_pos' in pred_dict:
+                    # [bs, seq, 2, 3]
+                    lhand_gt_pos = pred_dict['pred_hand_pos'][:, :, 0, :]
+                    rhand_gt_pos = pred_dict['pred_hand_pos'][:, :, 1, :]
+                else:
+                    lhand_gt_pos = torch.zeros_like(obj_trans)
+                    rhand_gt_pos = torch.zeros_like(obj_trans)
+            lb_l_gt = torch.norm(obj_trans - lhand_gt_pos, dim=-1)  # [bs, seq]
+            lb_r_gt = torch.norm(obj_trans - rhand_gt_pos, dim=-1)
+            # 掩码
+            if is_hoi:
+                loss_lb_l = torch.nn.functional.mse_loss(pred_dict['pred_lhand_lb'], lb_l_gt)
+                loss_lb_r = torch.nn.functional.mse_loss(pred_dict['pred_rhand_lb'], lb_r_gt)
+            else:
+                mask_l = contact_mask_l
+                mask_r = contact_mask_r
+                loss_lb_l = ((pred_dict['pred_lhand_lb'] - lb_l_gt).pow(2) * mask_l).sum() / (mask_l.sum() + 1e-6)
+                loss_lb_r = ((pred_dict['pred_rhand_lb'] - lb_r_gt).pow(2) * mask_r).sum() / (mask_r.sum() + 1e-6)
+            loss_dict['lhand_lb'] = loss_lb_l
+            loss_dict['rhand_lb'] = loss_lb_r
+        else:
+            loss_dict['lhand_lb'] = torch.tensor(0.0, device=device)
+            loss_dict['rhand_lb'] = torch.tensor(0.0, device=device)
+
+        # 速度一致性（若提供obj_vel）
+        if "pred_obj_vel_from_posdiff" in pred_dict and "obj_vel" in batch:
+            loss_dict['obj_vel_cons'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_vel_from_posdiff"], batch["obj_vel"].to(device))
+        else:
+            loss_dict['obj_vel_cons'] = torch.tensor(0.0, device=device)
+
+        # 加速度平滑
+        if "pred_obj_acc_from_posdiff" in pred_dict:
+            loss_dict['obj_acc_cons'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_acc_from_posdiff"], batch["obj_imu"].to(device)[:, :, 0, :3])
+        else:
+            loss_dict['obj_acc_cons'] = torch.tensor(0.0, device=device)
 
         # --- 新的虚拟关节监督损失：^Ov_{HO}方向向量 ---
         # 左手物体方向向量损失（^Ov_{HO}）
@@ -419,8 +564,6 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
         else:
             loss_dict['rhand_obj_direction'] = torch.tensor(0.0, device=device)
         
-        # --- FK重建的物体位置损失 ---
-        # 使用预测的^Ov_{HO}和骨长，通过FK公式重建物体位置并与真值比较
         if "pred_obj_trans_from_fk" in pred_dict:
             loss_dict['obj_trans_from_fk'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans_from_fk"], obj_trans)
         else:
@@ -428,27 +571,16 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
             
     else:
         # 没有物体数据时，设置新的虚拟关节损失为0
-        loss_dict['obj_relative_trans'] = torch.tensor(0.0, device=device)
         loss_dict['lhand_obj_direction'] = torch.tensor(0.0, device=device)
         loss_dict['rhand_obj_direction'] = torch.tensor(0.0, device=device)
         loss_dict['obj_trans_from_fk'] = torch.tensor(0.0, device=device)
+        loss_dict['obj_vel_cons'] = torch.tensor(0.0, device=device)
+        loss_dict['obj_acc_cons'] = torch.tensor(0.0, device=device)
     
-    # 设置默认权重
-    default_weights = {
-        'rot': 10, 'root_pos': 10, 'leaf_pos': 1.0, 'full_pos': 1.0,
-        'root_vel': 10, 'hand_contact': 1, 'obj_relative_trans': 10, 
-        'obj_vel': 1, 'leaf_vel': 10, 'foot_contact': 1,
-        'lhand_obj_direction': 6, 'rhand_obj_direction': 6,  # 新的方向向量损失权重
-        'obj_trans_from_fk': 8                               # FK重建位置损失权重
-    }
-    
-    # 获取配置的权重
+    # 设置权重
     weights = {}
-    if hasattr(cfg, 'loss_weights'):
-        for key in default_weights:
-            weights[key] = getattr(cfg.loss_weights, key, default_weights[key])
-    else:
-        weights = default_weights
+    for key in cfg.loss_weights:
+        weights[key] = getattr(cfg.loss_weights, key)
     
     # 根据数据集类型动态调整足部接触损失权重
     dataset_types = stage_info.get('datasets', ['mixed'])
@@ -460,25 +592,28 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
         # 混合数据：使用中等权重
         weights['foot_contact'] *= 0.7
     
-    # 根据训练阶段调整权重
-    if stage_name == 'velocity_contact':
-        # 第一阶段：只关注速度和接触
-        for key in weights:
+    # 根据激活模块动态调整权重（不依赖阶段名称）
+    active_modules = set(active_modules)
+    only_vc = active_modules == {'velocity_contact'}
+    only_hp = active_modules == {'human_pose'}
+    only_ot = active_modules == {'object_trans'}
+    joint_hp_ot = active_modules == {'human_pose', 'object_trans'}
+
+    if only_vc:
+        for key in list(weights.keys()):
             if key not in ['obj_vel', 'leaf_vel', 'hand_contact']:
                 weights[key] = 0.0
-    elif stage_name == 'human_pose':
-        # 第二阶段：只关注人体相关
-        for key in weights:
+    elif only_hp:
+        for key in list(weights.keys()):
             if key not in ['rot', 'root_pos', 'leaf_pos', 'full_pos', 'root_vel', 'foot_contact']:
                 weights[key] = 0.0
-    elif stage_name == 'object_trans':
-        # 第三阶段：只关注物体方向向量和FK重建位置损失
-        for key in weights:
-            if key not in ['lhand_obj_direction', 'rhand_obj_direction', 'obj_trans_from_fk']:
+    elif only_ot:
+        allowed_keys = ['obj_trans_fused', 'lhand_obj_direction', 'rhand_obj_direction', 'obj_trans_from_fk', 'obj_vel_cons', 'obj_acc_cons']
+        for key in list(weights.keys()):
+            if key not in allowed_keys:
                 weights[key] = 0.0
-    elif stage_name == 'joint_training':
-        # 联合训练阶段：使用后两个阶段权重
-        for key in weights:
+    elif joint_hp_ot:
+        for key in list(weights.keys()):
             if key in ['obj_vel', 'leaf_vel', 'hand_contact']:
                 weights[key] = 0.0
     
@@ -494,7 +629,6 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
     
     return total_loss, loss_dict, weighted_losses
 
-
 def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
     """
     根据训练阶段计算相应的测试损失（用于模型选择）
@@ -508,7 +642,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
     Returns:
         tuple: (测试损失, 损失组件字典)
     """
-    stage_name = stage_info['name']
+    active_modules = set(stage_info['active_modules'])
     use_object_data = stage_info.get('use_object_data', False)
     bs, seq = batch["human_imu"].shape[:2]
     root_pos = batch["root_pos"].to(device)
@@ -522,21 +656,11 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
     rhand_contact_gt = batch.get("rhand_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device)
     obj_contact_gt = batch.get("obj_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device)
     hand_contact_gt = torch.stack([lhand_contact_gt, rhand_contact_gt, obj_contact_gt], dim=2).float()
-
-    default_weights = {
-        'rot': 10, 'root_pos': 10, 'leaf_pos': 1.0, 'full_pos': 1.0,
-        'root_vel': 10, 'hand_contact': 1, 'obj_relative_trans': 10, 
-        'obj_vel': 1, 'leaf_vel': 10, 'foot_contact': 1,
-        'lhand_obj_direction': 6, 'rhand_obj_direction': 6, 'obj_trans_from_fk': 8
-    }
     
     # 获取配置的权重
     weights = {}
-    if hasattr(cfg, 'loss_weights'):
-        for key in default_weights:
-            weights[key] = getattr(cfg.loss_weights, key, default_weights[key])
-    else:
-        weights = default_weights
+    for key in cfg.loss_weights:
+        weights[key] = getattr(cfg.loss_weights, key)
     
     # 处理物体数据
     obj_trans = batch.get("obj_trans", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device)
@@ -544,7 +668,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
     loss_components = {}
     
     # 根据阶段计算相应的测试损失
-    if stage_name == 'velocity_contact':
+    if active_modules == {'velocity_contact'}:
         # 速度估计损失
         if use_object_data:
             loss_components['obj_vel'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_vel"], obj_vel)
@@ -573,7 +697,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
         
         return test_loss, loss_components
         
-    elif stage_name == 'human_pose':
+    elif active_modules == {'human_pose'}:
         # human_pose阶段：只看rot和root_pos
         if "motion" in pred_dict:
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
@@ -599,19 +723,23 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             
         return test_loss, loss_components
         
-    elif stage_name == 'object_trans':
-        # object_trans阶段：看FK重建的物体位置损失
+    elif active_modules == {'object_trans'}:
+        # object_trans阶段：以融合结果为主，兼容旧键
+        if "pred_obj_trans" in pred_dict:
+            loss_components['obj_trans_fused'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans)
+        else:
+            loss_components['obj_trans_fused'] = torch.tensor(0.0, device=device)
         if "pred_obj_trans_from_fk" in pred_dict:
             loss_components['obj_trans_from_fk'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans_from_fk"], obj_trans)
         else:
             loss_components['obj_trans_from_fk'] = torch.tensor(0.0, device=device)
-            
-        # 直接返回FK重建损失
-        test_loss = loss_components['obj_trans_from_fk']
+
+        # 以融合损失为主
+        test_loss = loss_components['obj_trans_fused']
         return test_loss, loss_components
         
-    elif stage_name == 'joint_training':
-        # joint_training阶段：看rot、root_pos和obj_trans_from_pose
+    elif active_modules == {'human_pose', 'object_trans'}:
+        # joint_training阶段：看rot、root_pos和融合的物体位置
         if "motion" in pred_dict:
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         else:
@@ -622,10 +750,10 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
         else:
             loss_components['root_pos'] = torch.tensor(0.0, device=device)
             
-        if "pred_obj_trans_from_fk" in pred_dict:
-            loss_components['obj_trans_from_fk'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans_from_fk"], obj_trans)
+        if "pred_obj_trans" in pred_dict:
+            loss_components['obj_trans_fused'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans)
         else:
-            loss_components['obj_trans_from_fk'] = torch.tensor(0.0, device=device)
+            loss_components['obj_trans_fused'] = torch.tensor(0.0, device=device)
             
         # 计算加权损失
         test_loss = torch.tensor(0.0, device=device)
@@ -700,36 +828,121 @@ def save_stage_checkpoint(model, optimizer, epoch, stage_info, save_dir, loss, c
 
 
 def load_previous_stage_best_model(save_dir, previous_stage_name, device):
-    """
-    加载上一阶段的最佳模型
-    
-    Args:
-        save_dir: 模型保存目录
-        previous_stage_name: 上一阶段名称
-        device: 设备
-    
-    Returns:
-        model_state_dict: 模型状态字典，如果没找到则返回None
-        epoch: 加载的epoch
-    """
-    if save_dir is None:
+    """(已删除) 兼容占位：不再支持从非模块化路径加载上一阶段最佳模型"""
+    return None, None
+
+
+def build_optimizer_and_scheduler(model: torch.nn.Module, cfg, stage_info, use_multi_gpu: bool):
+    """基于阶段超参数创建优化器和调度器，仅包含可训练参数"""
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    stage_lr = stage_info.get('lr', cfg.lr)
+    stage_weight_decay = stage_info.get('weight_decay', cfg.weight_decay)
+    stage_milestones = stage_info.get('milestones', cfg.milestones)
+    stage_gamma = stage_info.get('gamma', cfg.gamma)
+
+    if use_multi_gpu:
+        stage_lr = stage_lr * len(cfg.gpus)
+        print(f"多GPU训练，学习率调整为: {stage_lr}")
+
+    optimizer = optim.AdamW(trainable_params, lr=stage_lr, weight_decay=stage_weight_decay)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=stage_milestones, gamma=stage_gamma)
+
+    print(f"可训练参数数量: {sum(p.numel() for p in trainable_params)}")
+    print(f"阶段超参数: lr={stage_lr}, weight_decay={stage_weight_decay}, milestones={stage_milestones}, gamma={stage_gamma}")
+    return optimizer, scheduler
+
+
+def rebuild_dataloaders_if_needed(cfg, new_stage_info, train_loader, test_loader):
+    """释放旧 DataLoader（含 dataset.cleanup 支持）并创建新 Loader"""
+    # 显式清理旧的DataLoader（如果存在）
+    if train_loader is not None:
+        print("清理旧的DataLoader...")
+        if hasattr(train_loader, 'dataset') and hasattr(train_loader.dataset, 'cleanup'):
+            train_loader.dataset.cleanup()
+        if test_loader is not None and hasattr(test_loader, 'dataset') and hasattr(test_loader.dataset, 'cleanup'):
+            test_loader.dataset.cleanup()
+        del train_loader
+        del test_loader
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("旧DataLoader清理完成")
+
+    from train_transpose import create_staged_dataloaders
+    new_train_loader, new_test_loader = create_staged_dataloaders(cfg, new_stage_info)
+    if new_train_loader is None:
+        print(f"错误: 无法为阶段 '{new_stage_info['name']}' 创建数据加载器")
         return None, None
-    
-    # 查找上一阶段的最佳模型文件
-    best_model_path = os.path.join(save_dir, f"stage_best_{previous_stage_name}.pt")
-    
-    if not os.path.exists(best_model_path):
-        print(f"未找到上一阶段最佳模型: {best_model_path}")
-        return None, None
-    
-    try:
-        checkpoint = torch.load(best_model_path, map_location=device)
-        print(f"加载上一阶段最佳模型: {best_model_path}")
-        print(f"模型来自epoch {checkpoint['epoch']}, 综合损失: {checkpoint.get('comprehensive_loss', 'N/A')}")
-        return checkpoint['model_state_dict'], checkpoint['epoch']
-    except Exception as e:
-        print(f"加载上一阶段模型失败: {e}")
-        return None, None
+    print(f"已为阶段 '{new_stage_info['name']}' 创建新的数据加载器")
+    return new_train_loader, new_test_loader
+
+
+def build_model_input_dict(batch, current_stage_info, cfg, device, add_noise: bool = True):
+    """构造模型前向所需 data_dict，统一处理可选项与噪声"""
+    root_pos = batch["root_pos"].to(device)
+    motion = batch["motion"].to(device)
+    human_imu = batch["human_imu"].to(device)
+    obj_imu = batch.get("obj_imu", None)
+    obj_rot = batch.get("obj_rot", None)
+    obj_trans = batch.get("obj_trans", None)
+    obj_vel = batch.get("obj_vel", None)
+    position_global_norm = batch.get("position_global_norm", None)
+    lhand_contact = batch.get("lhand_contact", None)
+    rhand_contact = batch.get("rhand_contact", None)
+    obj_contact = batch.get("obj_contact", None)
+
+    bs, seq = human_imu.shape[:2]
+    if add_noise:
+        human_imu = human_imu + torch.randn_like(human_imu) * 0.005
+    if obj_imu is not None:
+        obj_imu = obj_imu.to(device)
+        if add_noise:
+            obj_imu = obj_imu + torch.randn_like(obj_imu) * 0.005
+    else:
+        obj_imu = torch.zeros((bs, seq, 1, cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9), device=device, dtype=human_imu.dtype)
+    if obj_rot is not None:
+        obj_rot = obj_rot.to(device)
+    else:
+        obj_rot = torch.zeros((bs, seq, 6), device=device, dtype=motion.dtype)
+    if obj_trans is not None:
+        obj_trans = obj_trans.to(device)
+    else:
+        obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
+
+    # 构造GT手部位置（用于HOI场景）
+    gt_hands_pos = None
+    if position_global_norm is not None and position_global_norm.shape[1] == seq:
+        try:
+            from configs.global_config import joint_set as _joint_set
+            wrist_l_idx, wrist_r_idx = 20, 21
+            pos = position_global_norm.to(device)
+            lhand_pos = pos[:, :, wrist_l_idx, :]
+            rhand_pos = pos[:, :, wrist_r_idx, :]
+            gt_hands_pos = torch.stack([lhand_pos, rhand_pos], dim=2)  # [bs, seq, 2, 3]
+        except Exception:
+            gt_hands_pos = None
+
+    # 数据集切换：HOI使用GT手部位置；OMOMO使用预测
+    datasets_this_stage = set(current_stage_info.get('datasets', ['mixed']))
+    use_gt_hands_for_obj = ('hoi' in datasets_this_stage)
+
+    data_dict = {
+        "human_imu": human_imu,
+        "obj_imu": obj_imu,
+        "motion": motion,
+        "root_pos": root_pos,
+        "obj_rot": obj_rot,
+        "obj_trans": obj_trans,
+        "use_object_data": current_stage_info['use_object_data'],
+        "obj_vel": obj_vel.to(device) if obj_vel is not None else None,
+        "gt_hands_pos": gt_hands_pos,
+        "use_gt_hands_for_obj": use_gt_hands_for_obj,
+        "lhand_contact": lhand_contact.to(device) if lhand_contact is not None else None,
+        "rhand_contact": rhand_contact.to(device) if rhand_contact is not None else None,
+        "obj_contact": obj_contact.to(device) if obj_contact is not None else None,
+    }
+    return data_dict
 
 def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, model=None, optimizer=None):
     """
@@ -772,31 +985,27 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             print(f"模块化训练已启用，从阶段 '{start_stage_name}' 开始")
             print(f"预训练模块配置: {pretrained_modules}")
     
-    # 确定训练的epoch范围
-    if staged_training_config and staged_training_config.get('enabled', False):
-        # 分阶段训练：根据阶段配置确定epoch范围
-        stages = staged_training_config.get('debug_stages' if cfg.debug else 'stages', [])
-        if stages:
-            # 如果指定了起始阶段，找到对应的起始epoch
-            if start_stage_name:
-                for stage in stages:
-                    if stage['name'] == start_stage_name:
-                        start_epoch = stage['epochs'][0]
-                        break
-                else:
-                    print(f"警告: 未找到起始阶段 '{start_stage_name}'，将从epoch 0开始")
-                    start_epoch = 0
-            else:
-                start_epoch = stages[0]['epochs'][0]
-            
-            # 设置max_epoch为最后一个阶段的结束epoch + 1（因为range是左闭右开的）
-            max_epoch = stages[-1]['epochs'][1] + 1
-            print(f"分阶段训练：epoch范围 {start_epoch} 到 {max_epoch-1}")
+    # 仅支持分阶段训练：根据阶段配置确定epoch范围
+    assert staged_training_config and staged_training_config.get('enabled', False), \
+        "当前精简版本仅支持分阶段训练，请在配置中启用 staged_training.enabled=True"
+    schedule, total_epochs = compute_stage_schedule(staged_training_config, is_debug=cfg.debug)
+    if schedule:
+        if start_stage_name:
+            matched = False
+            for s in schedule:
+                if s['name'] == start_stage_name:
+                    start_epoch = s['stage_start_epoch']
+                    matched = True
+                    break
+            if not matched:
+                print(f"警告: 未找到起始阶段 '{start_stage_name}'，将从epoch 0开始")
+                start_epoch = 0
         else:
-            print("警告: 启用了分阶段训练但未找到阶段配置，使用默认epoch设置")
+            start_epoch = schedule[0]['stage_start_epoch']
+        max_epoch = total_epochs
+        print(f"分阶段训练：epoch范围 {start_epoch} 到 {max_epoch-1}")
     else:
-        # 传统训练：使用配置的max_epoch
-        print(f"传统训练模式：使用配置的max_epoch {max_epoch}")
+        raise ValueError("启用了分阶段训练但未找到阶段配置，请检查配置文件中的 staged_training.stages 或 debug_stages")
 
     # 打印训练配置
     print(f'Training: {model_name} (using TransPose), pose_rep: {pose_rep}')
@@ -806,15 +1015,14 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     
     if staged_training_config and staged_training_config.get('enabled', False):
         print("启用分阶段训练:")
-        # 根据是否为debug模式显示相应的stages
-        if cfg.debug and 'debug_stages' in staged_training_config:
-            print("  [Debug模式] 使用debug_stages配置:")
-            for stage in staged_training_config.get('debug_stages', []):
-                print(f"    {stage['name']}: epochs {stage['epochs']}, modules: {stage['modules']}, datasets: {stage['datasets']}")
-        else:
-            print("  [正常模式] 使用stages配置:")
-            for stage in staged_training_config.get('stages', []):
-                print(f"    {stage['name']}: epochs {stage['epochs']}, modules: {stage['modules']}, datasets: {stage['datasets']}")
+        # 显示统一后的调度信息
+        print("  阶段调度:")
+        for s in schedule:
+            print(
+                f"    {s['name']}: duration {s['stage_duration']}, "
+                f"range [{s['stage_start_epoch']}, {s['stage_end_epoch']}], "
+                f"modules: {s['modules']}, datasets: {s['datasets']}"
+            )
     
     if not cfg.debug:
         os.makedirs(save_dir, exist_ok=True)
@@ -900,7 +1108,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     n_iter = 0
     training_step_count = 0
     current_stage_info = None
-    previous_stage_name = None  # 记录上一阶段名称
+    # 非模块化训练路径已移除
 
     # 如果启用分阶段训练且没有提供初始数据加载器，创建第一个阶段的数据加载器
     if train_loader is None and staged_training_config and staged_training_config.get('enabled', False):
@@ -918,27 +1126,8 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         current_stage_info = initial_stage_info
         configure_training_modules(model, current_stage_info)
         
-        # 重新创建优化器（只优化激活的参数），使用阶段特定的超参数
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        stage_lr = initial_stage_info.get('lr', cfg.lr)
-        stage_weight_decay = initial_stage_info.get('weight_decay', cfg.weight_decay)
-        stage_milestones = initial_stage_info.get('milestones', cfg.milestones)
-        stage_gamma = initial_stage_info.get('gamma', cfg.gamma)
-        
-        # 多GPU时调整学习率
-        if use_multi_gpu:
-            stage_lr = stage_lr * len(cfg.gpus)
-            print(f"多GPU训练，学习率调整为: {stage_lr}")
-        
-        optimizer = optim.AdamW(trainable_params, lr=stage_lr, weight_decay=stage_weight_decay)
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=stage_milestones, gamma=stage_gamma)
-        
-        print(f"初始化优化器，可训练参数数量: {sum(p.numel() for p in trainable_params)}")
-        print(f"初始阶段 '{initial_stage_info['name']}' 超参数:")
-        print(f"  lr: {stage_lr}")
-        print(f"  weight_decay: {stage_weight_decay}")
-        print(f"  milestones: {stage_milestones}")
-        print(f"  gamma: {stage_gamma}")
+        # 重新创建优化器/调度器（只优化激活的参数）
+        optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, initial_stage_info, use_multi_gpu)
         
         # 初始化第一阶段的损失值
         current_stage_best_loss = float('inf')
@@ -956,12 +1145,10 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             print(f"阶段 '{new_stage_info['name']}'：将使用阶段特定测试损失进行模型选择")
             print(f"重置当前阶段最佳测试损失为: {current_stage_best_loss}")
             
-            # 保存上一个阶段的检查点（如果有）
-            if current_stage_info is not None and not cfg.debug:
-                # 使用当前阶段的最佳损失值保存检查点
+            # 可选：保存上一个阶段结束检查点（当前简化版本默认不保存，避免冗余）
+            if False and current_stage_info is not None and not cfg.debug:
                 stage_loss = current_stage_best_loss
                 save_stage_checkpoint(model, optimizer, epoch-1, current_stage_info, save_dir, stage_loss, None, "stage_end")
-                previous_stage_name = current_stage_info['name']  # 记录上一阶段名称
             
             # 模块化训练：重新构建模型以正确加载/跳过模块
             if modular_training_config and modular_training_config.get('enabled', False):
@@ -985,6 +1172,9 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 # 展平 LSTM 参数
                 flatten_lstm_parameters(model)
                 
+                # 根据新阶段配置需要训练/冻结的模块
+                configure_training_modules(model, new_stage_info)
+                
                 print(f"重新构建完成，参数数量: {sum(p.numel() for p in model.parameters())}")
                 
                 # 删除旧模型释放内存
@@ -992,118 +1182,21 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 
             else:
-                # 非模块化训练：使用传统方式加载上一阶段最佳模型
-                if previous_stage_name is not None and not cfg.debug:
-                    prev_model_state, prev_epoch = load_previous_stage_best_model(save_dir, previous_stage_name, device)
-                    if prev_model_state is not None:
-                        # 加载上一阶段的最佳模型参数
-                        actual_model = get_actual_model(model)
-                        actual_model.load_state_dict(prev_model_state)
-                        print(f"已加载上一阶段 '{previous_stage_name}' 的最佳模型参数")
-                
-                # 配置新阶段的训练模块
                 configure_training_modules(model, new_stage_info)
             
             # 更新当前阶段信息
             current_stage_info = new_stage_info
             
-            # 重新创建优化器（只优化激活的参数），使用阶段特定的超参数
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            stage_lr = new_stage_info.get('lr', cfg.lr)
-            stage_weight_decay = new_stage_info.get('weight_decay', cfg.weight_decay)
-            stage_milestones = new_stage_info.get('milestones', cfg.milestones)
-            stage_gamma = new_stage_info.get('gamma', cfg.gamma)
-            
-            # 多GPU时调整学习率
-            if use_multi_gpu:
-                stage_lr = stage_lr * len(cfg.gpus)
-                print(f"多GPU训练，学习率调整为: {stage_lr}")
-            
-            optimizer = optim.AdamW(trainable_params, lr=stage_lr, weight_decay=stage_weight_decay)
-            scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=stage_milestones, gamma=stage_gamma)
-            
-            print(f"重新创建优化器，可训练参数数量: {sum(p.numel() for p in trainable_params)}")
-            print(f"阶段 '{new_stage_info['name']}' 超参数:")
-            print(f"  lr: {stage_lr}")
-            print(f"  weight_decay: {stage_weight_decay}")
-            print(f"  milestones: {stage_milestones}")
-            print(f"  gamma: {stage_gamma}")
+            # 重新创建优化器/调度器（只优化激活的参数）
+            optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, new_stage_info, use_multi_gpu)
             
             # 创建或更新数据加载器（如果启用分阶段训练）
             if staged_training_config and staged_training_config.get('enabled', False):
-                # 显式清理旧的DataLoader（如果存在）
-                if 'train_loader' in locals() and train_loader is not None:
-                    print("清理旧的DataLoader...")
-                    # 使用dataset的cleanup方法清理共享内存
-                    if hasattr(train_loader.dataset, 'cleanup'):
-                        train_loader.dataset.cleanup()
-                    if hasattr(test_loader, 'dataset') and hasattr(test_loader.dataset, 'cleanup'):
-                        test_loader.dataset.cleanup()
-                    
-                    # 删除引用
-                    del train_loader
-                    del test_loader
-                    
-                    # 强制垃圾回收
-                    import gc
-                    gc.collect()
-                    
-                    # 清理GPU缓存（如果使用GPU）
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    print("旧DataLoader清理完成")
-                
-                from train_transpose import create_staged_dataloaders
-                new_train_loader, new_test_loader = create_staged_dataloaders(cfg, new_stage_info)
-                
-                # 如果成功创建了新的数据加载器，则更新
-                if new_train_loader is not None:
-                    train_loader = new_train_loader
-                    test_loader = new_test_loader
-                    print(f"已为阶段 '{new_stage_info['name']}' 创建新的数据加载器")
-                elif train_loader is None:
-                    print(f"错误: 无法为阶段 '{new_stage_info['name']}' 创建数据加载器")
+                train_loader, test_loader = rebuild_dataloaders_if_needed(cfg, new_stage_info, train_loader, test_loader)
+                if train_loader is None:
                     return model, optimizer
         
-        # 如果 current_stage_info 仍然是 None（传统训练模式），设置一个默认的阶段信息
-        if current_stage_info is None:
-            current_stage_info = get_training_stage(epoch, staged_training_config, is_debug=cfg.debug)
-            
-            # 如果是模块化训练模式，也需要正确配置模块
-            if modular_training_config and modular_training_config.get('enabled', False):
-                print(f"模块化训练模式：为初始阶段 '{current_stage_info['name']}' 配置模块")
-                # 注意：模型已经在初始化时正确配置了，这里只需要配置训练参数
-                configure_training_modules(model, current_stage_info)
-            else:
-                configure_training_modules(model, current_stage_info)
-            
-            # 为传统训练模式创建基于阶段配置的优化器和调度器
-            if optimizer is None:
-                trainable_params = [p for p in model.parameters() if p.requires_grad]
-                stage_lr = current_stage_info.get('lr', cfg.lr)
-                stage_weight_decay = current_stage_info.get('weight_decay', cfg.weight_decay)
-                stage_milestones = current_stage_info.get('milestones', cfg.milestones)
-                stage_gamma = current_stage_info.get('gamma', cfg.gamma)
-                
-                # 多GPU时调整学习率
-                if use_multi_gpu:
-                    stage_lr = stage_lr * len(cfg.gpus)
-                    print(f"多GPU训练，学习率调整为: {stage_lr}")
-                
-                optimizer = optim.AdamW(trainable_params, lr=stage_lr, weight_decay=stage_weight_decay)
-                scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=stage_milestones, gamma=stage_gamma)
-                
-                print(f"传统训练模式初始化优化器，可训练参数数量: {sum(p.numel() for p in trainable_params)}")
-                print(f"传统训练阶段 '{current_stage_info['name']}' 超参数:")
-                print(f"  lr: {stage_lr}")
-                print(f"  weight_decay: {stage_weight_decay}")
-                print(f"  milestones: {stage_milestones}")
-                print(f"  gamma: {stage_gamma}")
-            
-            # 初始化传统训练模式的损失值
-            current_stage_best_loss = float('inf')
-            print(f"传统训练模式阶段 '{current_stage_info['name']}'：将使用阶段特定测试损失进行模型选择")
+        # current_stage_info 在分阶段路径中总会被设置
 
         # 训练阶段
         model.train()
@@ -1113,43 +1206,8 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
         train_iter = tqdm(train_loader, desc=f'Epoch {epoch} - {current_stage_info["name"]}', leave=False)
         
         for batch in train_iter:
-            # 准备数据
-            root_pos = batch["root_pos"].to(device)
-            motion = batch["motion"].to(device)
-            human_imu = batch["human_imu"].to(device)
-            root_vel = batch["root_vel"].to(device)
-            
-            # 处理可选的物体数据
-            bs, seq = human_imu.shape[:2]
-            obj_imu = batch.get("obj_imu", None)
-            obj_rot = batch.get("obj_rot", None)
-            obj_trans = batch.get("obj_trans", None)
-            if obj_imu is not None:
-                obj_imu = obj_imu.to(device)
-            else:
-                obj_imu = torch.zeros((bs, seq, 1, cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9), device=device, dtype=human_imu.dtype)
-            if obj_rot is not None:
-                obj_rot = obj_rot.to(device)
-            else:
-                obj_rot = torch.zeros((bs, seq, 6), device=device, dtype=motion.dtype)
-            if obj_trans is not None:
-                obj_trans = obj_trans.to(device)
-            else:
-                obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
-            
-            # 构建传递给模型的data_dict
-            # 根据当前阶段决定是否使用物体数据
-            use_object_data = current_stage_info['use_object_data']
-            
-            data_dict = {
-                "human_imu": human_imu,
-                "obj_imu": obj_imu,
-                "motion": motion,
-                "root_pos": root_pos,
-                "obj_rot": obj_rot,
-                "obj_trans": obj_trans,
-                "use_object_data": use_object_data
-            }
+            # 构建前向输入
+            data_dict = build_model_input_dict(batch, current_stage_info, cfg, device, add_noise=True)
             
             # 前向传播
             optimizer.zero_grad()
@@ -1228,36 +1286,8 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             with torch.no_grad():
                 test_iter = tqdm(test_loader, desc=f'Test Epoch {epoch} - {current_stage_info["name"]}', leave=False)
                 for batch in test_iter:
-                    # 准备测试数据（与训练类似）
-                    root_pos = batch["root_pos"].to(device)
-                    motion = batch["motion"].to(device)
-                    human_imu = batch["human_imu"].to(device)
-                    root_vel = batch["root_vel"].to(device)
-                    
-                    bs, seq = human_imu.shape[:2]
-                    obj_imu = batch.get("obj_imu", None)
-                    obj_rot = batch.get("obj_rot", None)
-                    obj_trans = batch.get("obj_trans", None)
-                    if obj_imu is not None: obj_imu = obj_imu.to(device)
-                    else: obj_imu = torch.zeros((bs, seq, 1, cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9), device=device, dtype=human_imu.dtype)
-                    if obj_rot is not None: obj_rot = obj_rot.to(device)
-                    else: obj_rot = torch.zeros((bs, seq, 6), device=device, dtype=motion.dtype)
-                    if obj_trans is not None: obj_trans = obj_trans.to(device)
-                    else: obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
-                    
-                    # 前向传播
-                    use_object_data = current_stage_info['use_object_data']
-                    
-                    # 构建 data_dict_eval
-                    data_dict_eval = {
-                        "human_imu": human_imu,
-                        "obj_imu": obj_imu,
-                        "motion": motion,
-                        "root_pos": root_pos,
-                        "obj_rot": obj_rot,
-                        "obj_trans": obj_trans,
-                        "use_object_data": use_object_data
-                    }
+                    # 构建评估输入
+                    data_dict_eval = build_model_input_dict(batch, current_stage_info, cfg, device, add_noise=False)
                     
                     pred_dict = model(data_dict_eval)
                     
@@ -1331,7 +1361,7 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
             should_save_model = False
             
             # 使用阶段特定的测试损失进行模型选择
-            if stage_test_loss < current_stage_best_loss and not cfg.debug:
+            if stage_test_loss < current_stage_best_loss:
                 current_stage_best_loss = stage_test_loss
                 # 同时更新全局最佳损失（用于跨阶段比较）
                 if stage_test_loss < best_loss:
@@ -1420,47 +1450,46 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
                 print(f'\nEpoch {epoch}, Stage: {current_stage_info["name"]}, Stage Epoch: {current_stage_info["stage_epoch"]}, LR: {current_lr:.6f}')
     
     # 保存最终阶段的检查点
-    if current_stage_info is not None and not cfg.debug:
+    if current_stage_info is not None:
         # 使用当前阶段的最佳损失值保存最终检查点
         final_stage_loss = current_stage_best_loss
         save_stage_checkpoint(model, optimizer, max_epoch-1, current_stage_info, save_dir, final_stage_loss, None, "final_stage")
     
-    # 保存最终模型（基于最佳综合损失）
-    if not cfg.debug:
-        # 尝试加载最后阶段的最佳模型作为最终模型
-        if current_stage_info is not None:
-            final_best_stage_path = os.path.join(save_dir, f'stage_best_{current_stage_info["name"]}.pt')
-            if os.path.exists(final_best_stage_path):
-                # 复制最佳模型为最终模型
-                import shutil
-                final_path = os.path.join(save_dir, 'final.pt')
-                shutil.copy2(final_best_stage_path, final_path)
-                print(f'Copying best stage model to final model: {final_path}')
-                
-                # 读取并打印最佳模型信息
-                checkpoint = torch.load(final_best_stage_path, map_location=device)
-                print(f'Final model - Epoch: {checkpoint["epoch"]}, Stage Test Loss: {checkpoint.get("stage_test_loss", "N/A")}')
-            else:
-                # 兜底：保存当前模型
-                final_path = os.path.join(save_dir, 'final.pt')
-                print(f'Saving current model as final to {final_path}')
-                model_state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-                torch.save({
-                    'epoch': max_epoch - 1,
-                    'stage_info': current_stage_info,
-                    'model_state_dict': model_state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': train_loss,
-                    'stage_test_loss': current_stage_best_loss,
-                }, final_path)
-        
-        # 保存最终的损失曲线
-        loss_curves = {
-            'train_losses': train_losses,
-            'test_losses': test_losses,
-        }
-        with open(os.path.join(save_dir, 'loss_curves.pkl'), 'wb') as f:
-            pickle.dump(loss_curves, f)
+    # 保存最终模型（基于阶段最佳损失）
+    # 尝试加载最后阶段的最佳模型作为最终模型
+    if current_stage_info is not None:
+        final_best_stage_path = os.path.join(save_dir, f'stage_best_{current_stage_info["name"]}.pt')
+        if os.path.exists(final_best_stage_path):
+            # 复制最佳模型为最终模型
+            import shutil
+            final_path = os.path.join(save_dir, 'final.pt')
+            shutil.copy2(final_best_stage_path, final_path)
+            print(f'Copying best stage model to final model: {final_path}')
+            
+            # 读取并打印最佳模型信息
+            checkpoint = torch.load(final_best_stage_path, map_location=device)
+            print(f'Final model - Epoch: {checkpoint["epoch"]}, Stage Test Loss: {checkpoint.get("stage_test_loss", "N/A")}')
+        else:
+            # 兜底：保存当前模型
+            final_path = os.path.join(save_dir, 'final.pt')
+            print(f'Saving current model as final to {final_path}')
+            model_state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            torch.save({
+                'epoch': max_epoch - 1,
+                'stage_info': current_stage_info,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_loss,
+                'stage_test_loss': current_stage_best_loss,
+            }, final_path)
+    
+    # 保存最终的损失曲线
+    loss_curves = {
+        'train_losses': train_losses,
+        'test_losses': test_losses,
+    }
+    with open(os.path.join(save_dir, 'loss_curves.pkl'), 'wb') as f:
+        pickle.dump(loss_curves, f)
     
     # 如果使用tensorboard，保存最终指标并关闭writer
     if writer is not None:
@@ -1496,63 +1525,5 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
 
 
 def load_transpose_model(cfg, checkpoint_path):
-    """
-    加载TransPose模型
-    
-    Args:
-        cfg: 配置信息
-        checkpoint_path: 模型检查点路径
-        
-    Returns:
-        model: 加载的模型
-    """
-    device = torch.device(cfg.device if hasattr(cfg, 'device') else f'cuda:{cfg.gpus[0]}' if torch.cuda.is_available() else 'cpu')
-    
-    # 读取模块化训练配置
-    staged_training_config = getattr(cfg, 'staged_training', None)
-    pretrained_modules = None
-    skip_modules = None
-    
-    if staged_training_config and staged_training_config.get('enabled', False):
-        modular_training_config = staged_training_config.get('modular_training', {})
-        if modular_training_config and modular_training_config.get('enabled', False):
-            pretrained_modules = modular_training_config.get('pretrained_modules', {})
-            print(f'Using modular training configuration: {pretrained_modules}')
-    
-    # 如果启用了模块化训练，使用模块化方式创建模型
-    if pretrained_modules is not None:
-        model = TransPoseNet(cfg, pretrained_modules=pretrained_modules, skip_modules=skip_modules).to(device)
-        print(f'Created modular TransPose model')
-    else:
-        model = TransPoseNet(cfg).to(device)
-        
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        print(f'Loaded TransPose model from {checkpoint_path}, epoch {checkpoint["epoch"]}')
-        
-        # 如果检查点包含阶段信息，打印出来
-        if 'stage_info' in checkpoint:
-            stage_info = checkpoint['stage_info']
-            print(f'Loaded model trained with stage: {stage_info["name"]}')
-            print(f'Active modules were: {stage_info["active_modules"]}')
-    
-    # 解决 LSTM 内存警告：调用 flatten_parameters()
-    def flatten_lstm_parameters(module):
-        """递归调用所有 LSTM 模块的 flatten_parameters()"""
-        for child in module.children():
-            if isinstance(child, torch.nn.LSTM):
-                child.flatten_parameters()
-            else:
-                flatten_lstm_parameters(child)
-    
-    flatten_lstm_parameters(model)
-    
-    # 多GPU包装（如果需要）
-    use_multi_gpu = getattr(cfg, 'use_multi_gpu', False) and len(cfg.gpus) > 1
-    if use_multi_gpu:
-        print(f'Wrapping loaded model with DataParallel for GPUs: {cfg.gpus}')
-        model = torch.nn.DataParallel(model, device_ids=cfg.gpus)
-    
-    return model
+    """(已删除) 兼容占位：不再支持加载完整旧检查点，请使用 staged_training.modular_training.pretrained_modules"""
+    raise NotImplementedError("请在配置文件中通过 staged_training.modular_training.pretrained_modules 指定模块权重")

@@ -21,7 +21,6 @@ from dataloader.dataloader import IMUDataset # 从 eval.py 引入
 # 导入模型相关 - 根据需要选择正确的模型加载方式
 # from models.DiT_model import MotionDiffusion # 如果要用 DiT
 from models.TransPose_net import TransPoseNet # 明确使用 TransPose
-from models.do_train_imu_TransPose import load_transpose_model # 或者使用这个加载函数
 
 import imgui
 from aitviewer.renderables.spheres import Spheres
@@ -140,7 +139,7 @@ def merge_two_parts(verts_list, faces_list, device='cpu'):
 def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_bottom_trans=None, obj_bottom_rot=None, obj_geo_root='./dataset/captured_objects', device='cpu'):
     """ 加载物体几何体并应用变换 (OMOMO 方式) """
     if obj_name is None:
-        print("警告: 物体名称为 None，无法加载几何体。")
+        print("Warning: Object name is None, cannot load geometry.")
         return torch.zeros((1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
 
     # Ensure transformations are tensors on the correct device
@@ -162,7 +161,7 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
         bottom_obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified_bottom.obj")
 
         if not os.path.exists(top_obj_mesh_path) or not os.path.exists(bottom_obj_mesh_path):
-             print(f"警告: 找不到物体 {obj_name} 的两部分几何文件。将尝试加载整体文件。")
+             print(f"Warning: Cannot find two-part geometry files for object {obj_name}. Will try to load the complete file.")
              two_parts = False
              obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj") # Fallback
         else:
@@ -173,14 +172,47 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
 
     if not two_parts:
         if not os.path.exists(obj_mesh_path):
-             print(f"警告: 找不到物体几何文件: {obj_mesh_path}")
+             print(f"Warning: Cannot find object geometry file: {obj_mesh_path}")
              return torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
         obj_mesh_verts, obj_mesh_faces = apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
 
     return obj_mesh_verts, obj_mesh_faces
 
 
-def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False):
+def compute_virtual_bone_info(wrist_pos, obj_trans, obj_rot_mat):
+    """
+    计算虚拟骨长和方向（轴角表示）
+    
+    Args:
+        wrist_pos: [T, 3] - 手腕位置
+        obj_trans: [T, 3] - 物体位置  
+        obj_rot_mat: [T, 3, 3] - 物体旋转矩阵
+    
+    Returns:
+        bone_length: [T] - 虚拟骨长
+        obj_direction_axis_angle: [T, 3] - 物体坐标系下方向的轴角表示
+    """
+    # 1. 计算世界坐标系下的向量
+    v_HO_world = obj_trans - wrist_pos  # [T, 3]
+    
+    # 2. 计算骨长
+    bone_length = torch.norm(v_HO_world, dim=1)  # [T]
+    
+    # 3. 归一化得到世界坐标系下的单位向量
+    v_HO_world_unit = v_HO_world / (bone_length.unsqueeze(-1) + 1e-8)  # [T, 3]
+    
+    # 4. 转换到物体坐标系：^Ov_{HO} = ^WR_O^T * ^Wv_{HO}
+    obj_rot_inv = obj_rot_mat.transpose(-1, -2)  # [T, 3, 3]
+    obj_direction = torch.bmm(obj_rot_inv, v_HO_world_unit.unsqueeze(-1)).squeeze(-1)  # [T, 3]
+    
+    # 5. 将方向向量转换为轴角表示
+    # 这里我们直接将物体坐标系下的方向向量作为轴角表示
+    # 因为这个向量本身就包含了方向和幅度信息
+    obj_direction_axis_angle = obj_direction  # [T, 3]
+    
+    return bone_length, obj_direction_axis_angle
+
+def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False, use_fk=False):
     """ 在 aitviewer 场景中可视化单个批次的数据 (真值和预测) """
     # --- Revised Clearing Logic (Attempt 5 - Using Scene.remove) ---
     try:
@@ -310,19 +342,34 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     "root_pos": gt_root_pos,           # 新增
                 }
             
-            # 添加虚拟关节数据（TransPose模型需要）
-            
             has_object_data_for_model = obj_imu is not None
             if has_object_data_for_model:
                 model_input["obj_imu"] = obj_imu # [bs, T, 1, dim]
                 model_input["obj_rot"] = gt_obj_rot_6d # [bs, T, 6]
                 model_input["obj_trans"] = gt_obj_trans # [bs, T, 3]
+            
+            # 添加GT手部位置（如果可用）
+            position_global_norm = batch.get("position_global_norm", None)
+            if position_global_norm is not None and position_global_norm.shape[1] == T:
+                try:
+                    wrist_l_idx, wrist_r_idx = 20, 21
+                    pos = position_global_norm.to(device)
+                    lhand_pos = pos[:, :, wrist_l_idx, :]
+                    rhand_pos = pos[:, :, wrist_r_idx, :]
+                    gt_hands_pos = torch.stack([lhand_pos, rhand_pos], dim=2)  # [bs, seq, 2, 3]
+                    model_input["gt_hands_pos"] = gt_hands_pos
+                except Exception:
+                    # 如果提取失败，创建零值
+                    model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_root_pos.dtype)
+            else:
+                # 如果没有position_global_norm，创建零值
+                model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_root_pos.dtype)
 
             try:
                 pred_dict = model(model_input)
                 pred_motion = pred_dict.get("motion") # [bs, T, 132]
                 pred_obj_rot = pred_dict.get("obj_rot") # [bs, T, 6] (TransPose 输出 6D)
-                pred_obj_trans = pred_dict.get("pred_obj_trans_from_contact") # [bs, T, 3] (使用新的基于接触的FK方法)
+                pred_obj_trans = pred_dict.get("pred_obj_trans") # 默认使用融合后的物体位置
                 pred_root_pos = pred_dict.get("root_pos") # [bs, T, 3]
 
                 # --- Get predicted contact probabilities ---
@@ -354,30 +401,30 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 if pred_motion is not None:
                     pred_motion_seq = pred_motion[bs] # [T, 132]
                 else:
-                    print("警告: 模型未输出 'motion'")
+                    print("Warning: Model did not output 'motion'")
 
                 if pred_root_pos is not None:
                     pred_root_pos_seq = pred_root_pos[bs] # [T, 3]
                 else:
-                    print("警告: 模型未输出 'root_pos'")
+                    print("Warning: Model did not output 'root_pos'")
 
                 if pred_obj_rot is not None:
                     pred_obj_rot_6d_seq = pred_obj_rot[bs] # [T, 6]
                 elif has_object_data_for_model:
-                    print("警告: 模型未输出 'obj_rot'，即使有物体 IMU 输入")
+                    print("Warning: Model did not output 'obj_rot', even with object IMU input")
 
                 # 新增：获取预测的物体平移
                 if pred_obj_trans is not None:
                     pred_obj_trans_seq = pred_obj_trans[bs] # [T, 3]
                 elif has_object_data_for_model:
-                    print("警告: 模型未输出 'obj_trans'，即使有物体 IMU 输入")
+                    print("Warning: Model did not output 'obj_trans', even with object IMU input")
 
             except Exception as e:
-                print(f"模型推理失败: {e}")
+                print(f"Model inference failed: {e}")
                 import traceback
                 traceback.print_exc()
         else:
-            print("仅真值模式：跳过模型推理")
+            print("GT-only mode: Skip model inference")
 
         # --- 4. 获取预测 SMPL (使用预测 motion + 真值 trans) ---
         verts_pred_seq = None
@@ -449,8 +496,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         device=device
                     )
                 else:
-                    # 如果没有预测平移，回退到使用真值平移
-                    print("警告: 没有预测的物体平移，使用真值平移进行可视化")
+                    # If no predicted translation, fallback to using GT translation
+                    print("Warning: No predicted object translation, using GT translation for visualization")
                     pred_obj_verts_seq, _ = load_object_geometry(
                         obj_name, 
                         gt_obj_rot_mat_seq, # 使用真值旋转
@@ -776,11 +823,105 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             viewer.scene.add(pred_rfoot_spheres)
         # --- 结束足部接触可视化 ---
 
+        # --- 计算并存储虚拟骨长和方向信息 ---
+        viewer.virtual_bone_info = {}  # 初始化存储字典
+        
+        if has_object_gt and gt_obj_trans_seq is not None and gt_obj_rot_mat_seq is not None:
+            # 计算左手虚拟骨长和方向
+            lhand_pos_seq = Jtr_gt_seq[:, lhand_idx, :]  # [T, 3]
+            lhand_bone_length, lhand_direction_axis_angle = compute_virtual_bone_info(
+                lhand_pos_seq, gt_obj_trans_seq, gt_obj_rot_mat_seq
+            )
+            
+            # 计算右手虚拟骨长和方向  
+            rhand_pos_seq = Jtr_gt_seq[:, rhand_idx, :]  # [T, 3]
+            rhand_bone_length, rhand_direction_axis_angle = compute_virtual_bone_info(
+                rhand_pos_seq, gt_obj_trans_seq, gt_obj_rot_mat_seq
+            )
+            
+            # 从模型预测中获取门控权重、物体速度输入和预测的虚拟骨长方向（如果有预测结果）
+            gating_weights = None
+            obj_vel_input = None
+            pred_lhand_bone_length = None
+            pred_rhand_bone_length = None
+            pred_lhand_direction = None
+            pred_rhand_direction = None
+            
+            if not vis_gt_only and 'gating_weights' in pred_dict:
+                gating_weights = pred_dict['gating_weights'][bs].cpu().numpy()  # [T, 3]
+            if not vis_gt_only and 'obj_vel_input' in pred_dict:
+                obj_vel_input = pred_dict['obj_vel_input'][bs].cpu().numpy()  # [T, 3]
+            
+            # 获取预测的左右手虚拟骨长和方向（按需从模型内部计算FK）
+            using_fk_data = False
+            if use_fk and (not vis_gt_only) and pred_obj_trans_seq is not None and 'pred_hand_contact_prob' in pred_dict:
+                try:
+                    # 手部位置 [bs, T, 2, 3]
+                    pred_hand_positions = pred_dict.get('pred_hand_pos', None)
+                    if pred_hand_positions is None:
+                        hands_pos_feat = pred_dict.get('hands_pos_feat', None)
+                        if hands_pos_feat is not None:
+                            pred_hand_positions = hands_pos_feat.reshape(1, T, 2, 3)
+                    # 物体旋转矩阵 [bs, T, 3, 3]
+                    obj_rot_mat_seq = gt_obj_rot_mat_seq.unsqueeze(0)
+                    pred_obj_trans_fk_seq, fk_bone_info_seq = model.object_trans_module.predict_object_position_from_contact(
+                        pred_hand_contact_prob=pred_dict['pred_hand_contact_prob'],
+                        pred_hand_positions=pred_hand_positions,
+                        obj_rot_matrix=obj_rot_mat_seq,
+                        gt_obj_trans=gt_obj_trans.unsqueeze(0)
+                    )
+                    # 取出bs=0
+                    pred_obj_trans_fk_seq = pred_obj_trans_fk_seq[0]
+                    pred_obj_trans_seq = pred_obj_trans_fk_seq
+                    using_fk_data = True
+                    # 同时取骨长与方向
+                    pred_lhand_bone_length = fk_bone_info_seq['fk_lhand_bone_length'][0].cpu().numpy()
+                    pred_rhand_bone_length = fk_bone_info_seq['fk_rhand_bone_length'][0].cpu().numpy()
+                    pred_lhand_direction = fk_bone_info_seq['fk_lhand_direction'][0].cpu().numpy()
+                    pred_rhand_direction = fk_bone_info_seq['fk_rhand_direction'][0].cpu().numpy()
+                except Exception as _e:
+                    using_fk_data = False
+
+            # 如果未使用按需FK，则退回融合方案的骨长/方向（若有）
+            if not using_fk_data and not vis_gt_only and 'pred_lhand_lb' in pred_dict:
+                pred_lhand_bone_length = pred_dict['pred_lhand_lb'][bs].cpu().numpy()  # [T] 融合方案骨长
+            if not using_fk_data and not vis_gt_only and 'pred_rhand_lb' in pred_dict:
+                pred_rhand_bone_length = pred_dict['pred_rhand_lb'][bs].cpu().numpy()  # [T] 融合方案骨长
+            if not using_fk_data and not vis_gt_only and 'pred_lhand_obj_direction' in pred_dict:
+                pred_lhand_direction = pred_dict['pred_lhand_obj_direction'][bs].cpu().numpy()  # [T, 3] 融合方案方向
+            if not using_fk_data and not vis_gt_only and 'pred_rhand_obj_direction' in pred_dict:
+                pred_rhand_direction = pred_dict['pred_rhand_obj_direction'][bs].cpu().numpy()  # [T, 3] 融合方案方向
+            
+            
+            # 存储到viewer中供GUI显示使用
+            viewer.virtual_bone_info = {
+                'has_data': True,
+                # GT数据
+                'gt_lhand_bone_length': lhand_bone_length.cpu().numpy(),  # [T] - 真值左手骨长
+                'gt_rhand_bone_length': rhand_bone_length.cpu().numpy(),  # [T] - 真值右手骨长  
+                'gt_lhand_direction_axis_angle': lhand_direction_axis_angle.cpu().numpy(),  # [T, 3] - 真值左手方向
+                'gt_rhand_direction_axis_angle': rhand_direction_axis_angle.cpu().numpy(),  # [T, 3] - 真值右手方向
+                # 预测数据
+                'pred_lhand_bone_length': pred_lhand_bone_length,  # [T] or None - 预测左手骨长
+                'pred_rhand_bone_length': pred_rhand_bone_length,  # [T] or None - 预测右手骨长
+                'pred_lhand_direction': pred_lhand_direction,  # [T, 3] or None - 预测左手方向  
+                'pred_rhand_direction': pred_rhand_direction,  # [T, 3] or None - 预测右手方向
+                # 方案标识
+                'using_fk_data': using_fk_data,  # 是否在可视化时动态使用了FK方案
+                'prediction_method': 'FK Scheme (on-demand)' if (use_fk and using_fk_data) else 'Fusion Scheme',  # 预测方法名称
+                # 其他信息
+                'gating_weights': gating_weights,  # [T, 3] - 门控权重
+                'obj_vel_input': obj_vel_input,  # [T, 3] - 物体速度输入
+                'num_frames': T
+            }
+        else:
+            viewer.virtual_bone_info = {'has_data': False}
+
 
 # === 自定义 Viewer 类 ===
 
 class InteractiveViewer(Viewer):
-    def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False, **kwargs):
+    def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, show_objects=True, vis_gt_only=False, show_foot_contact=False, use_fk=False, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list # 直接使用加载到内存的列表
         self.current_index = 0
@@ -792,6 +933,10 @@ class InteractiveViewer(Viewer):
         self.vis_gt_only = vis_gt_only
         self.show_foot_contact = show_foot_contact
         self.obj_geo_root = obj_geo_root
+        self.use_fk = use_fk
+        
+        # 初始化虚拟骨长信息
+        self.virtual_bone_info = {'has_data': False}
 
         # 设置初始相机位置 (可选)
         # self.scene.camera.position = np.array([0.0, 1.0, 3.0])
@@ -802,14 +947,14 @@ class InteractiveViewer(Viewer):
 
     def visualize_current_sequence(self):
         if not self.data_list:
-            print("错误：数据列表为空。")
+            print("Error: Data list is empty.")
             return
         if 0 <= self.current_index < len(self.data_list):
             batch = self.data_list[self.current_index]
-            mode_str = " (仅真值)" if self.vis_gt_only else " (真值+预测)"
+            mode_str = " (GT only)" if self.vis_gt_only else " (GT+Pred)"
             print(f"Visualizing sequence index: {self.current_index}{mode_str}")
             try:
-                visualize_batch_data(self, batch, self.model, self.smpl_model, self.device, self.obj_geo_root, self.show_objects, self.vis_gt_only, self.show_foot_contact)
+                visualize_batch_data(self, batch, self.model, self.smpl_model, self.device, self.obj_geo_root, self.show_objects, self.vis_gt_only, self.show_foot_contact, self.use_fk)
                 self.title = f"Sequence Index: {self.current_index}/{len(self.data_list)-1}{mode_str} (q/e:±1, Ctrl+q/e:±10, Alt+q/e:±50)"
             except Exception as e:
                  print(f"Error visualizing sequence {self.current_index}: {e}")
@@ -818,6 +963,213 @@ class InteractiveViewer(Viewer):
                  self.title = f"Error visualizing index: {self.current_index}"
         else:
             print("Index out of bounds.")
+
+    def gui_scene(self):
+        """重写GUI场景方法，添加虚拟骨长信息显示"""
+        # 调用父类的GUI场景方法
+        super().gui_scene()
+        
+        # 添加虚拟骨长信息窗口
+        if self.virtual_bone_info.get('has_data', False):
+            self.render_virtual_bone_info_window()
+    
+    def render_virtual_bone_info_window(self):
+        """渲染虚拟骨长信息窗口"""
+        # 获取当前帧ID
+        current_frame = self.scene.current_frame_id
+        num_frames = self.virtual_bone_info.get('num_frames', 0)
+        
+        # 确保帧ID在有效范围内
+        if not (0 <= current_frame < num_frames):
+            return
+        
+        # Create virtual bone info window - make it wider for comparison
+        imgui.set_next_window_size(500, 600)  # 设置窗口大小：宽度500，高度600
+        
+        # 获取预测方法信息
+        prediction_method = self.virtual_bone_info.get('prediction_method', 'Unknown Scheme')
+        using_fk_data = self.virtual_bone_info.get('using_fk_data', False)
+        
+        imgui.begin(f"Virtual Bone GT vs Pred Comparison [{prediction_method}]", True)
+        
+        # Get current frame GT data
+        gt_lhand_bone_length = self.virtual_bone_info['gt_lhand_bone_length'][current_frame]
+        gt_rhand_bone_length = self.virtual_bone_info['gt_rhand_bone_length'][current_frame]
+        gt_lhand_direction = self.virtual_bone_info['gt_lhand_direction_axis_angle'][current_frame]
+        gt_rhand_direction = self.virtual_bone_info['gt_rhand_direction_axis_angle'][current_frame]
+        
+        # Get current frame prediction data (if available)
+        pred_lhand_bone_length = self.virtual_bone_info.get('pred_lhand_bone_length', None)
+        pred_rhand_bone_length = self.virtual_bone_info.get('pred_rhand_bone_length', None)
+        pred_lhand_direction = self.virtual_bone_info.get('pred_lhand_direction', None)
+        pred_rhand_direction = self.virtual_bone_info.get('pred_rhand_direction', None)
+        
+        # Display current frame info
+        imgui.text(f"Frame: {current_frame}/{num_frames-1}")
+        
+        # Display prediction method info
+        imgui.text(f"Prediction Method: {prediction_method}")
+        if using_fk_data:
+            imgui.text_colored("• Shows FK scheme initial distance and direction", 0.2, 0.8, 0.2, 1.0)
+            imgui.text("• FK: Based on geometric constraints of contact segment first frame")
+        else:
+            imgui.text_colored("• Shows fusion scheme predicted bone length and direction", 0.8, 0.6, 0.2, 1.0)  
+            imgui.text("• Fusion: Network predicted time-varying bone length and direction")
+        imgui.separator()
+        
+        # === Left Hand Comparison ===
+        imgui.text("Left Hand Virtual Bone:")
+        imgui.columns(3, "LeftHandColumns")
+        imgui.text("GT")
+        imgui.next_column()
+        imgui.text("Pred")
+        imgui.next_column()
+        imgui.text("Error")
+        imgui.next_column()
+        imgui.separator()
+        
+        # Left hand bone length comparison
+        imgui.text(f"{gt_lhand_bone_length:.4f}")
+        imgui.next_column()
+        if pred_lhand_bone_length is not None:
+            pred_len = pred_lhand_bone_length[current_frame]
+            length_error = abs(pred_len - gt_lhand_bone_length)
+            imgui.text(f"{pred_len:.4f}")
+            imgui.next_column()
+            imgui.text(f"{length_error:.4f}")
+        else:
+            imgui.text("N/A")
+            imgui.next_column()
+            imgui.text("N/A")
+        imgui.next_column()
+        
+        # Left hand direction comparison
+        imgui.text(f"[{gt_lhand_direction[0]:.3f}, {gt_lhand_direction[1]:.3f}, {gt_lhand_direction[2]:.3f}]")
+        imgui.next_column()
+        if pred_lhand_direction is not None:
+            pred_dir = pred_lhand_direction[current_frame]
+            # Normalize both vectors to unit vectors
+            gt_norm = (gt_lhand_direction[0]**2 + gt_lhand_direction[1]**2 + gt_lhand_direction[2]**2)**0.5
+            pred_norm = (pred_dir[0]**2 + pred_dir[1]**2 + pred_dir[2]**2)**0.5
+            
+            if gt_norm > 1e-8 and pred_norm > 1e-8:
+                gt_unit = gt_lhand_direction / gt_norm
+                pred_unit = pred_dir / pred_norm
+                # Calculate angle between unit vectors: Δθ = arccos(u1 · u2)
+                dot_product = gt_unit[0] * pred_unit[0] + gt_unit[1] * pred_unit[1] + gt_unit[2] * pred_unit[2]
+                dot_product = max(-1.0, min(1.0, dot_product))  # Clamp to [-1, 1] for numerical stability
+                angle_error_rad = __import__('math').acos(abs(dot_product))  # Use abs to get smallest angle
+                angle_error_deg = angle_error_rad * 180.0 / 3.14159265359
+            else:
+                angle_error_deg = float('nan')
+            
+            imgui.text(f"[{pred_dir[0]:.3f}, {pred_dir[1]:.3f}, {pred_dir[2]:.3f}]")
+            imgui.next_column()
+            imgui.text(f"{angle_error_deg:.2f}°")
+        else:
+            imgui.text("N/A")
+            imgui.next_column()
+            imgui.text("N/A")
+        imgui.next_column()
+        
+        imgui.columns(1)  # Reset to single column
+        imgui.separator()
+        
+        # === Right Hand Comparison ===
+        imgui.text("Right Hand Virtual Bone:")
+        imgui.columns(3, "RightHandColumns")
+        imgui.text("GT")
+        imgui.next_column()
+        imgui.text("Pred")
+        imgui.next_column()
+        imgui.text("Error")
+        imgui.next_column()
+        imgui.separator()
+        
+        # Right hand bone length comparison
+        imgui.text(f"{gt_rhand_bone_length:.4f}")
+        imgui.next_column()
+        if pred_rhand_bone_length is not None:
+            pred_len = pred_rhand_bone_length[current_frame]
+            length_error = abs(pred_len - gt_rhand_bone_length)
+            imgui.text(f"{pred_len:.4f}")
+            imgui.next_column()
+            imgui.text(f"{length_error:.4f}")
+        else:
+            imgui.text("N/A")
+            imgui.next_column()
+            imgui.text("N/A")
+        imgui.next_column()
+        
+        # Right hand direction comparison
+        imgui.text(f"[{gt_rhand_direction[0]:.3f}, {gt_rhand_direction[1]:.3f}, {gt_rhand_direction[2]:.3f}]")
+        imgui.next_column()
+        if pred_rhand_direction is not None:
+            pred_dir = pred_rhand_direction[current_frame]
+            # Normalize both vectors to unit vectors
+            gt_norm = (gt_rhand_direction[0]**2 + gt_rhand_direction[1]**2 + gt_rhand_direction[2]**2)**0.5
+            pred_norm = (pred_dir[0]**2 + pred_dir[1]**2 + pred_dir[2]**2)**0.5
+            
+            if gt_norm > 1e-8 and pred_norm > 1e-8:
+                gt_unit = gt_rhand_direction / gt_norm
+                pred_unit = pred_dir / pred_norm
+                # Calculate angle between unit vectors: Δθ = arccos(u1 · u2)
+                dot_product = gt_unit[0] * pred_unit[0] + gt_unit[1] * pred_unit[1] + gt_unit[2] * pred_unit[2]
+                dot_product = max(-1.0, min(1.0, dot_product))  # Clamp to [-1, 1] for numerical stability
+                angle_error_rad = __import__('math').acos(abs(dot_product))  # Use abs to get smallest angle
+                angle_error_deg = angle_error_rad * 180.0 / 3.14159265359
+            else:
+                angle_error_deg = float('nan')
+            
+            imgui.text(f"[{pred_dir[0]:.3f}, {pred_dir[1]:.3f}, {pred_dir[2]:.3f}]")
+            imgui.next_column()
+            imgui.text(f"{angle_error_deg:.2f}°")
+        else:
+            imgui.text("N/A")
+            imgui.next_column()
+            imgui.text("N/A")
+        imgui.next_column()
+        
+        imgui.columns(1)  # Reset to single column
+        imgui.separator()
+        
+        # Display gating weights if available
+        gating_weights = self.virtual_bone_info.get('gating_weights', None)
+        if gating_weights is not None:
+            weights = gating_weights[current_frame]  # [3]
+            imgui.text("Gating Weights:")
+            imgui.text(f"  L-Hand: {weights[0]:.3f}")
+            imgui.text(f"  R-Hand: {weights[1]:.3f}")
+            imgui.text(f"  IMU:    {weights[2]:.3f}")
+            imgui.separator()
+        
+        # Display object velocity input if available
+        obj_vel_input = self.virtual_bone_info.get('obj_vel_input', None)
+        if obj_vel_input is not None:
+            velocity = obj_vel_input[current_frame]  # [3]
+            imgui.text("Object Velocity Input:")
+            imgui.text(f"  X: {velocity[0]:.4f}")
+            imgui.text(f"  Y: {velocity[1]:.4f}")
+            imgui.text(f"  Z: {velocity[2]:.4f}")
+            imgui.text(f"  Magnitude: {(velocity[0]**2 + velocity[1]**2 + velocity[2]**2)**0.5:.4f}")
+            imgui.separator()
+        
+        # Display additional info
+        imgui.text("Description:")
+        imgui.text("Length: Wrist to Object Distance (m)")
+        imgui.text("Direction: Unit Vector in Object Frame")
+        imgui.text("Error: Absolute Difference / Vector Angle Error (degrees)")
+        if using_fk_data:
+            imgui.text("FK Scheme: Fixed initial geometric constraints per contact segment")
+        else:
+            imgui.text("Fusion Scheme: Network time-varying prediction + gating fusion")
+            imgui.text("Gating: L/R-Hand FK vs IMU Integration")
+        
+        # Add total progress info
+        progress = (current_frame + 1) / num_frames * 100
+        imgui.text(f"Progress: {progress:.1f}%")
+        
+        imgui.end()
 
     # --- Rename to key_event and adjust logic --- 
     # def key_press_event(self, key, scancode: int, mods: KeyModifiers): # Old name and signature
@@ -850,9 +1202,9 @@ class InteractiveViewer(Viewer):
                         self.current_index = new_index
                         self.visualize_current_sequence()
                         self.scene.current_frame_id = 0
-                        print(f"后退50个序列到索引: {self.current_index}")
+                        print(f"Jump back 50 sequences to index: {self.current_index}")
                     else:
-                        print("已经在最前面的序列。")
+                        print("Already at the first sequence.")
                 elif ctrl_pressed:
                     # Ctrl + Q: 后退10个index
                     step = 10
@@ -861,9 +1213,9 @@ class InteractiveViewer(Viewer):
                         self.current_index = new_index
                         self.visualize_current_sequence()
                         self.scene.current_frame_id = 0
-                        print(f"后退10个序列到索引: {self.current_index}")
+                        print(f"Jump back 10 sequences to index: {self.current_index}")
                     else:
-                        print("已经在最前面的序列。")
+                        print("Already at the first sequence.")
                 else:
                     # Q: 后退1个index
                     if self.current_index > 0:
@@ -881,9 +1233,9 @@ class InteractiveViewer(Viewer):
                         self.current_index = new_index
                         self.visualize_current_sequence()
                         self.scene.current_frame_id = 0
-                        print(f"前进50个序列到索引: {self.current_index}")
+                        print(f"Jump forward 50 sequences to index: {self.current_index}")
                     else:
-                        print("已经在最后面的序列。")
+                        print("Already at the last sequence.")
                 elif ctrl_pressed:
                     # Ctrl + E: 前进10个index
                     step = 10
@@ -892,9 +1244,9 @@ class InteractiveViewer(Viewer):
                         self.current_index = new_index
                         self.visualize_current_sequence()
                         self.scene.current_frame_id = 0
-                        print(f"前进10个序列到索引: {self.current_index}")
+                        print(f"Jump forward 10 sequences to index: {self.current_index}")
                     else:
-                        print("已经在最后面的序列。")
+                        print("Already at the last sequence.")
                 else:
                     # E: 前进1个index
                     if self.current_index < len(self.data_list) - 1:
@@ -919,6 +1271,7 @@ def main():
     parser.add_argument('--no_objects', action='store_true', help='Do not load or visualize objects.')
     parser.add_argument('--vis_gt_only', action='store_true', help='Only visualize ground truth, skip model inference and prediction visualization.')
     parser.add_argument('--show_foot_contact', action='store_true', help='Visualize foot-ground contact indicators.')
+    parser.add_argument('--use_fk', action='store_true', help='Use on-demand FK for object translation and virtual bone info in visualization.')
     parser.add_argument('--limit_sequences', type=int, default=None, help='Limit the number of sequences to load for visualization.')
     args = parser.parse_args()
 
@@ -950,12 +1303,33 @@ def main():
     if not model_path:
         print("Error: No model path provided in config or via --model_path.")
         # return
-    model = load_transpose_model(config, model_path)
-    model = model.to(device)
+    # 使用配置中的 pretrained_modules 加载模块（与 eval.py 保持一致）
+    staged_cfg = config.get('staged_training', {}) if hasattr(config, 'get') else config.staged_training
+    modular_cfg = staged_cfg.get('modular_training', {}) if staged_cfg else {}
+    use_modular = bool(modular_cfg.get('enabled', False))
+    pretrained_modules = modular_cfg.get('pretrained_modules', {}) if use_modular else {}
+    if use_modular and pretrained_modules:
+        print("Loading TransPose model with pretrained modules for visualization:")
+        for k, v in pretrained_modules.items():
+            print(f"  - {k}: {v}")
+        model = TransPoseNet(config, pretrained_modules=pretrained_modules, skip_modules=[]).to(device)
+    else:
+        print("Warning: No pretrained_modules in config; initializing a fresh TransPoseNet for visualization.")
+        model = TransPoseNet(config).to(device)
     model.eval()
 
     # --- Load Test Dataset ---
-    test_data_dir = config.test.data_path
+    # 优先使用 OMOMO 数据集配置
+    test_data_dir = None
+    try:
+        if 'datasets' in config and 'omomo' in config.datasets and 'test_path' in config.datasets.omomo:
+            test_data_dir = config.datasets.omomo.test_path
+    except Exception:
+        pass
+    if args.test_data_dir:
+        test_data_dir = args.test_data_dir
+    if test_data_dir is None and hasattr(config, 'test') and 'data_path' in config.test:
+        test_data_dir = config.test.data_path
     if not test_data_dir or not os.path.exists(test_data_dir):
         print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
         return
@@ -1002,7 +1376,7 @@ def main():
     # --- Initialize and Run Viewer ---
     print("Initializing Interactive Viewer...")
     if args.vis_gt_only:
-        print("仅真值模式：将只显示真值数据，跳过模型推理")
+        print("GT-only mode: Will only show GT data, skip model inference")
     viewer_instance = InteractiveViewer(
         data_list=data_list,
         model=model,
@@ -1013,13 +1387,14 @@ def main():
         show_objects=(not args.no_objects),
         vis_gt_only=args.vis_gt_only,
         show_foot_contact=args.show_foot_contact,
+        use_fk=args.use_fk,
         window_size=(1920, 1080) # Example window size
         # Add other Viewer kwargs if needed (e.g., fps)
     )
     print("Viewer Initialized. Navigation controls:")
-    print("  q/e: 前进/后退 1个序列")
-    print("  Ctrl+q/e: 前进/后退 10个序列")
-    print("  Alt+q/e: 前进/后退 50个序列")
+    print("  q/e: Previous/Next 1 sequence")
+    print("  Ctrl+q/e: Previous/Next 10 sequences")
+    print("  Alt+q/e: Previous/Next 50 sequences")
     if args.show_foot_contact:
         print("Foot contact visualization enabled:")
         print("  GT Left Foot: Purple spheres")

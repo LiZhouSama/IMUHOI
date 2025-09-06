@@ -587,7 +587,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', obj_mesh_di
     
     # 如果没有物体数据或没有手部接触，跳过该序列
     if not obj_data or (not lhand_contact.any() and not rhand_contact.any()):
-        print(f"跳过序列 {seq_key}: 没有手部接触")
+        # print(f"跳过序列 {seq_key}: 没有手部接触")
         return 0
     
     # 找到连续的单手接触段
@@ -596,7 +596,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', obj_mesh_di
     )
     
     if not lhand_segments and not rhand_segments:
-        print(f"跳过序列 {seq_key}: 没有长度>={min_window}的连续单手接触段")
+        # print(f"跳过序列 {seq_key}: 没有长度>={min_window}的连续单手接触段")
         return 0
     
     # 组装基础数据

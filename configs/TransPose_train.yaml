@@ -59,71 +59,49 @@ staged_training:
   # 模块化训练配置
   modular_training:
     enabled: True  # 是否启用模块化训练
-    start_from_stage: "object_trans"  # 从哪个阶段开始训练，可选: "velocity_contact", "human_pose", "object_trans", "joint_training"
+    start_from_stage: "joint_training"  # 从哪个阶段开始训练，可选: "velocity_contact", "human_pose", "object_trans", "joint_training"
     pretrained_modules:  # 预训练模块路径
-      velocity_contact: "outputs/TransPose/transpose_07181907/modules/velocity_contact_best.pt"
-      human_pose: "outputs/TransPose/transpose_07201626/modules/human_pose_best.pt"
-      # object_trans: "outputs/TransPose/transpose_07222052/modules/object_trans_best.pt"
-  
-  # stages:
-  #   - name: "velocity_contact"
-  #     epochs: [0, 99]  # epoch范围：0-49 (共50个epoch)
-  #     modules: ["velocity_contact"]  # 激活的模块
-  #     datasets: ["mixed"]  # 使用的数据集类型：amass、omomo、mixed
-  #   - name: "human_pose_amass"  
-  #     epochs: [100, 199]  # epoch范围：50-149 (共100个epoch) - 先用AMASS训练基础人体姿态
-  #     modules: ["human_pose"]  # 激活的模块
-  #     datasets: ["amass"]  # 只使用AMASS数据集
-  #   - name: "human_pose_omomo"  
-  #     epochs: [200, 299]  # epoch范围：150-199 (共50个epoch) - 再用OMOMO微调
-  #     modules: ["human_pose"]  # 激活的模块
-  #     datasets: ["omomo"]  # 只使用OMOMO数据集
-  #   - name: "object_trans"
-  #     epochs: [300, 349]  # epoch范围：200-249 (共50个epoch)
-  #     modules: ["object_trans"]  # 激活的模块
-  #     datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-  #   - name: "joint_training"
-  #     epochs: [350, 499]  # epoch范围：250-399 (共150个epoch)
-  #     modules: ["human_pose", "object_trans"]  # 激活的模块
-  #     datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+      velocity_contact: "outputs/TransPose/transpose_08200259/modules/velocity_contact_best.pt"
+      human_pose: "outputs/TransPose/transpose_09051657/modules/human_pose_best.pt"
+      object_trans: "outputs/TransPose/transpose_09051657/modules/object_trans_best.pt"
   
   # 正常训练阶段配置（每个阶段都有独立的超参数）
   stages:
     - name: "velocity_contact"
-      epochs: [0, 149]  # epoch范围：0-149 (共150个epoch)
-      modules: ["velocity_contact"]  # 激活的模块
-      datasets: ["omomo"]  # 使用的数据集类型：amass、omomo、mixed
-      # 阶段特定的超参数
-      batch_size: 250
-      num_workers: 6
-      milestones: [50, 100]  # 相对于阶段内的epoch（第50、100个epoch时衰减）
+      epochs: 200  # 阶段时长（epoch 数）
+      modules: ["velocity_contact"]
+      datasets: ["omomo"]
+      batch_size: 50
+      milestones: [50, 100, 140, 170, 190]
       gamma: 0.2
-    - name: "human_pose"  
-      epochs: [150, 449]  # epoch范围：150-449 (共300个epoch)
-      modules: ["human_pose"]  # 激活的模块
-      datasets: ["omomo"]  # 只使用OMOMO数据集
-      # 阶段特定的超参数
-      batch_size: 50 
-      weight_decay: 0.0001
-      milestones: [100, 200, 250]  # 相对于阶段内的epoch
-      gamma: 0.5  # 更温和的衰减
+    - name: "human_pose"
+      epochs: 300  # 阶段时长（epoch 数）
+      modules: ["human_pose"]
+      datasets: ["omomo"]
+      batch_size: 40
+      milestones: [100, 200, 300]
+      gamma: 0.2
+    - name: "object_trans_hoi"
+      epochs: 300  # 阶段时长（epoch 数）
+      modules: ["object_trans"]
+      datasets: ["hoi"]
+      batch_size: 50
+      milestones: [100, 200, 300]
+      gamma: 0.2
     - name: "object_trans"
-      epochs: [450, 649]  # epoch范围：450-649 (共200个epoch)
-      modules: ["object_trans"]  # 激活的模块
-      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-      # 阶段特定的超参数
-      batch_size: 80  # 物体位置训练使用中等batch_size
-      milestones: [80, 150]  # 相对于阶段内的epoch
+      epochs: 300  # 阶段时长（epoch 数）
+      modules: ["object_trans"]
+      datasets: ["omomo"]
+      batch_size: 50
+      milestones: [100, 200, 300]
       gamma: 0.2
-    # - name: "joint_training"
-    #   epochs: [650, 849]  # epoch范围：650-849 (共200个epoch)
-    #   modules: ["human_pose", "object_trans"]  # 激活的模块
-    #   datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-    #   # 阶段特定的超参数
-    #   batch_size: 50  # 联合训练使用较小batch_size确保稳定性
-    #   lr: 0.0001  # 很低的学习率用于微调
-    #   milestones: [80, 120, 160]  # 相对于阶段内的epoch
-    #   gamma: 0.5
+    - name: "joint_training"
+      epochs: 300
+      modules: ["human_pose", "object_trans"]
+      datasets: ["omomo"]
+      batch_size: 50
+      milestones: [80, 120, 160, 200, 240, 280]
+      gamma: 0.2
 
   # stages:
   # - name: "velocity_contact"
@@ -144,26 +122,26 @@ staged_training:
   #   datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
 
   debug_stages:
-    - name: "velocity_contact"
-      epochs: [0, 1]  # epoch范围：0-2 (共3个epoch)
-      modules: ["velocity_contact"]  # 激活的模块
-      datasets: ["mixed"]  # 使用的数据集类型：amass、omomo、mixed
-    - name: "human_pose_amass"  
-      epochs: [2, 3]  # epoch范围：3-5 (共3个epoch) - 先用AMASS训练基础人体姿态
-      modules: ["human_pose"]  # 激活的模块
-      datasets: ["amass"]  # 只使用AMASS数据集
-    - name: "human_pose_omomo"  
-      epochs: [4, 5]  # epoch范围：6-8 (共3个epoch) - 再用OMOMO微调
-      modules: ["human_pose"]  # 激活的模块
-      datasets: ["omomo"]  # 只使用OMOMO数据集
-    - name: "object_trans"
-      epochs: [6, 7]  # epoch范围：9-11 (共3个epoch)
-      modules: ["object_trans"]  # 激活的模块
-      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-    - name: "joint_training"
-      epochs: [8, 9]  # epoch范围：12-19 (共8个epoch)
-      modules: ["human_pose", "object_trans"]  # 激活的模块
-      datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+  - name: "velocity_contact"
+    epochs: 11  # 阶段时长（epoch 数）
+    modules: ["velocity_contact"]  # 激活的模块
+    datasets: ["omomo"]  # 使用的数据集类型：amass、omomo、mixed
+  - name: "human_pose"  
+    epochs: 10  # 阶段时长（epoch 数）
+    modules: ["human_pose"]  # 激活的模块
+    datasets: ["omomo"]  # 只使用OMOMO数据集
+  - name: "object_trans_hoi"
+    epochs: 10  # 阶段时长（epoch 数）
+    modules: ["object_trans"]  # 激活的模块
+    datasets: ["hoi"]  # 只使用OMOMO数据集
+  - name: "object_trans"
+    epochs: 10  # 阶段时长（epoch 数）
+    modules: ["object_trans"]  # 激活的模块
+    datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
+  - name: "joint_training"
+    epochs: 10  
+    modules: ["human_pose", "object_trans"]  # 激活的模块
+    datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
 
 # 数据集配置
 datasets:
@@ -175,26 +153,44 @@ datasets:
     train_path: "processed_data_0701/train"
     test_path: "processed_data_0701/test"
     debug_path: "processed_data_0701/debug"  # OMOMO调试数据路径
+  hoi:
+    train_path: "processed_hoi_data_0803/train"
+    test_path: "processed_hoi_data_0803/test"
+    debug_path: "processed_hoi_data_0803/debug"
 
-# 损失权重配置
-loss_weights:
-  rot: 10  # 姿态损失权重
-  root_pos: 10  # 根节点位置损失权重
-  obj_trans: 5  # 物体位置损失权重
-  obj_relative_trans: 10  # 物体相对位置损失权重
-  obj_rot: 1.0  # 物体旋转损失权重
-  leaf_pos: 1.0  # 叶子节点位置损失权重
-  full_pos: 1.0  # 全身关节位置损失权重
-  root_vel: 10  # 根关节速度损失权重
-  tran_b2: 0.001  # 根关节速度损失权重
-  hand_contact: 1  # 手部接触损失权重
-  contact_aware: 1.0  # 接触感知损失权重
-  obj_vel: 1  # 物体速度损失权重
-  leaf_vel: 10  # 叶子节点速度损失权重
-  foot_contact: 1  # 足部接触损失权重
-  lhand_obj_direction: 6  # 左手物体方向向量损失权重
-  rhand_obj_direction: 6  # 右手物体方向向量损失权重
-  obj_trans_from_fk: 8  # 根据姿态计算的物体位置损失权重
+# # 损失权重配置
+# loss_weights:
+#   rot: 10  # 姿态损失权重
+#   root_pos: 10  # 根节点位置损失权重
+#   obj_trans: 5  # 物体位置损失权重
+#   obj_relative_trans: 10  # 物体相对位置损失权重
+#   obj_rot: 1.0  # 物体旋转损失权重
+#   leaf_pos: 1.0  # 叶子节点位置损失权重
+#   full_pos: 1.0  # 全身关节位置损失权重
+#   root_vel: 10  # 根关节速度损失权重
+#   tran_b2: 0.001  # 根关节速度损失权重
+#   hand_contact: 1  # 手部接触损失权重
+#   contact_aware: 1.0  # 接触感知损失权重
+#   obj_vel: 1  # 物体速度损失权重
+#   leaf_vel: 10  # 叶子节点速度损失权重
+#   foot_contact: 1  # 足部接触损失权重
+#   lhand_obj_direction: 6  # 左手物体方向向量损失权重
+#   rhand_obj_direction: 6  # 右手物体方向向量损失权重
+#   obj_trans_from_fk: 8  # 根据姿态计算的物体位置损失权重
+#   obj_trans_fused: 10   # 融合后的主位置监督
+#   obj_fk_pos: 4         # FK分支位置监督
+#   obj_vel_cons: 4       # 速度一致性
+#   obj_acc_smooth: 0.1   # 加速度平滑
+#   lhand_lb: 2           # 左手骨长监督
+#   rhand_lb: 2           # 右手骨长监督
+
+loss_weights: 
+  {
+    'obj_vel': 1, 'leaf_vel': 1, 'hand_contact': 1,
+    'rot': 10, 'root_pos': 10, 'leaf_pos': 10, 'full_pos': 10, 'root_vel': 10, 'foot_contact': 1,
+    'obj_trans_from_fk': 2, 'obj_trans_fused': 10, 'lhand_obj_direction': 1, 'rhand_obj_direction': 1,
+    'obj_vel_cons': 1, 'obj_acc_cons': 4, 'lhand_lb': 0.2, 'rhand_lb': 0.2,
+  }
 
 # 训练窗口配置
 train:
@@ -224,3 +220,8 @@ augmentation:
 noise_params:
   init_rotation_noise_std: 0.1  # 初始旋转矩阵噪声标准差
   bone_length_noise_std: 0.05   # 骨长噪声标准差 
+
+# 物体模块额外参数
+obj_trans_noise_std: 0.02
+gating_prior_beta: 2.0
+gating_temperature: 1.0

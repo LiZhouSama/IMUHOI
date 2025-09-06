@@ -11,7 +11,7 @@ CONFIG_PATH="configs/TransPose_train.yaml"
 SIMPLE_OBJT_MODULE_PATH="outputs/TransPose/transpose_08031938/modules/object_trans_best.pt"  # 例如: "outputs/TransPose/simple_objt/modules/object_trans_best.pt"
 
 # 数据路径
-TEST_DATA_DIR="processed_data_0701/test"
+TEST_DATA_DIR="processed_hoi_data_0803/test"
 SMPL_MODEL_PATH="body_models/smplh/neutral/model.npz"
 OBJ_GEO_ROOT="./dataset/captured_objects"
 

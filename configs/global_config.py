@@ -5,8 +5,8 @@ IMU_JOINTS_ROT = [18, 19, 4, 5, 15, 0]  #左手、右手、左脚、右脚、头
 IMU_JOINT_NAMES = ['left_hand', 'right_hand', 'left_foot', 'right_foot', 'head', 'hip']
 # HEAD_IDX = 2  # 头部在IMU_JOINTS列表中的索引
 FRAME_RATE = 30  # 帧率
-acc_scale = 30
-vel_scale = 3
+acc_scale = 1
+vel_scale = 1
 
 
 class joint_set:

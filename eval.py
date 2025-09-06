@@ -10,6 +10,7 @@ from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 import argparse
 from sklearn.metrics import f1_score, precision_score, recall_score
+from configs.global_config import FRAME_RATE
 
 def load_config(config_path):
     """加载配置文件"""
@@ -26,54 +27,33 @@ def load_smpl_model(smpl_model_path, device):
     ).to(device)
     return smpl_model
 
-def load_model(model_path, config, device):
-    """加载训练好的模型"""
-    input_length = config.test.get('window', config.train.get('window', 60))
+def load_model(config, device):
+    """加载训练好的模型（使用配置中的 pretrained_modules 进行模块化加载）"""
+    from models.TransPose_net import TransPoseNet
+    # 读取配置中的预训练模块
+    staged_cfg = config.get('staged_training', {}) if hasattr(config, 'get') else config.staged_training
+    modular_cfg = staged_cfg.get('modular_training', {}) if staged_cfg else {}
+    use_modular = bool(modular_cfg.get('enabled', False))
+    pretrained_modules = modular_cfg.get('pretrained_modules', {}) if use_modular else {}
 
-    # 检查模型类型并加载
-    if config.get('use_transpose_model', False):
-        print("Loading TransPose model...")
-        from models.do_train_imu_TransPose import load_transpose_model
-        model = load_transpose_model(config, model_path)
-    elif config.get('use_transpose_humanOnly_model', False):
-        print("Loading TransPose HumanOnly model...")
-        from models.do_train_imu_TransPose_humanOnly import load_transpose_model_humanOnly
-        model = load_transpose_model_humanOnly(config, model_path)
-    elif config.model.get('use_dit_model', True):
-        print("Loading DiT_model...")
-        model = MotionDiffusion(config, input_length=input_length).to(device)
+    if use_modular and pretrained_modules:
+        print("Loading TransPose model with pretrained modules:")
+        for k, v in pretrained_modules.items():
+            print(f"  - {k}: {v}")
+        model = TransPoseNet(config, pretrained_modules=pretrained_modules, skip_modules=[]).to(device)
     else:
-        print("Loading wrap_model...")
-        from models.wrap_model import MotionDiffusion as WrapMotionDiffusion
-        model = WrapMotionDiffusion(config, input_length=input_length).to(device)
-
-    # 如果模型不是通过特定加载函数（如 load_transpose_model）加载的，则加载 state_dict
-    if not (config.get('use_transpose_model', False) or config.get('use_transpose_humanOnly_model', False)):
-        if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location=device)
-            # Handle potential keys like 'model_state_dict' or 'model'
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            elif 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            else:
-                state_dict = checkpoint
-            # Remove 'module.' prefix if saved with DataParallel
-            if list(state_dict.keys())[0].startswith('module.'):
-                state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-            model.load_state_dict(state_dict)
-        else:
-             print(f"Warning: Model checkpoint not found at {model_path}. Model weights not loaded.")
+        print("Warning: No pretrained_modules provided in config; initializing a fresh TransPoseNet.")
+        model = TransPoseNet(config).to(device)
 
     model.eval()
-    model.to(device)
     return model
 
 def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True):
     """评估模型性能，计算 MPJPE, MPJRE (角度), Object Trans Error, Contact F1, Jitter (适配 SMPLH)"""
     metrics = {
         'mpjpe': [], 'mpjre_angle': [], 'jitter': [],
-        'obj_trans_err': [], 
+        'obj_trans_err_fusion': [], 'obj_trans_err_fk': [], 'obj_trans_err_imu': [],  # 分别跟踪融合、FK、IMU方案的物体位置误差
+        'hoi_err_fusion': [], 'hoi_err_fk': [], 'hoi_err_imu': [],                    # 分别跟踪融合、FK、IMU方案的HOI误差
         'contact_f1_lhand': [], 'contact_f1_rhand': [], 'contact_f1_obj': []
     }
     num_batches = 0
@@ -120,8 +100,6 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 "root_pos": gt_root_pos,         # 用于状态初始化
             }
             
-            # 添加虚拟关节数据（TransPose模型需要）
-            
             # 添加物体相关输入（如果有）
             if has_object:
                 model_input["obj_imu"] = gt_obj_imu        # [bs, T, 1, dim]
@@ -133,6 +111,23 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 model_input["obj_imu"] = torch.zeros(bs, seq_len, 1, gt_human_imu.shape[-1], device=device_model)
                 model_input["obj_rot"] = torch.zeros(bs, seq_len, 6, device=device_model)
                 model_input["obj_trans"] = torch.zeros(bs, seq_len, 3, device=device_model)
+            
+            # 添加GT手部位置（如果可用）
+            position_global_norm = batch.get("position_global_norm", None)
+            if position_global_norm is not None and position_global_norm.shape[1] == seq_len:
+                try:
+                    wrist_l_idx, wrist_r_idx = 20, 21
+                    pos = position_global_norm.to(device)
+                    lhand_pos = pos[:, :, wrist_l_idx, :]
+                    rhand_pos = pos[:, :, wrist_r_idx, :]
+                    gt_hands_pos = torch.stack([lhand_pos, rhand_pos], dim=2)  # [bs, seq, 2, 3]
+                    model_input["gt_hands_pos"] = gt_hands_pos
+                except Exception:
+                    # 如果提取失败，创建零值
+                    model_input["gt_hands_pos"] = torch.zeros((bs, seq_len, 2, 3), device=device, dtype=gt_root_pos.dtype)
+            else:
+                # 如果没有position_global_norm，创建零值
+                model_input["gt_hands_pos"] = torch.zeros((bs, seq_len, 2, 3), device=device, dtype=gt_root_pos.dtype)
 
             try:
                 if hasattr(model, 'diffusion_reverse'):
@@ -147,8 +142,10 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             # --- Extract Predictions (Normalized) ---
             pred_root_pos_norm = pred_dict.get("root_pos", None)
             pred_motion_norm = pred_dict.get("motion", None)
-            pred_obj_trans_norm = pred_dict.get("pred_obj_trans_from_fk", None)  # 更新键名
+            pred_obj_trans_fusion = pred_dict.get("pred_obj_trans", None)  # 融合方案的物体位置
+            pred_obj_trans_fk = None  # 直接FK方案的物体位置（按需计算）
             pred_hand_contact_prob = pred_dict.get("pred_hand_contact_prob", None)  # [bs, T, 3]
+            pred_obj_vel = pred_dict.get("pred_obj_vel", None)  # 纯IMU方案的物体速度 [bs, T, 3]
 
             if pred_motion_norm is None:
                 print(f"Warning: Batch {batch_idx}: Model did not output 'motion'. Skipping batch.")
@@ -227,16 +224,150 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             mpjre_angle = angle_deg.mean()
             metrics['mpjre_angle'].append(mpjre_angle.item()) # Store mean angle in degrees
 
-            # Object Translation Error (直接使用归一化数据)
-            if evaluate_objects and has_object and pred_obj_trans_norm is not None:
+            # Object Translation Error - 融合方案 (直接使用归一化数据)
+            if evaluate_objects and has_object and pred_obj_trans_fusion is not None:
                 # 直接计算归一化空间中的平移误差
-                obj_trans_err = torch.linalg.norm(pred_obj_trans_norm - gt_obj_trans, dim=-1).mean()
-                metrics['obj_trans_err'].append(obj_trans_err.item() * 1000) # Convert to mm scale
+                obj_trans_err_fusion = torch.linalg.norm(pred_obj_trans_fusion - gt_obj_trans, dim=-1).mean()
+                metrics['obj_trans_err_fusion'].append(obj_trans_err_fusion.item() * 1000) # Convert to mm scale
             elif evaluate_objects and has_object:
-                print(f"Warning: Batch {batch_idx}: Missing predicted object translation for error calculation.")
-                metrics['obj_trans_err'].append(float('nan'))
+                print(f"Warning: Batch {batch_idx}: Missing fusion object translation for error calculation.")
+                metrics['obj_trans_err_fusion'].append(float('nan'))
             elif evaluate_objects and not has_object:
-                metrics['obj_trans_err'].append(float('nan'))
+                metrics['obj_trans_err_fusion'].append(float('nan'))
+
+            # 按需计算FK方案的物体位置
+            if evaluate_objects and has_object and pred_hand_contact_prob is not None:
+                # 获取手部位置 [bs, seq, 2, 3]
+                pred_hand_positions = pred_dict.get("pred_hand_pos", None)
+                if pred_hand_positions is None:
+                    hands_pos_feat = pred_dict.get("hands_pos_feat", None)
+                    if hands_pos_feat is not None:
+                        try:
+                            pred_hand_positions = hands_pos_feat.reshape(bs, seq_len, 2, 3)
+                        except Exception:
+                            pred_hand_positions = None
+                # 物体旋转矩阵 [bs, seq, 3, 3]
+                obj_rot_matrix = transforms.rotation_6d_to_matrix(gt_obj_rot_6d) if gt_obj_rot_6d is not None else None
+                try:
+                    if pred_hand_positions is not None and obj_rot_matrix is not None and hasattr(model, 'object_trans_module'):
+                        pred_obj_trans_fk, _fk_info = model.object_trans_module.predict_object_position_from_contact(
+                            pred_hand_contact_prob=pred_hand_contact_prob,
+                            pred_hand_positions=pred_hand_positions,
+                            obj_rot_matrix=obj_rot_matrix,
+                            gt_obj_trans=gt_obj_trans
+                        )
+                except Exception as _e:
+                    pred_obj_trans_fk = None
+
+            # 纯IMU方案：由速度积分得到物体位置
+            pred_obj_trans_imu = None
+            if evaluate_objects and has_object and pred_obj_vel is not None:
+                try:
+                    dt = 1.0 / float(FRAME_RATE)
+                    # 以GT首帧为锚点做绝对位置积分
+                    init_pos = gt_obj_trans[:, 0, :]  # [bs, 3]
+                    disp = torch.cumsum(pred_obj_vel * dt, dim=1)  # [bs, T, 3]
+                    pred_obj_trans_imu = disp + init_pos.unsqueeze(1)
+                except Exception:
+                    pred_obj_trans_imu = None
+
+            # Object Translation Error - FK方案 (直接使用归一化数据)
+            if evaluate_objects and has_object and pred_obj_trans_fk is not None:
+                # 直接计算归一化空间中的平移误差
+                obj_trans_err_fk = torch.linalg.norm(pred_obj_trans_fk - gt_obj_trans, dim=-1).mean()
+                metrics['obj_trans_err_fk'].append(obj_trans_err_fk.item() * 1000) # Convert to mm scale
+            elif evaluate_objects and has_object:
+                print(f"Warning: Batch {batch_idx}: Missing FK object translation for error calculation.")
+                metrics['obj_trans_err_fk'].append(float('nan'))
+            elif evaluate_objects and not has_object:
+                metrics['obj_trans_err_fk'].append(float('nan'))
+
+            # Object Translation Error - IMU方案 (速度积分)
+            if evaluate_objects and has_object and pred_obj_trans_imu is not None:
+                obj_trans_err_imu = torch.linalg.norm(pred_obj_trans_imu - gt_obj_trans, dim=-1).mean()
+                metrics['obj_trans_err_imu'].append(obj_trans_err_imu.item() * 1000)  # mm
+            elif evaluate_objects and has_object:
+                print(f"Warning: Batch {batch_idx}: Missing IMU-integrated object translation for error calculation.")
+                metrics['obj_trans_err_imu'].append(float('nan'))
+            elif evaluate_objects and not has_object:
+                metrics['obj_trans_err_imu'].append(float('nan'))
+
+            # Object-Hand Relative Position Error - 融合方案 (在真值交互帧下)
+            def compute_hoi_error(pred_obj_trans, method_name):
+                """计算HOI误差的通用函数"""
+                if evaluate_objects and has_object and pred_obj_trans is not None:
+                    # 提取手腕关节位置 (SMPL joint indices: 20=left wrist, 21=right wrist)
+                    wrist_l_idx, wrist_r_idx = 20, 21
+                    
+                    # 预测的手腕位置
+                    pred_lhand_pos = pred_joints_all[:, :, wrist_l_idx, :]  # [bs, seq, 3]
+                    pred_rhand_pos = pred_joints_all[:, :, wrist_r_idx, :]  # [bs, seq, 3]
+                    
+                    # 真值的手腕位置
+                    gt_lhand_pos = gt_joints_all[:, :, wrist_l_idx, :]      # [bs, seq, 3]
+                    gt_rhand_pos = gt_joints_all[:, :, wrist_r_idx, :]      # [bs, seq, 3]
+                    
+                    relative_errors = []
+                    
+                    # 计算左手交互帧的相对位置误差
+                    if gt_lhand_contact is not None:
+                        lhand_contact_mask = gt_lhand_contact.bool()  # [bs, seq]
+                        if lhand_contact_mask.any():
+                            # 在交互帧中计算物体相对于左手的位置
+                            gt_obj_rel_lhand = gt_obj_trans - gt_lhand_pos        # [bs, seq, 3]
+                            pred_obj_rel_lhand = pred_obj_trans - pred_lhand_pos  # [bs, seq, 3]
+                            
+                            # 只在真值交互帧计算误差
+                            valid_frames = lhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_lhand)  # [bs, seq, 3]
+                            if valid_frames.any():
+                                gt_rel_valid = gt_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                pred_rel_valid = pred_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                lhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
+                                relative_errors.append(lhand_rel_error)
+                    
+                    # 计算右手交互帧的相对位置误差
+                    if gt_rhand_contact is not None:
+                        rhand_contact_mask = gt_rhand_contact.bool()  # [bs, seq]
+                        if rhand_contact_mask.any():
+                            # 在交互帧中计算物体相对于右手的位置
+                            gt_obj_rel_rhand = gt_obj_trans - gt_rhand_pos        # [bs, seq, 3]
+                            pred_obj_rel_rhand = pred_obj_trans - pred_rhand_pos  # [bs, seq, 3]
+                            
+                            # 只在真值交互帧计算误差
+                            valid_frames = rhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_rhand)  # [bs, seq, 3]
+                            if valid_frames.any():
+                                gt_rel_valid = gt_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                pred_rel_valid = pred_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                rhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
+                                relative_errors.append(rhand_rel_error)
+                    
+                    # 合并所有相对误差
+                    if relative_errors:
+                        all_relative_errors = torch.cat(relative_errors, dim=0)
+                        hoi_err = all_relative_errors.mean()
+                        return hoi_err.item() * 1000  # Convert to mm scale
+                    else:
+                        # 没有交互帧
+                        return float('nan')
+                elif evaluate_objects and has_object:
+                    print(f"Warning: Batch {batch_idx}: Missing {method_name} object translation for HOI error calculation.")
+                    return float('nan')
+                elif evaluate_objects and not has_object:
+                    return float('nan')
+                else:
+                    return float('nan')
+
+            # 计算融合方案的HOI误差
+            hoi_err_fusion = compute_hoi_error(pred_obj_trans_fusion, "fusion")
+            metrics['hoi_err_fusion'].append(hoi_err_fusion)
+
+            # 计算FK方案的HOI误差
+            hoi_err_fk = compute_hoi_error(pred_obj_trans_fk, "FK")
+            metrics['hoi_err_fk'].append(hoi_err_fk)
+
+            # 计算IMU方案的HOI误差
+            hoi_err_imu = compute_hoi_error(pred_obj_trans_imu, "IMU")
+            metrics['hoi_err_imu'].append(hoi_err_imu)
 
             # Contact Prediction Evaluation
             if pred_hand_contact_prob is not None:
@@ -307,7 +438,7 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
         if valid_values:
             avg_metrics[key] = np.mean(valid_values)
             unit = ""
-            if key == 'mpjpe' or key == 'obj_trans_err': unit = "(mm)"
+            if 'mpjpe' in key or 'obj_trans_err' in key or 'hoi_err' in key: unit = "(mm)"
             elif key == 'mpjre_angle': unit = "(deg)"
             elif key == 'jitter': unit = "(mm/frame^2)"
             elif 'contact_f1' in key: unit = "(F1)"
@@ -321,7 +452,6 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
 def main():
     parser = argparse.ArgumentParser(description='Evaluate EgoMotion Model')
     parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml', help='Path to the configuration file.')
-    parser.add_argument('--model_path', type=str, default=None, help='Path to the trained model checkpoint. Overrides config if provided.')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to the SMPL model file (e.g., SMPLH neutral). Overrides config if provided.')
     parser.add_argument('--test_data_dir', type=str, default=None, help='Path to the test dataset directory. Overrides config if provided.')
     parser.add_argument('--batch_size', type=int, default=None, help='Test batch size. Overrides config if provided.')
@@ -336,7 +466,6 @@ def main():
     config = load_config(args.config)
 
     # Override config values with command line arguments if provided
-    if args.model_path: config.model_path = args.model_path
     if args.smpl_model_path: config.bm_path = args.smpl_model_path
     if args.test_data_dir: config.test.data_path = args.test_data_dir
     if args.batch_size: config.test.batch_size = args.batch_size
@@ -350,20 +479,7 @@ def main():
        return
     print(f"Loading SMPL model from: {smpl_model_path}")
     smpl_model = load_smpl_model(smpl_model_path, device)
-
-    model_path = config.get('model_path', None)
-    if model_path is None or not os.path.exists(model_path):
-        print(f"Error: Evaluation model path not found or invalid: {model_path}")
-        print("Please provide the correct path in the config (model_path) or via --model_path.")
-        # return
-
-    # Determine model type for logging message (can be refined)
-    model_type_str = "Unknown"
-    if config.get('use_transpose_model', False): model_type_str = "TransPose"
-    elif config.get('use_transpose_humanOnly_model', False): model_type_str = "TransPose HumanOnly"
-    elif config.model.get('use_dit_model', True): model_type_str = "DiT"
-    print(f"Loading {model_type_str} model from: {model_path}")
-    model = load_model(model_path, config, device)
+    model = load_model(config, device)
 
     test_data_dir = config.datasets.omomo.get('test_path', None)
     if test_data_dir is None or not os.path.exists(test_data_dir):
@@ -406,9 +522,41 @@ def main():
     print(f"MPJRE (deg):                                  {results.get('mpjre_angle', 'N/A'):.4f}")
     print(f"Jitter (mm/frame^2):                          {results.get('jitter', 'N/A'):.4f}")
     if not args.no_eval_objects:
-        print(f"Obj Trans Error (mm):                         {results.get('obj_trans_err', 'N/A'):.4f}")
+        print(f"\n--- Object Position Errors (方案对比) ---")
+        print(f"Obj Trans Error - Fusion (mm):               {results.get('obj_trans_err_fusion', 'N/A'):.4f}")
+        print(f"Obj Trans Error - FK Only (mm):              {results.get('obj_trans_err_fk', 'N/A'):.4f}")
+        print(f"Obj Trans Error - IMU Only (mm):             {results.get('obj_trans_err_imu', 'N/A'):.4f}")
+        
+        print(f"\n--- HOI Errors (方案对比) ---")
+        print(f"HOI Error - Fusion (mm):                     {results.get('hoi_err_fusion', 'N/A'):.4f}")
+        print(f"HOI Error - FK Only (mm):                    {results.get('hoi_err_fk', 'N/A'):.4f}")
+        print(f"HOI Error - IMU Only (mm):                   {results.get('hoi_err_imu', 'N/A'):.4f}")
+        
+        # 计算改进量
+        fusion_obj_err = results.get('obj_trans_err_fusion', float('nan'))
+        fk_obj_err = results.get('obj_trans_err_fk', float('nan'))
+        imu_obj_err = results.get('obj_trans_err_imu', float('nan'))
+        fusion_hoi_err = results.get('hoi_err_fusion', float('nan'))
+        fk_hoi_err = results.get('hoi_err_fk', float('nan'))
+        imu_hoi_err = results.get('hoi_err_imu', float('nan'))
+        
+        if not (np.isnan(fusion_obj_err) or np.isnan(fk_obj_err)):
+            obj_improvement = ((fk_obj_err - fusion_obj_err) / fk_obj_err) * 100
+            print(f"Obj Trans Improvement (融合 vs FK):           {obj_improvement:+.2f}%")
+        if not (np.isnan(fusion_obj_err) or np.isnan(imu_obj_err)):
+            obj_improvement_imu = ((imu_obj_err - fusion_obj_err) / imu_obj_err) * 100
+            print(f"Obj Trans Improvement (融合 vs IMU):          {obj_improvement_imu:+.2f}%")
+        
+        if not (np.isnan(fusion_hoi_err) or np.isnan(fk_hoi_err)):
+            hoi_improvement = ((fk_hoi_err - fusion_hoi_err) / fk_hoi_err) * 100
+            print(f"HOI Improvement (融合 vs FK):                 {hoi_improvement:+.2f}%")
+        if not (np.isnan(fusion_hoi_err) or np.isnan(imu_hoi_err)):
+            hoi_improvement_imu = ((imu_hoi_err - fusion_hoi_err) / imu_hoi_err) * 100
+            print(f"HOI Improvement (融合 vs IMU):                {hoi_improvement_imu:+.2f}%")
     else:
          print("Object metrics skipped.")
+    
+    print(f"\n--- Contact Prediction ---")
     print(f"LHand Contact F1:                             {results.get('contact_f1_lhand', 'N/A'):.4f}")
     print(f"RHand Contact F1:                             {results.get('contact_f1_rhand', 'N/A'):.4f}")
     print(f"Obj Contact F1:                               {results.get('contact_f1_obj', 'N/A'):.4f}")

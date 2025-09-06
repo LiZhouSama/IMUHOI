@@ -1,23 +1,37 @@
-import sys
-import os
-sys.path.append("../")
 import torch.nn
 from torch.nn.functional import relu
 import torch
-import numpy as np
 from human_body_prior.body_model.body_model import BodyModel
-from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d, so3_relative_angle, axis_angle_to_matrix
-import pytorch3d.transforms as transforms
+from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 from utils.utils import global2local
 
-from configs.global_config import FRAME_RATE, IMU_JOINTS_POS, IMU_JOINTS_ROT, IMU_JOINT_NAMES, joint_set
+from configs.global_config import FRAME_RATE, IMU_JOINTS_ROT, IMU_JOINT_NAMES, joint_set, acc_scale
 
 
 
 # 定义辅助函数
+INITIAL_STATE_DIM = 64
 def lerp(val, low, high):
     """线性插值"""
     return low + (high - low) * val
+
+def create_rnn_state_projection(initial_state_dim: int, hidden_size: int, num_layers: int, bidirectional: bool, device: torch.device) -> torch.nn.Linear:
+    """创建用于将压缩初始状态映射到 (h0, c0) 拼接向量的线性层"""
+    num_directions = 2 if bidirectional else 1
+    return torch.nn.Linear(initial_state_dim, 2 * num_layers * num_directions * hidden_size).to(device)
+
+def compute_rnn_initial_state(proj_layer: torch.nn.Linear, rnn_module: 'RNN', compressed_initial_state: torch.Tensor, batch_size: int):
+    """由压缩初始状态生成 LSTM 的 (h0, c0) 初始状态元组"""
+    projected_state = proj_layer(compressed_initial_state)
+    num_layers = rnn_module.n_rnn_layer
+    num_directions = rnn_module.num_directions
+    hidden_size = rnn_module.n_hidden
+    expected_shape = (batch_size, 2 * num_layers * num_directions, hidden_size)
+    projected_state = projected_state.view(expected_shape)
+    h_0_c_0 = torch.split(projected_state, num_layers * num_directions, dim=1)
+    h_0 = h_0_c_0[0].permute(1, 0, 2).contiguous()
+    c_0 = h_0_c_0[1].permute(1, 0, 2).contiguous()
+    return (h_0, c_0)
 
 class RNN(torch.nn.Module):
     """
@@ -68,30 +82,82 @@ class VelocityContactModule(torch.nn.Module):
         # 计算IMU输入维度
         n_human_imu = self.num_human_imus * self.imu_dim
         n_obj_imu = 1 * self.imu_dim
-        n_imu = n_human_imu + n_obj_imu
         
         # 手部接触网络相关索引
         self.lhand_imu_idx = IMU_JOINT_NAMES.index('left_hand')
         self.rhand_imu_idx = IMU_JOINT_NAMES.index('right_hand')
         
-        # 速度估计网络
-        n_velocity_output = 3 + joint_set.n_leaf * 3  # 物体速度 + 叶子节点速度
-        self.velocity_net = RNN(n_imu, n_velocity_output, 256 * hidden_dim_multiplier)
+        # 物体运动检测阈值 (基于IMU数据)
+        self.obj_imu_acc_threshold = cfg.obj_imu_acc_threshold if hasattr(cfg, 'obj_imu_acc_threshold') else 0.01  # IMU加速度变化阈值
+        self.obj_imu_ori_threshold = cfg.obj_imu_ori_threshold if hasattr(cfg, 'obj_imu_ori_threshold') else 0.005  # IMU方向变化阈值
+        self.contact_suppression_strength = cfg.contact_suppression_strength if hasattr(cfg, 'contact_suppression_strength') else 0.95  # 当无运动时将接触概率降低到此比例
+        
+        # 物体速度抑制参数
+        self.velocity_suppression_strength = cfg.velocity_suppression_strength if hasattr(cfg, 'velocity_suppression_strength') else 0.9  # 当无运动时将速度降低到此比例
+        
+        # 速度估计网络 - 分离为两个独立的网络
+        self.obj_velocity_net = RNN(n_obj_imu, 3, 128 * hidden_dim_multiplier)
+        self.leaf_velocity_net = RNN(n_human_imu, joint_set.n_leaf * 3, 128 * hidden_dim_multiplier)
         
         # 手部接触预测网络
-        n_hand_contact_input = 3 * self.imu_dim + 2 * 3 + 3  # 双手IMU+物体IMU + 双手速度 + 物体速度
+        n_hand_contact_input = 3 * self.imu_dim + 2 * 3 + 3  # 双手IMU + 物体IMU + 双手速度 + 物体速度
         self.hand_contact_net = RNN(n_hand_contact_input, 3, 128 * hidden_dim_multiplier)
         
         # 初始状态维度
-        self.initial_state_dim = 64
+        self.initial_state_dim = INITIAL_STATE_DIM
         
         # 用于生成初始状态的线性层
-        def create_state_projection(hidden_size, num_layers, bidirectional):
-            num_directions = 2 if bidirectional else 1
-            return torch.nn.Linear(self.initial_state_dim, 2 * num_layers * num_directions * hidden_size).to(device)
+        self.proj_obj_velocity_state = create_rnn_state_projection(self.initial_state_dim, self.obj_velocity_net.n_hidden, self.obj_velocity_net.n_rnn_layer, self.obj_velocity_net.num_directions == 2, device)
+        self.proj_leaf_velocity_state = create_rnn_state_projection(self.initial_state_dim, self.leaf_velocity_net.n_hidden, self.leaf_velocity_net.n_rnn_layer, self.leaf_velocity_net.num_directions == 2, device)
+        self.proj_hand_contact_state = create_rnn_state_projection(self.initial_state_dim, self.hand_contact_net.n_hidden, self.hand_contact_net.n_rnn_layer, self.hand_contact_net.num_directions == 2, device)
+    
+    def detect_object_motion_from_imu(self, obj_imu):
+        """
+        基于物体IMU数据检测物体运动状态，参考preprocess.py中的逻辑
         
-        self.proj_velocity_state = create_state_projection(self.velocity_net.n_hidden, self.velocity_net.n_rnn_layer, self.velocity_net.num_directions == 2)
-        self.proj_hand_contact_state = create_state_projection(self.hand_contact_net.n_hidden, self.hand_contact_net.n_rnn_layer, self.hand_contact_net.num_directions == 2)
+        Args:
+            obj_imu: 物体IMU数据 [batch_size, seq_len, 9] 
+                     格式通常为 [acc_x, acc_y, acc_z, ori_6d] (前3维加速度，后6维方向)
+            
+        Returns:
+            motion_mask: 物体运动掩码 [batch_size, seq_len] (True表示有运动)
+        """
+        batch_size, seq_len, imu_dim = obj_imu.shape
+        device = obj_imu.device
+        
+        # 初始化运动掩码，第一帧默认为False
+        motion_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+        
+        if seq_len <= 1:
+            return motion_mask
+        
+        # 提取加速度信息 (前3维)
+        obj_acc = obj_imu[:, :, :3]  # [batch_size, seq_len, 3]
+        
+        # 提取方向信息 (后6维，6D旋转表示)
+        obj_ori_6d = obj_imu[:, :, 3:]  # [batch_size, seq_len, 6]
+        
+        # 将6D旋转表示转换为旋转矩阵，以与preprocess.py保持一致
+        from pytorch3d.transforms import rotation_6d_to_matrix
+        obj_rot_mat = rotation_6d_to_matrix(obj_ori_6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+        
+        # 计算相邻帧的加速度变化
+        acc_diff = torch.norm(obj_acc[:, 1:] - obj_acc[:, :-1], dim=2)  # [batch_size, seq_len-1]
+        
+        # 计算相邻帧的旋转变化 (使用Frobenius范数，与preprocess.py保持一致)
+        rot_diff = torch.norm(obj_rot_mat[:, 1:] - obj_rot_mat[:, :-1], dim=(2, 3))  # [batch_size, seq_len-1]
+        
+        # 使用配置的IMU检测阈值
+        acc_threshold = self.obj_imu_acc_threshold  # IMU加速度变化阈值
+        ori_threshold = self.obj_imu_ori_threshold  # IMU方向变化阈值 (对应旋转矩阵的Frobenius范数)
+        
+        # 判断运动：加速度或旋转变化超过阈值
+        motion_detected = (acc_diff > acc_threshold) | (rot_diff > ori_threshold)
+        
+        # 填充运动掩码 (第一帧保持False)
+        motion_mask[:, 1:] = motion_detected
+        
+        return motion_mask
     
     def forward(self, imu_data, compressed_initial_state, use_object_data=True):
         """
@@ -116,27 +182,15 @@ class VelocityContactModule(torch.nn.Module):
         if not use_object_data:
             obj_imu_data = torch.zeros_like(obj_imu_data)
         
-        # 生成初始状态
-        def get_initial_rnn_state(proj_layer, rnn_module):
-            projected_state = proj_layer(compressed_initial_state)
-            num_layers = rnn_module.n_rnn_layer
-            num_directions = rnn_module.num_directions
-            hidden_size = rnn_module.n_hidden
-            expected_shape = (batch_size, 2 * num_layers * num_directions, hidden_size)
-            projected_state = projected_state.view(expected_shape)
-            h_0_c_0 = torch.split(projected_state, num_layers * num_directions, dim=1)
-            h_0 = h_0_c_0[0].permute(1, 0, 2).contiguous()
-            c_0 = h_0_c_0[1].permute(1, 0, 2).contiguous()
-            return (h_0, c_0)
+        # 速度估计 - 使用分离的网络
+        # 物体速度估计
+        obj_velocity_initial_state = compute_rnn_initial_state(self.proj_obj_velocity_state, self.obj_velocity_net, compressed_initial_state, batch_size)
+        pred_obj_vel, _ = self.obj_velocity_net(obj_imu_data, obj_velocity_initial_state)
         
-        # 速度估计
-        velocity_initial_state = get_initial_rnn_state(self.proj_velocity_state, self.velocity_net)
-        pred_velocity_output, _ = self.velocity_net(imu_data, velocity_initial_state)
-        
-        # 分离预测的速度
-        pred_obj_vel = pred_velocity_output[:, :, :3]
-        pred_leaf_vel = pred_velocity_output[:, :, 3:].reshape(batch_size, seq_len, joint_set.n_leaf, 3)
-        pred_leaf_vel_flat = pred_leaf_vel.reshape(batch_size, seq_len, -1)
+        # 叶子节点速度估计
+        leaf_velocity_initial_state = compute_rnn_initial_state(self.proj_leaf_velocity_state, self.leaf_velocity_net, compressed_initial_state, batch_size)
+        pred_leaf_vel_flat, _ = self.leaf_velocity_net(human_imu_data, leaf_velocity_initial_state)
+        pred_leaf_vel = pred_leaf_vel_flat.reshape(batch_size, seq_len, joint_set.n_leaf, 3)
         
         # 提取双手速度
         lhand_vel = pred_leaf_vel[:, :, 3, :]  # 左手速度
@@ -153,18 +207,62 @@ class VelocityContactModule(torch.nn.Module):
         hand_contact_input = torch.cat([imu_feat, hand_vel_feat, pred_obj_vel], dim=2)
         
         # 获取手部接触网络的初始状态
-        hand_contact_initial_state = get_initial_rnn_state(self.proj_hand_contact_state, self.hand_contact_net)
+        hand_contact_initial_state = compute_rnn_initial_state(self.proj_hand_contact_state, self.hand_contact_net, compressed_initial_state, batch_size)
         
         # 手部接触预测
         pred_hand_contact_prob_logits, _ = self.hand_contact_net(hand_contact_input, hand_contact_initial_state)
         pred_hand_contact_prob = torch.sigmoid(pred_hand_contact_prob_logits)
         
-        return {
+        # 应用基于物体运动的先验调整
+        if use_object_data and obj_imu_data.numel() > 0:
+            # 基于物体IMU数据检测物体运动状态
+            motion_mask = self.detect_object_motion_from_imu(obj_imu_data)  # [batch_size, seq_len]
+            
+            # 1. 物体速度抑制：当物体没有运动时，大幅降低预测速度
+            # 保存抑制前的原始速度预测
+            pred_obj_vel_before_suppression = pred_obj_vel.clone()
+            
+            velocity_suppression_factor = torch.where(
+                motion_mask.unsqueeze(-1),  # [batch_size, seq_len, 1]
+                torch.ones_like(pred_obj_vel),  # 有运动时不调整
+                torch.full_like(pred_obj_vel, 1.0 - self.velocity_suppression_strength)  # 无运动时降低速度
+            )
+            
+            # 应用速度抑制因子
+            pred_obj_vel = pred_obj_vel * velocity_suppression_factor
+            
+            # 2. 手部接触概率抑制：当物体没有运动时，大幅降低接触概率
+            # motion_mask为False的位置表示物体没有运动
+            contact_suppression_factor = torch.where(
+                motion_mask.unsqueeze(-1),  # [batch_size, seq_len, 1]
+                torch.ones_like(pred_hand_contact_prob),  # 有运动时不调整
+                torch.full_like(pred_hand_contact_prob, 1.0 - self.contact_suppression_strength)  # 无运动时降低概率
+            )
+            
+            # 应用接触概率抑制因子
+            pred_hand_contact_prob = pred_hand_contact_prob * contact_suppression_factor
+
+        pred_obj_vel_watch = pred_obj_vel.detach().cpu().numpy()
+        obj_imu_data_watch = obj_imu_data.detach().cpu().numpy()
+        
+        # 构建返回字典
+        result = {
             "pred_obj_vel": pred_obj_vel,
             "pred_leaf_vel": pred_leaf_vel,
             "pred_leaf_vel_flat": pred_leaf_vel_flat,
             "pred_hand_contact_prob": pred_hand_contact_prob
         }
+        
+        # 添加运动检测和抑制相关的调试信息（如果使用了物体数据）
+        if use_object_data and obj_imu_data.numel() > 0:
+            result.update({
+                "obj_motion_mask": motion_mask,  # 物体运动掩码 [batch_size, seq_len]
+                "velocity_suppression_factor": velocity_suppression_factor,  # 速度抑制因子 [batch_size, seq_len, 3]
+                "contact_suppression_factor": contact_suppression_factor,  # 接触抑制因子 [batch_size, seq_len, 3]
+                "pred_obj_vel_before_suppression": pred_obj_vel_before_suppression,  # 抑制前的原始速度预测
+            })
+        
+        return result
 
 
 class HumanPoseModule(torch.nn.Module):
@@ -197,18 +295,14 @@ class HumanPoseModule(torch.nn.Module):
         self.trans_b2 = RNN(joint_set.n_full * 3 + n_human_imu, 3, 256 * hidden_dim_multiplier, bidirectional=False)
         
         # 初始状态维度
-        self.initial_state_dim = 64
+        self.initial_state_dim = INITIAL_STATE_DIM
         
         # 用于生成初始状态的线性层
-        def create_state_projection(hidden_size, num_layers, bidirectional):
-            num_directions = 2 if bidirectional else 1
-            return torch.nn.Linear(self.initial_state_dim, 2 * num_layers * num_directions * hidden_size).to(device)
-
-        self.proj_s1_state = create_state_projection(self.pose_s1.n_hidden, self.pose_s1.n_rnn_layer, self.pose_s1.num_directions == 2)
-        self.proj_s2_state = create_state_projection(self.pose_s2.n_hidden, self.pose_s2.n_rnn_layer, self.pose_s2.num_directions == 2)
-        self.proj_s3_state = create_state_projection(self.pose_s3.n_hidden, self.pose_s3.n_rnn_layer, self.pose_s3.num_directions == 2)
-        self.proj_contact_state = create_state_projection(self.contact_prob_net.n_hidden, self.contact_prob_net.n_rnn_layer, self.contact_prob_net.num_directions == 2)
-        self.proj_trans_b2_state = create_state_projection(self.trans_b2.n_hidden, self.trans_b2.n_rnn_layer, self.trans_b2.num_directions == 2)
+        self.proj_s1_state = create_rnn_state_projection(self.initial_state_dim, self.pose_s1.n_hidden, self.pose_s1.n_rnn_layer, self.pose_s1.num_directions == 2, device)
+        self.proj_s2_state = create_rnn_state_projection(self.initial_state_dim, self.pose_s2.n_hidden, self.pose_s2.n_rnn_layer, self.pose_s2.num_directions == 2, device)
+        self.proj_s3_state = create_rnn_state_projection(self.initial_state_dim, self.pose_s3.n_hidden, self.pose_s3.n_rnn_layer, self.pose_s3.num_directions == 2, device)
+        self.proj_contact_state = create_rnn_state_projection(self.initial_state_dim, self.contact_prob_net.n_hidden, self.contact_prob_net.n_rnn_layer, self.contact_prob_net.num_directions == 2, device)
+        self.proj_trans_b2_state = create_rnn_state_projection(self.initial_state_dim, self.trans_b2.n_hidden, self.trans_b2.n_rnn_layer, self.trans_b2.num_directions == 2, device)
         
         # SMPL Body Model for FK
         self.body_model = BodyModel(bm_fname=cfg.bm_path, num_betas=16).to(device)
@@ -217,7 +311,6 @@ class HumanPoseModule(torch.nn.Module):
         
         # 注册buffer
         self.register_buffer('parents_tensor', self.body_model.kintree_table[0].long())
-        self.register_buffer('imu_joints_pos', torch.tensor(IMU_JOINTS_POS, dtype=torch.long))
         self.register_buffer('imu_joints_rot', torch.tensor(IMU_JOINTS_ROT, dtype=torch.long))
         self.register_buffer('gravity_velocity', torch.tensor([0.0, -0.018, 0], dtype=torch.float32))
         
@@ -282,25 +375,12 @@ class HumanPoseModule(torch.nn.Module):
         batch_size, seq_len, _ = human_imu_data.shape
         device = human_imu_data.device
         
-        # 生成初始状态
-        def get_initial_rnn_state(proj_layer, rnn_module):
-            projected_state = proj_layer(compressed_initial_state)
-            num_layers = rnn_module.n_rnn_layer
-            num_directions = rnn_module.num_directions
-            hidden_size = rnn_module.n_hidden
-            expected_shape = (batch_size, 2 * num_layers * num_directions, hidden_size)
-            projected_state = projected_state.view(expected_shape)
-            h_0_c_0 = torch.split(projected_state, num_layers * num_directions, dim=1)
-            h_0 = h_0_c_0[0].permute(1, 0, 2).contiguous()
-            c_0 = h_0_c_0[1].permute(1, 0, 2).contiguous()
-            return (h_0, c_0)
-
         # 级联姿态估计
-        s1_initial_state = get_initial_rnn_state(self.proj_s1_state, self.pose_s1)
-        s2_initial_state = get_initial_rnn_state(self.proj_s2_state, self.pose_s2)
-        s3_initial_state = get_initial_rnn_state(self.proj_s3_state, self.pose_s3)
-        contact_initial_state = get_initial_rnn_state(self.proj_contact_state, self.contact_prob_net)
-        trans_b2_initial_state = get_initial_rnn_state(self.proj_trans_b2_state, self.trans_b2)
+        s1_initial_state = compute_rnn_initial_state(self.proj_s1_state, self.pose_s1, compressed_initial_state, batch_size)
+        s2_initial_state = compute_rnn_initial_state(self.proj_s2_state, self.pose_s2, compressed_initial_state, batch_size)
+        s3_initial_state = compute_rnn_initial_state(self.proj_s3_state, self.pose_s3, compressed_initial_state, batch_size)
+        contact_initial_state = compute_rnn_initial_state(self.proj_contact_state, self.contact_prob_net, compressed_initial_state, batch_size)
+        trans_b2_initial_state = compute_rnn_initial_state(self.proj_trans_b2_state, self.trans_b2, compressed_initial_state, batch_size)
 
         # 第一阶段：预测关键关节位置
         s1_input = torch.cat([human_imu_data, pred_leaf_vel_flat], dim=2)
@@ -418,12 +498,9 @@ class HumanPoseModule(torch.nn.Module):
             "hands_pos_feat": torch.cat([lhand_pos_global, rhand_pos_global], dim=2)
         }
 
-
-class ObjectTransModule(torch.nn.Module):
+class UnifiedObjectTransModule(torch.nn.Module):
     """
-    模块3: 物体方向向量估计和位置重建
-    输入: ^WR_O, 双手估计的接触label, 估计的手的位置, 物体的真实位置加噪声
-    输出: ^Ov_{HO} (物体坐标系下的方向向量)
+    统一物体位置估计模块：左/右手FK + IMU速度 + 门控逐帧融合
     """
     def __init__(self, cfg, device):
         super().__init__()
@@ -431,68 +508,40 @@ class ObjectTransModule(torch.nn.Module):
         self.imu_dim = cfg.imu_dim if hasattr(cfg, 'imu_dim') else 9
         self.num_human_imus = cfg.num_human_imus if hasattr(cfg, 'num_human_imus') else 6
         hidden_dim_multiplier = cfg.hidden_dim_multiplier if hasattr(cfg, 'hidden_dim_multiplier') else 1
+
+        # 噪声与门控参数
+        self.gating_prior_beta = getattr(cfg, 'gating_prior_beta', 0)     # 先验强度: gating_prior_beta控制先验知识的影响程度
+        self.gating_temperature = getattr(cfg, 'gating_temperature', 5.0)   # 温度控制: 通过gating_temperature控制权重的锐度，温度越低权重越集中
         
-        # 噪声参数
-        self.obj_trans_noise_std = getattr(cfg, 'obj_trans_noise_std', 0.05)  # 物体位置噪声标准差
-        
-        # 分别为左右手创建^Ov_{HO}估计网络
-        # 输入：^WR_O(6D旋转) + 手部位置(3) + 接触概率(3) + 物体位置加噪声(3)
-        n_obj_direction_input = 6 + 3 + 3 + 3  # 15维
-        
-        # 左手^Ov_{HO}估计网络
-        self.lhand_obj_direction_net = RNN(n_obj_direction_input, 3, 128 * hidden_dim_multiplier)  # 输出左手^Ov_{HO}，3D
-        
-        # 右手^Ov_{HO}估计网络  
-        self.rhand_obj_direction_net = RNN(n_obj_direction_input, 3, 128 * hidden_dim_multiplier)  # 输出右手^Ov_{HO}，3D
-        
+        # 门控权重平滑参数（仅在推理时使用，训练时保持真实梯度）
+        self.gating_smoothing_enabled = getattr(cfg, 'gating_smoothing_enabled', False)
+        self.gating_smoothing_alpha = getattr(cfg, 'gating_smoothing_alpha', 0.6)  # 平滑系数，越大越平滑
+        self.gating_max_change = getattr(cfg, 'gating_max_change', 0.25)  # 相邻帧最大权重变化（选择性平滑）
+
         # 初始状态维度
-        self.initial_state_dim = 64
-        
-        # 用于生成初始状态的线性层
-        def create_state_projection(hidden_size, num_layers, bidirectional):
-            num_directions = 2 if bidirectional else 1
-            return torch.nn.Linear(self.initial_state_dim, 2 * num_layers * num_directions * hidden_size).to(device)
-        
-        self.proj_lhand_obj_direction_state = create_state_projection(self.lhand_obj_direction_net.n_hidden, self.lhand_obj_direction_net.n_rnn_layer, self.lhand_obj_direction_net.num_directions == 2)
-        self.proj_rhand_obj_direction_state = create_state_projection(self.rhand_obj_direction_net.n_hidden, self.rhand_obj_direction_net.n_rnn_layer, self.rhand_obj_direction_net.num_directions == 2)
-    
-    def add_noise_to_obj_trans(self, obj_trans, noise_std):
-        """
-        为物体位置添加噪声
-        
-        Args:
-            obj_trans: [bs, seq, 3] 物体位置
-            noise_std: 噪声标准差
-        
-        Returns:
-            [bs, seq, 3] 带噪声的物体位置
-        """
-        noise = torch.randn_like(obj_trans) * noise_std
-        noisy_obj_trans = obj_trans + noise
-        return noisy_obj_trans
-    
-    def compute_object_position_from_direction(self, hand_position, obj_rot_matrix, obj_direction, bone_length):
-        """
-        使用FK公式重建物体位置：\hat p_o = 估计的 p_H + ^WR_O · 估计的 ^Ov_{HO} · bone_length
-        
-        Args:
-            hand_position: [bs, seq, 3] 手部位置
-            obj_rot_matrix: [bs, seq, 3, 3] 物体旋转矩阵 ^WR_O
-            obj_direction: [bs, seq, 3] 物体坐标系下的方向向量 ^Ov_{HO}
-            bone_length: [bs, seq] 骨长（由加噪声的真值计算得出）
-        
-        Returns:
-            computed_obj_trans: [bs, seq, 3] 重建的物体位置
-        """
-        # FK公式：\hat p_o = p_H + ^WR_O * ^Ov_{HO} * bone_length
-        # 1. 将方向向量转换到世界坐标系：^WR_O * ^Ov_{HO}
-        direction_world = torch.bmm(obj_rot_matrix.view(-1, 3, 3), obj_direction.view(-1, 3, 1)).squeeze(-1)  # [bs*seq, 3]
-        direction_world = direction_world.view(hand_position.shape)  # [bs, seq, 3]
-        
-        # 2. 乘以骨长并加上手部位置
-        computed_obj_trans = hand_position + direction_world * bone_length.unsqueeze(-1)  # [bs, seq, 3]
-        
-        return computed_obj_trans
+        self.initial_state_dim = INITIAL_STATE_DIM
+
+        # 分支输入维度
+        n_fk_branch_input = 34  # obj_rot6 + hand_pos3 + hand_contact1 + obj_imu9 + hand_imu9 + obj_vel3 + rot_delta3
+        n_imu_branch_input = 21 # obj_imu9 + obj_vel3 + rot_delta3 + obj_rot6
+        n_gating_input = 9      # contact_prob3 + obj_vel3 + obj_imu_acc3
+
+        # 左/右手: 回归物体系单位方向(3) + 长度(1)
+        self.lhand_fk_head = RNN(n_fk_branch_input, 4, 128 * hidden_dim_multiplier)
+        self.rhand_fk_head = RNN(n_fk_branch_input, 4, 128 * hidden_dim_multiplier)
+
+        # IMU分支: 回归速度(3)
+        # self.imu_head = RNN(n_imu_branch_input, 3, 128 * hidden_dim_multiplier)
+
+        # 门控: 输出3路logits
+        self.gating_head = RNN(n_gating_input, 3, 64 * hidden_dim_multiplier)
+
+        # 初始状态投影
+        self.proj_lhand_fk_state = create_rnn_state_projection(self.initial_state_dim, self.lhand_fk_head.n_hidden, self.lhand_fk_head.n_rnn_layer, self.lhand_fk_head.num_directions == 2, device)
+        self.proj_rhand_fk_state = create_rnn_state_projection(self.initial_state_dim, self.rhand_fk_head.n_hidden, self.rhand_fk_head.n_rnn_layer, self.rhand_fk_head.num_directions == 2, device)
+        # self.proj_imu_state = create_rnn_state_projection(self.initial_state_dim, self.imu_head.n_hidden, self.imu_head.n_rnn_layer, self.imu_head.num_directions == 2, device)
+        self.proj_gate_state = create_rnn_state_projection(self.initial_state_dim, self.gating_head.n_hidden, self.gating_head.n_rnn_layer, self.gating_head.num_directions == 2, device)
+
     
     def predict_object_position_from_contact(self, pred_hand_contact_prob, pred_hand_positions, obj_rot_matrix, gt_obj_trans):
         """
@@ -507,12 +556,23 @@ class ObjectTransModule(torch.nn.Module):
         
         Returns:
             computed_obj_trans: [bs, seq, 3] 预测的物体位置
+            fk_bone_info: dict, FK计算过程中的骨长和方向信息，包含：
+                - fk_lhand_bone_length: [bs, seq] FK左手虚拟骨长
+                - fk_rhand_bone_length: [bs, seq] FK右手虚拟骨长
+                - fk_lhand_direction: [bs, seq, 3] FK左手方向（物体坐标系）
+                - fk_rhand_direction: [bs, seq, 3] FK右手方向（物体坐标系）
         """
         batch_size, seq_len, _ = pred_hand_contact_prob.shape
         device = pred_hand_contact_prob.device
         
         # 初始化输出
         computed_obj_trans = gt_obj_trans.clone()  # 开始时使用真值位置作为基础
+        
+        # 初始化FK骨长和方向信息
+        fk_lhand_bone_length = torch.zeros(batch_size, seq_len, device=device)
+        fk_rhand_bone_length = torch.zeros(batch_size, seq_len, device=device)
+        fk_lhand_direction = torch.zeros(batch_size, seq_len, 3, device=device)
+        fk_rhand_direction = torch.zeros(batch_size, seq_len, 3, device=device)
         
         # 阈值设定
         contact_threshold = 0.5
@@ -635,9 +695,25 @@ class ObjectTransModule(torch.nn.Module):
                 hand_to_obj_world = initial_obj_pos - initial_hand_pos  # [3]
                 initial_distance = torch.norm(hand_to_obj_world)  # scalar
                 
-                # 转换到物体坐标系：^Ov_{HO} = ^WR_O^T * ^W(p_O - p_H)
+                # 计算单位方向向量（避免距离被计算两次）
+                if initial_distance > 1e-6:  # 避免除零
+                    hand_to_obj_unit = hand_to_obj_world / initial_distance  # 归一化方向
+                else:
+                    # 如果距离太小，使用默认方向
+                    hand_to_obj_unit = torch.tensor([0.0, 0.0, 1.0], device=hand_to_obj_world.device, dtype=hand_to_obj_world.dtype)
+                    initial_distance = 0.1  # 设置最小距离
+                
+                # 转换到物体坐标系：^Ov_{HO} = ^WR_O^T * ^W(单位方向向量)
                 initial_obj_rot_mat_inv = initial_obj_rot_mat.transpose(0, 1)  # [3, 3]
-                obj_direction_initial = initial_obj_rot_mat_inv @ hand_to_obj_world  # [3]
+                obj_direction_initial = initial_obj_rot_mat_inv @ hand_to_obj_unit  # [3] 单位方向向量
+                
+                # 记录当前接触段的FK骨长和方向信息
+                if hand_type == 'left':
+                    fk_lhand_bone_length[b, start_frame:end_frame+1] = initial_distance
+                    fk_lhand_direction[b, start_frame:end_frame+1] = obj_direction_initial.unsqueeze(0).repeat(end_frame-start_frame+1, 1)
+                else:  # right
+                    fk_rhand_bone_length[b, start_frame:end_frame+1] = initial_distance
+                    fk_rhand_direction[b, start_frame:end_frame+1] = obj_direction_initial.unsqueeze(0).repeat(end_frame-start_frame+1, 1)
                 
                 # 对这个接触段的每一帧应用FK
                 for i, frame_idx in enumerate(range(start_frame, end_frame + 1)):
@@ -676,106 +752,314 @@ class ObjectTransModule(torch.nn.Module):
                 for frame_idx in range(last_end_frame + 1, seq_len):
                     computed_obj_trans[b, frame_idx] = current_obj_position
         
-        return computed_obj_trans
+        # 构建FK骨长和方向信息字典
+        fk_bone_info = {
+            'fk_lhand_bone_length': fk_lhand_bone_length,
+            'fk_rhand_bone_length': fk_rhand_bone_length,
+            'fk_lhand_direction': fk_lhand_direction,
+            'fk_rhand_direction': fk_rhand_direction
+        }
+        
+        return computed_obj_trans, fk_bone_info
+
+    @staticmethod
+    def _rot6d_delta(rot6d: torch.Tensor) -> torch.Tensor:
+        bs, seq, _ = rot6d.shape
+        rotm = rotation_6d_to_matrix(rot6d.reshape(-1, 6)).reshape(bs, seq, 3, 3)
+        rel = torch.matmul(rotm[:, 1:].transpose(-1, -2), rotm[:, :-1])
+        rel_axis = matrix_to_axis_angle(rel.reshape(-1, 3, 3)).reshape(bs, seq - 1, 3)
+        rel_axis = torch.cat([torch.zeros(bs, 1, 3, device=rot6d.device, dtype=rot6d.dtype), rel_axis], dim=1)
+        return rel_axis
+
+    @staticmethod
+    def _unit_vector(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    @staticmethod
+    def _softplus_positive(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.softplus(x) + 1e-6
     
-    def forward(self, hands_pos_feat, pred_hand_contact_prob, obj_rot, obj_trans, compressed_initial_state):
+    def _smooth_gating_weights(self, weights: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
+        对门控权重进行选择性时间平滑，防止位置突变（仅在推理时使用）
+        
+        平滑策略：
+        - 训练时：不应用平滑，保持真实梯度信号
+        - 推理时：选择性平滑
+          * FK分支突增 → 需要平滑（防止位置跳跃）
+          * IMU分支突增 → 不需要平滑（不会突变）
+          * FK分支突减 → 不应平滑（物体需要能快速停止）
         
         Args:
-            hands_pos_feat: [bs, seq, 2*3] 手部位置特征
-            pred_hand_contact_prob: [bs, seq, 3] 手部接触概率
-            obj_rot: [bs, seq, 6] 物体旋转（6D表示） - ^WR_O
-            obj_trans: [bs, seq, 3] 物体位置真值
-            compressed_initial_state: [bs, initial_state_dim] 压缩的初始状态
+            weights: [batch_size, seq_len, 3] 原始门控权重
+                    dim=-1: [左手FK, 右手FK, IMU分支]
             
         Returns:
-            dict: 包含物体方向向量和重建位置的字典
+            smoothed_weights: [batch_size, seq_len, 3] 平滑后的门控权重
         """
-        batch_size, seq_len, _ = hands_pos_feat.shape
+        # 训练时不应用平滑，直接返回原始权重
+        if self.training:
+            return weights
+            
+        # 推理时才考虑平滑
+        if not self.gating_smoothing_enabled:
+            return weights
+        
+        bs, seq, num_branches = weights.shape
+        device = weights.device
+        
+        # 分支索引定义
+        # 0: 左手FK, 1: 右手FK, 2: IMU分支
+        LHAND_FK, RHAND_FK, IMU_BRANCH = 0, 1, 2
+        
+        # 初始化平滑后的权重
+        smoothed_weights = torch.zeros_like(weights)
+        smoothed_weights[:, 0, :] = weights[:, 0, :]  # 第一帧保持不变
+        
+        # 逐帧应用选择性平滑
+        for t in range(1, seq):
+            current_weights = weights[:, t, :]  # [bs, 3]
+            prev_smoothed = smoothed_weights[:, t-1, :]  # [bs, 3]
+            
+            # 确定主导分支（权重最大的分支）
+            prev_dominant = torch.argmax(prev_smoothed, dim=-1)  # [bs]
+            curr_dominant = torch.argmax(current_weights, dim=-1)  # [bs]
+            
+            # 初始化当前帧权重（默认不平滑）
+            frame_weights = current_weights.clone()
+            
+            # 检查是否有任何样本需要平滑（优化：避免不必要的循环）
+            transition_mask = prev_dominant != curr_dominant  # [bs] 布尔掩码
+            
+            if transition_mask.any():  # 只有当至少有一个样本发生转换时才处理
+                # 逐批次处理（因为每个样本的主导分支转换可能不同）
+                for b in range(bs):
+                    if not transition_mask[b]:  # 该样本无转换，跳过
+                        continue
+                        
+                    prev_dom = prev_dominant[b].item()
+                    curr_dom = curr_dominant[b].item()
+                    
+                    # 判断是否需要平滑的转换类型
+                    need_smoothing = False
+                    
+                    # 需要平滑的转换：
+                    # IMU → FK分支 (2→0, 2→1)
+                    # FK分支 → FK分支 (0→1, 1→0)
+                    if (prev_dom == IMU_BRANCH and curr_dom in [LHAND_FK, RHAND_FK]) or \
+                       (prev_dom in [LHAND_FK, RHAND_FK] and curr_dom in [LHAND_FK, RHAND_FK]):
+                        need_smoothing = True
+                    
+                    # 不需要平滑的转换：
+                    # FK分支 → IMU (0→2, 1→2) - 允许快速转到IMU，物体能快速停止
+                    
+                    if need_smoothing:
+                        # 应用指数移动平均平滑
+                        frame_weights[b, :] = (
+                            self.gating_smoothing_alpha * prev_smoothed[b, :] + 
+                            (1.0 - self.gating_smoothing_alpha) * current_weights[b, :]
+                        )
+                        
+                        # 限制相邻帧的最大变化量
+                        if self.gating_max_change > 0:
+                            weight_change = frame_weights[b, :] - prev_smoothed[b, :]
+                            weight_change_norm = torch.norm(weight_change)
+                            
+                            # 如果变化量超过阈值，则进行裁剪
+                            if weight_change_norm > self.gating_max_change:
+                                weight_change = weight_change * (self.gating_max_change / (weight_change_norm + 1e-8))
+                                frame_weights[b, :] = prev_smoothed[b, :] + weight_change
+                        
+                        # 重新归一化以确保权重和为1
+                        frame_weights[b, :] = torch.nn.functional.softmax(
+                            torch.log(frame_weights[b, :] + 1e-8) * self.gating_temperature, 
+                            dim=-1
+                        )
+            
+            smoothed_weights[:, t, :] = frame_weights
+        
+        return smoothed_weights
+
+    def _build_fk_inputs(self, obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3):
+        return torch.cat([obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3], dim=2)
+
+    def _build_imu_inputs(self, obj_imu9, obj_vel3, obj_rot_delta3, obj_rot6d):
+        return torch.cat([obj_imu9, obj_vel3, obj_rot_delta3, obj_rot6d], dim=2)
+
+    def _build_gating_inputs(self, contact_prob3, obj_vel3, obj_imu_acc3):
+        return torch.cat([contact_prob3, obj_vel3, obj_imu_acc3], dim=2)
+
+    def _compute_init_dir_len(self, hand_pos_0, obj_rotm_0, obj_pos_0):
+        vec_world = obj_pos_0 - hand_pos_0  # [bs, 3]
+        lb0 = vec_world.norm(dim=-1, keepdim=True)
+        unit_world = self._unit_vector(vec_world)
+        obj_Rt = obj_rotm_0.transpose(-1, -2)
+        oe0 = torch.bmm(obj_Rt, unit_world.unsqueeze(-1)).squeeze(-1)
+        return oe0, lb0
+
+    def forward(
+        self,
+        hands_pos_feat: torch.Tensor,
+        pred_hand_contact_prob: torch.Tensor,
+        obj_rot: torch.Tensor,
+        obj_trans: torch.Tensor,
+        compressed_initial_state: torch.Tensor,
+        obj_imu: torch.Tensor = None,
+        human_imu: torch.Tensor = None,
+        obj_vel_input: torch.Tensor = None,
+        gt_hands_pos: torch.Tensor = None,
+        use_gt_hands_for_obj: bool = False
+    ):
+        bs, seq, _ = hands_pos_feat.shape
         device = hands_pos_feat.device
+
+        # 选择手部位置来源
+        if use_gt_hands_for_obj and gt_hands_pos is not None:
+            hand_positions = gt_hands_pos  # [bs, seq, 2, 3]
+        else:
+            hand_positions = hands_pos_feat.reshape(bs, seq, 2, 3)
+        lhand_position = hand_positions[:, :, 0, :]
+        rhand_position = hand_positions[:, :, 1, :]
+
+        # 旋转矩阵与差分
+        obj_rot_delta = self._rot6d_delta(obj_rot)
+        obj_rotm = rotation_6d_to_matrix(obj_rot.reshape(-1, 6)).reshape(bs, seq, 3, 3)
+
+        # 物体IMU拆分
+        if obj_imu is None:
+            obj_imu = torch.zeros(bs, seq, 9, device=device, dtype=hands_pos_feat.dtype)
+        else:
+            obj_imu = obj_imu.reshape(bs, seq, -1)
+        obj_imu_acc = obj_imu[:, :, :3]
+
+        # 人体IMU -> 取左右手
+        if human_imu is None:
+            human_imu_reshaped = torch.zeros(bs, seq, self.num_human_imus, self.imu_dim, device=device, dtype=hands_pos_feat.dtype)
+        else:
+            human_imu_reshaped = human_imu.reshape(bs, seq, self.num_human_imus, self.imu_dim)
+        from configs.global_config import IMU_JOINT_NAMES
+        l_idx = IMU_JOINT_NAMES.index('left_hand')
+        r_idx = IMU_JOINT_NAMES.index('right_hand')
+        lhand_imu9 = human_imu_reshaped[:, :, l_idx, :]
+        rhand_imu9 = human_imu_reshaped[:, :, r_idx, :]
+
+        # 物体速度
+        if obj_vel_input is None:
+            obj_vel_input = torch.zeros(bs, seq, 3, device=device, dtype=hands_pos_feat.dtype)
+ 
+        # 手接触标量
+        pL = pred_hand_contact_prob[:, :, 0:1]
+        pR = pred_hand_contact_prob[:, :, 1:2]
+
+        # FK分支输入
+        fk_l_input = self._build_fk_inputs(obj_rot, lhand_position, pL, obj_imu, lhand_imu9, obj_vel_input, obj_rot_delta)
+        fk_r_input = self._build_fk_inputs(obj_rot, rhand_position, pR, obj_imu, rhand_imu9, obj_vel_input, obj_rot_delta)
+
+        # 初始状态
+        l_fk_h0 = compute_rnn_initial_state(self.proj_lhand_fk_state, self.lhand_fk_head, compressed_initial_state, bs)
+        r_fk_h0 = compute_rnn_initial_state(self.proj_rhand_fk_state, self.rhand_fk_head, compressed_initial_state, bs)
+        # imu_h0 = compute_rnn_initial_state(self.proj_imu_state, self.imu_head, compressed_initial_state, bs)
+        gate_h0 = compute_rnn_initial_state(self.proj_gate_state, self.gating_head, compressed_initial_state, bs)
+
+        # 左右手方向+长度
+        l_fk_out, _ = self.lhand_fk_head(fk_l_input, l_fk_h0)
+        r_fk_out, _ = self.rhand_fk_head(fk_r_input, r_fk_h0)
+        l_dir = self._unit_vector(l_fk_out[:, :, :3])
+        r_dir = self._unit_vector(r_fk_out[:, :, :3])
+        l_len = self._softplus_positive(l_fk_out[:, :, 3])
+        r_len = self._softplus_positive(r_fk_out[:, :, 3])
+
+        # FK到世界
+        obj_rotm_flat = obj_rotm.reshape(bs * seq, 3, 3)
+        l_dir_world = torch.bmm(obj_rotm_flat, l_dir.reshape(bs * seq, 3, 1)).reshape(bs, seq, 3)
+        r_dir_world = torch.bmm(obj_rotm_flat, r_dir.reshape(bs * seq, 3, 1)).reshape(bs, seq, 3)
+        l_pos_fk = lhand_position + l_dir_world * l_len.unsqueeze(-1)
+        r_pos_fk = rhand_position + r_dir_world * r_len.unsqueeze(-1)
+
+        # IMU分支：使用物体IMU加速度积分得到速度
+        # # 对加速度进行时间积分得到速度
+        # dt = 1.0 / FRAME_RATE
+        # vel_from_acc_integration = torch.zeros_like(obj_imu_acc)
+        # # 第一帧速度初始化为0
+        # vel_from_acc_integration[:, 0, :] = 0.0
+        # # 后续帧通过积分计算：v(t) = v(t-1) + a(t) * dt
+        # for t in range(1, seq):
+        #     vel_from_acc_integration[:, t, :] = vel_from_acc_integration[:, t-1, :] + obj_imu_acc[:, t, :] * dt
+            
+        # vel_used = vel_from_acc_integration  # [bs, seq, 3]
+        vel_used = obj_vel_input  # [bs, seq, 3]
+
+        # 门控
+        gating_input = self._build_gating_inputs(pred_hand_contact_prob, obj_vel_input, obj_imu_acc)
+        gate_logits, _ = self.gating_head(gating_input, gate_h0)
+        prior_im = 1.0 - torch.maximum(pL.squeeze(-1), pR.squeeze(-1))
+        prior = torch.stack([pL.squeeze(-1), pR.squeeze(-1), prior_im], dim=-1)
+        eps = 1e-6
+        gate_logits = gate_logits + self.gating_prior_beta * torch.log(prior + eps)
+        weights_raw = torch.nn.functional.softmax(gate_logits / self.gating_temperature, dim=-1)
         
-        # 将6D旋转转换为旋转矩阵
-        obj_rot_matrix = rotation_6d_to_matrix(obj_rot.view(-1, 6)).view(batch_size, seq_len, 3, 3)  # [bs, seq, 3, 3]
-        
-        # 为物体位置添加噪声
-        obj_trans_noisy = self.add_noise_to_obj_trans(obj_trans, self.obj_trans_noise_std)  # [bs, seq, 3]
-        
-        # 分离手部位置
-        hand_positions = hands_pos_feat.reshape(batch_size, seq_len, 2, 3)  # [bs, seq, 2, 3]
-        lhand_position = hand_positions[:, :, 0, :]  # [bs, seq, 3]
-        rhand_position = hand_positions[:, :, 1, :]  # [bs, seq, 3]
-        
-        # 计算加噪声的真值骨长：|加噪声的真值p_o - 真值p_H|
-        lhand_bone_length_noisy = torch.norm(obj_trans_noisy - lhand_position, dim=-1)  # [bs, seq]
-        rhand_bone_length_noisy = torch.norm(obj_trans_noisy - rhand_position, dim=-1)  # [bs, seq]
-        
-        # 生成初始状态
-        def get_initial_rnn_state(proj_layer, rnn_module):
-            projected_state = proj_layer(compressed_initial_state)
-            num_layers = rnn_module.n_rnn_layer
-            num_directions = rnn_module.num_directions
-            hidden_size = rnn_module.n_hidden
-            expected_shape = (batch_size, 2 * num_layers * num_directions, hidden_size)
-            projected_state = projected_state.view(expected_shape)
-            h_0_c_0 = torch.split(projected_state, num_layers * num_directions, dim=1)
-            h_0 = h_0_c_0[0].permute(1, 0, 2).contiguous()
-            c_0 = h_0_c_0[1].permute(1, 0, 2).contiguous()
-            return (h_0, c_0)
-        
-        # 准备RNN输入：^WR_O(6D旋转) + 手部位置(3) + 接触概率(3) + 物体位置加噪声(3)
-        
-        # 左手^Ov_{HO}估计
-        lhand_obj_direction_initial_state = get_initial_rnn_state(self.proj_lhand_obj_direction_state, self.lhand_obj_direction_net)
-        lhand_obj_direction_input = torch.cat([
-            obj_rot,                    # [bs, seq, 6] - ^WR_O (6D旋转)
-            lhand_position,             # [bs, seq, 3] - 左手位置
-            pred_hand_contact_prob,     # [bs, seq, 3] - 接触概率
-            obj_trans_noisy             # [bs, seq, 3] - 物体位置加噪声
-        ], dim=2)  # [bs, seq, 15]
-        
-        pred_lhand_obj_direction, _ = self.lhand_obj_direction_net(lhand_obj_direction_input, lhand_obj_direction_initial_state)  # [bs, seq, 3]
-        
-        # 右手^Ov_{HO}估计
-        rhand_obj_direction_initial_state = get_initial_rnn_state(self.proj_rhand_obj_direction_state, self.rhand_obj_direction_net)
-        rhand_obj_direction_input = torch.cat([
-            obj_rot,                    # [bs, seq, 6] - ^WR_O (6D旋转)
-            rhand_position,             # [bs, seq, 3] - 右手位置
-            pred_hand_contact_prob,     # [bs, seq, 3] - 接触概率
-            obj_trans_noisy             # [bs, seq, 3] - 物体位置加噪声
-        ], dim=2)  # [bs, seq, 15]
-        
-        pred_rhand_obj_direction, _ = self.rhand_obj_direction_net(rhand_obj_direction_input, rhand_obj_direction_initial_state)  # [bs, seq, 3]
-        
-        # 使用FK公式重建物体位置
-        # 左手重建
-        lhand_computed_obj_trans = self.compute_object_position_from_direction(
-            lhand_position, obj_rot_matrix, pred_lhand_obj_direction, lhand_bone_length_noisy
-        )  # [bs, seq, 3]
-        
-        # 右手重建
-        rhand_computed_obj_trans = self.compute_object_position_from_direction(
-            rhand_position, obj_rot_matrix, pred_rhand_obj_direction, rhand_bone_length_noisy
-        )  # [bs, seq, 3]
-        
-        # 对左右手重建的物体位置取平均
-        computed_obj_trans_avg = (lhand_computed_obj_trans + rhand_computed_obj_trans) / 2  # [bs, seq, 3]
-        
-        # 新增：基于接触的FK物体位置预测
-        computed_obj_trans_contact_fk = self.predict_object_position_from_contact(
-            pred_hand_contact_prob, hand_positions, obj_rot_matrix, obj_trans
-        )  # [bs, seq, 3]
-        
-        return {
-            "pred_lhand_obj_direction": pred_lhand_obj_direction,       # [bs, seq, 3] - 左手^Ov_{HO}
-            "pred_rhand_obj_direction": pred_rhand_obj_direction,       # [bs, seq, 3] - 右手^Ov_{HO}
-            "pred_obj_trans_from_fk": computed_obj_trans_avg,           # [bs, seq, 3] - FK重建的物体位置
-            "pred_lhand_obj_trans": lhand_computed_obj_trans,           # [bs, seq, 3] - 左手单独重建
-            "pred_rhand_obj_trans": rhand_computed_obj_trans,           # [bs, seq, 3] - 右手单独重建
-            "pred_obj_trans_from_contact": computed_obj_trans_contact_fk,  # [bs, seq, 3] - 基于接触的FK物体位置
+        # 应用权重平滑
+        weights = self._smooth_gating_weights(weights_raw)
+
+        # 逐帧融合：IMU速度积分引入上一帧锚点
+        dt = 1.0 / FRAME_RATE
+        fused_pos = torch.zeros(bs, seq, 3, device=device, dtype=hands_pos_feat.dtype)
+        for t in range(seq):
+            prev_pos = fused_pos[:, t - 1, :] if t > 0 else obj_trans[:, 0, :]
+            pos_imu_integrated = prev_pos + vel_used[:, t, :] * dt
+            fused_pos[:, t, :] = (
+                weights[:, t, 0:1] * l_pos_fk[:, t, :] +
+                weights[:, t, 1:2] * r_pos_fk[:, t, :] +
+                weights[:, t, 2:3] * pos_imu_integrated
+            )
+
+        # 差分
+        vel_from_pos = torch.zeros_like(fused_pos)
+        acc_from_pos = torch.zeros_like(fused_pos)
+        if seq > 1:
+            vel_from_pos[:, 1:] = (fused_pos[:, 1:] - fused_pos[:, :-1]) * FRAME_RATE
+        if seq > 2:
+            acc_from_pos[:, 2:] = (fused_pos[:, 2:] - 2 * fused_pos[:, 1:-1] + fused_pos[:, :-2]) * (FRAME_RATE ** 2) / acc_scale
+
+        # 首帧初始化参考
+        obj_pos_0 = obj_trans[:, 0, :]
+        obj_R_0 = obj_rotm[:, 0, :, :]
+        l_hand_0 = lhand_position[:, 0, :]
+        r_hand_0 = rhand_position[:, 0, :]
+        l_oe0, l_lb0 = self._compute_init_dir_len(l_hand_0, obj_R_0, obj_pos_0)
+        r_oe0, r_lb0 = self._compute_init_dir_len(r_hand_0, obj_R_0, obj_pos_0)
+
+        # weights_watch = weights.detach().cpu().numpy()
+        # pred_hand_contact_prob_watch = pred_hand_contact_prob.detach().cpu().numpy()
+        # vel_used_watch = vel_used.detach().cpu().numpy()
+        # obj_imu_watch = obj_imu.detach().cpu().numpy()
+
+
+        return_dict = {
+            'pred_obj_trans': fused_pos,
+            'gating_weights': weights,
+            'gating_weights_raw': weights_raw,  # 原始权重（平滑前）
+            'pred_obj_vel_from_posdiff': vel_from_pos,
+            'pred_obj_acc_from_posdiff': acc_from_pos,
+            'obj_vel_input': obj_vel_input,  # 添加用于可视化的物体速度输入
+
+            'pred_lhand_obj_direction': l_dir,
+            'pred_rhand_obj_direction': r_dir,
+            'pred_lhand_lb': l_len,
+            'pred_rhand_lb': r_len,
+            'pred_lhand_obj_trans': l_pos_fk,
+            'pred_rhand_obj_trans': r_pos_fk,
+            'pred_obj_trans_from_fk': (l_pos_fk + r_pos_fk) / 2.0,
+
+            'init_lhand_oe_ho': l_oe0,
+            'init_rhand_oe_ho': r_oe0,
+            'init_lhand_lb': l_lb0.squeeze(-1),
+            'init_rhand_lb': r_lb0.squeeze(-1),
+            
+            # 选择性平滑调试信息
+            'gating_smoothing_applied': self.training == False and self.gating_smoothing_enabled,  # 是否应用了平滑
         }
-
-
+        return return_dict
 class TransPoseNet(torch.nn.Module):
     """
     适用于EgoIMU项目的TransPose网络架构，支持分阶段训练和模块化加载
@@ -814,20 +1098,17 @@ class TransPoseNet(torch.nn.Module):
         n_root_pos_start = 3
         n_obj_rot_start = 6
         n_obj_trans_start = 3
-        n_initial_state = n_motion_start + n_root_pos_start + n_obj_rot_start + n_obj_trans_start
+        n_lhand_pos_start = 3  # 左手初始位置
+        n_rhand_pos_start = 3  # 右手初始位置
+        n_initial_state = n_motion_start + n_root_pos_start + n_obj_rot_start + n_obj_trans_start + n_lhand_pos_start + n_rhand_pos_start
         
         # 压缩初始状态MLP
-        self.initial_state_dim = 64
+        self.initial_state_dim = INITIAL_STATE_DIM
         self.initial_state_compressor = torch.nn.Sequential(
             torch.nn.Linear(n_initial_state, self.initial_state_dim * 2),
             torch.nn.ReLU(),
             torch.nn.Linear(self.initial_state_dim * 2, self.initial_state_dim)
         ).to(self.device)
-        
-        # 传递噪声参数给配置
-        if hasattr(cfg, 'noise_params'):
-            cfg.init_rotation_noise_std = cfg.noise_params.get('init_rotation_noise_std', 0.1)
-            cfg.bone_length_noise_std = cfg.noise_params.get('bone_length_noise_std', 0.05)
         
         # 初始化默认值
         if pretrained_modules is None:
@@ -881,8 +1162,8 @@ class TransPoseNet(torch.nn.Module):
                 pretrained_modules['object_trans'], 'object_trans', cfg
             )
         else:
-            print("正在初始化新的object_trans模块")
-            self.object_trans_module = ObjectTransModule(cfg, self.device)
+            print("正在初始化新的object_trans模块(统一融合版)")
+            self.object_trans_module = UnifiedObjectTransModule(cfg, self.device)
     
     def _load_single_module(self, checkpoint_path, module_name, cfg):
         """加载单个模块的预训练权重"""
@@ -900,7 +1181,7 @@ class TransPoseNet(torch.nn.Module):
             elif module_name == 'human_pose':
                 module = HumanPoseModule(cfg, self.device)
             elif module_name == 'object_trans':
-                module = ObjectTransModule(cfg, self.device)
+                module = UnifiedObjectTransModule(cfg, self.device)
             else:
                 raise ValueError(f"未知的模块名称: {module_name}")
             
@@ -925,7 +1206,7 @@ class TransPoseNet(torch.nn.Module):
             elif module_name == 'human_pose':
                 return HumanPoseModule(cfg, self.device)
             elif module_name == 'object_trans':
-                return ObjectTransModule(cfg, self.device)
+                return UnifiedObjectTransModule(cfg, self.device)
     
     def get_module_state_dict(self, module_name):
         """获取指定模块的状态字典"""
@@ -1021,6 +1302,7 @@ class TransPoseNet(torch.nn.Module):
         root_pos = data_dict["root_pos"]
         obj_rot = data_dict.get("obj_rot", None)
         obj_trans = data_dict.get("obj_trans", None)
+        hands_pos = data_dict.get("gt_hands_pos", None)
         
         batch_size, seq_len = human_imu.shape[:2]
         
@@ -1034,12 +1316,16 @@ class TransPoseNet(torch.nn.Module):
         root_pos_start = root_pos[:, 0]
         obj_rot_start = obj_rot[:, 0]
         obj_trans_start = obj_trans[:, 0]
+        lhand_pos_start = hands_pos[:, 0, 0, :]
+        rhand_pos_start = hands_pos[:, 0, 1, :]
         
         initial_state_flat = torch.cat([
             motion_start,
             root_pos_start,
             obj_rot_start,
-            obj_trans_start
+            obj_trans_start,
+            lhand_pos_start,
+            rhand_pos_start
         ], dim=1)
         
         return imu_data, initial_state_flat
@@ -1116,14 +1402,43 @@ class TransPoseNet(torch.nn.Module):
             }
             results.update(human_pose_outputs)
         
-        # 模块3: 物体方向向量估计（只有在使用物体数据时才执行）
+        # 模块3: 物体位置估计（只有在使用物体数据时才执行）
         if use_object_data and self.object_trans_module is not None:
+            # 选择物体速度输入：HOI用GT，OMOMO用VC预测（若可用）
+            use_gt_hands_for_obj = bool(data_dict.get('use_gt_hands_for_obj', False))
+            obj_vel_input = None
+            if use_gt_hands_for_obj:
+                obj_vel_input = data_dict.get('obj_vel', None)
+            else:
+                obj_vel_input = velocity_contact_outputs.get('pred_obj_vel', None)
+
+            # HOI 阶段使用one-hot GT接触概率，否则用预测
+            if use_gt_hands_for_obj:
+                lhand_gt = data_dict.get('lhand_contact', None)
+                rhand_gt = data_dict.get('rhand_contact', None)
+                obj_gt = data_dict.get('obj_contact', None)
+                if lhand_gt is not None and rhand_gt is not None and obj_gt is not None:
+                    pred_hand_contact_prob_input = torch.stack([
+                        lhand_gt.float().to(device),
+                        rhand_gt.float().to(device),
+                        obj_gt.float().to(device)
+                    ], dim=2)
+                else:
+                    pred_hand_contact_prob_input = velocity_contact_outputs["pred_hand_contact_prob"]
+            else:
+                pred_hand_contact_prob_input = velocity_contact_outputs["pred_hand_contact_prob"]
+
             object_trans_outputs = self.object_trans_module(
-                human_pose_outputs["hands_pos_feat"],
-                velocity_contact_outputs["pred_hand_contact_prob"],
-                obj_rot,
-                obj_trans,
-                compressed_initial_state
+                hands_pos_feat=human_pose_outputs["hands_pos_feat"],
+                pred_hand_contact_prob=pred_hand_contact_prob_input,
+                obj_rot=obj_rot,
+                obj_trans=obj_trans,
+                compressed_initial_state=compressed_initial_state,
+                obj_imu=data_dict.get("obj_imu", None),
+                human_imu=data_dict.get("human_imu", None),
+                obj_vel_input=obj_vel_input,
+                gt_hands_pos=data_dict.get("gt_hands_pos", None),
+                use_gt_hands_for_obj=use_gt_hands_for_obj
             )
             results.update(object_trans_outputs)
         else:
