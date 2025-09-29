@@ -360,7 +360,7 @@ class HumanPoseModule(torch.nn.Module):
         weight = (clamped_p - threshold_min) / (threshold_max - threshold_min)
         return weight.unsqueeze(1)
     
-    def forward(self, human_imu_data, pred_leaf_vel_flat, compressed_initial_state, root_pos_gt):
+    def forward(self, human_imu_data, pred_leaf_vel_flat, compressed_initial_state):
         """
         前向传播
 
@@ -368,7 +368,6 @@ class HumanPoseModule(torch.nn.Module):
             human_imu_data: [bs, seq, n_human_imu] 人体IMU数据
             pred_leaf_vel_flat: [bs, seq, n_leaf*3] 叶子节点速度
             compressed_initial_state: [bs, initial_state_dim] 压缩的初始状态
-            root_pos_gt: [bs, seq, 3] 根关节位置真值（可选，用于物体位置估计）
 
         Returns:
             dict: 包含姿态、接触和平移预测的字典
@@ -407,25 +406,81 @@ class HumanPoseModule(torch.nn.Module):
         )
         pred_motion = pred_motion_6d_flat.reshape(batch_size, seq_len, -1)
         
+        # 足部接触概率预测
+        contact_prob_input = torch.cat([s1_output, human_imu_data], dim=2)
+        contact_probability, _ = self.contact_prob_net(contact_prob_input, contact_initial_state)
+        contact_probability = torch.sigmoid(contact_probability)
+        contact_probability_flat = contact_probability.reshape(-1, 2)
+        
+        # 速度分支B2预测
+        trans_b2_input = torch.cat([s2_output, human_imu_data], dim=2)
+        velocity_b2, _ = self.trans_b2(trans_b2_input, trans_b2_initial_state)
+        velocity_b2_flat = velocity_b2.reshape(-1, 3)
+        
+        # 计算人体平移
+        pose_mat_flat = rotation_6d_to_matrix(pred_motion_6d_flat.reshape(-1, 22, 6))
+        root_orient_mat_flat = pose_mat_flat[:, 0]
+        pose_axis_angle_flat = matrix_to_axis_angle(pose_mat_flat).reshape(batch_size*seq_len, -1)
+        
+        # Forward Kinematics
+        body_model_output = self.body_model(
+            root_orient=pose_axis_angle_flat[:, :3],
+            pose_body=pose_axis_angle_flat[:, 3:],
+        )
+        j_flat = body_model_output.Jtr[:, :self.num_joints, :]
+
+        # 计算速度分支B1
+        j_seq = j_flat.reshape(batch_size, seq_len, self.num_joints, 3)
+        left_foot_pos = j_seq[:, :, self.left_foot_idx, :]
+        right_foot_pos = j_seq[:, :, self.right_foot_idx, :]
+        
+        prev_left_foot_pos = torch.roll(left_foot_pos, shifts=1, dims=1)
+        prev_right_foot_pos = torch.roll(right_foot_pos, shifts=1, dims=1)
+        prev_left_foot_pos[:, 0, :] = left_foot_pos[:, 0, :]
+        prev_right_foot_pos[:, 0, :] = right_foot_pos[:, 0, :]
+        
+        lfoot_vel = (prev_left_foot_pos - left_foot_pos)
+        rfoot_vel = (prev_right_foot_pos - right_foot_pos)
+        lfoot_vel_flat = lfoot_vel.reshape(-1, 3)
+        rfoot_vel_flat = rfoot_vel.reshape(-1, 3)
+        
+        contact_indices = contact_probability_flat.max(dim=1).indices
+        chosen_foot_vel = torch.where(contact_indices.unsqueeze(1) == 0, rfoot_vel_flat, lfoot_vel_flat)
+        tran_b1_vel = self.gravity_velocity.unsqueeze(0) + chosen_foot_vel
+        
+        # 计算速度分支B2
+        velocity_b2_flat = torch.bmm(root_orient_mat_flat, velocity_b2_flat.unsqueeze(-1)).squeeze(-1)
+        tran_b2_vel = velocity_b2_flat * self.vel_scale / FRAME_RATE
+        
+        # 融合速度分支
+        max_contact_prob = contact_probability_flat.max(dim=1).values
+        weight = self._prob_to_weight(max_contact_prob)
+        velocity_flat = lerp(tran_b2_vel, tran_b1_vel, weight)
+        
+        # 计算最终平移
+        velocity = velocity_flat.reshape(batch_size, seq_len, 3)
+        trans = torch.cumsum(velocity, dim=1)
+        
         # 计算手部位置（用于物体平移估计）
         pred_root_orient_6d = pred_motion[:, :, :6]
         pred_body_pose_6d = pred_motion[:, :, 6:]
-
+        
         pred_root_orient_6d_flat = pred_root_orient_6d.reshape(-1, 6)
         pred_body_pose_6d_flat = pred_body_pose_6d.reshape(-1, 21, 6)
         pred_root_orient_mat_flat = rotation_6d_to_matrix(pred_root_orient_6d_flat)
         pred_body_pose_mat_flat = rotation_6d_to_matrix(pred_body_pose_6d_flat.reshape(-1, 6)).reshape(-1, 21, 3, 3)
         pred_root_orient_axis_flat = matrix_to_axis_angle(pred_root_orient_mat_flat)
         pred_body_pose_axis_flat = matrix_to_axis_angle(pred_body_pose_mat_flat.reshape(-1, 3, 3)).reshape(-1, 21*3)
-
+        pred_transl_flat = trans.reshape(-1, 3)
+        
         pred_pose_body_input = {
-            'root_orient': pred_root_orient_axis_flat,
-            'pose_body': pred_body_pose_axis_flat,
-            'trans': root_pos_gt.reshape(-1, 3)
+            'root_orient': pred_root_orient_axis_flat, 
+            'pose_body': pred_body_pose_axis_flat, 
+            'trans': pred_transl_flat
         }
         pred_smplh_out = self.body_model(**pred_pose_body_input)
         pred_joints_all = pred_smplh_out.Jtr.view(batch_size, seq_len, -1, 3)
-
+        
         # 提取手部位置
         lhand_pos_global = pred_joints_all[:, :, self.wrist_l_idx, :]
         rhand_pos_global = pred_joints_all[:, :, self.wrist_r_idx, :]
@@ -435,7 +490,10 @@ class HumanPoseModule(torch.nn.Module):
             "pred_leaf_pos": pred_leaf_pos,
             "pred_full_pos": pred_full_pos,
             "motion": pred_motion,
-            "root_pos": root_pos_gt,
+            "tran_b2_vel": velocity_b2_flat.reshape(batch_size, seq_len, 3),
+            "contact_probability": contact_probability,
+            "root_vel": velocity * FRAME_RATE,
+            "root_pos": trans,
             "pred_hand_pos": hand_positions,
             "hands_pos_feat": torch.cat([lhand_pos_global, rhand_pos_global], dim=2)
         }
@@ -452,8 +510,8 @@ class UnifiedObjectTransModule(torch.nn.Module):
         hidden_dim_multiplier = cfg.hidden_dim_multiplier if hasattr(cfg, 'hidden_dim_multiplier') else 1
 
         # 噪声与门控参数
-        self.gating_prior_beta = getattr(cfg, 'gating_prior_beta', 5.0)     # 先验强度: gating_prior_beta控制先验知识的影响程度
-        self.gating_temperature = getattr(cfg, 'gating_temperature', 5.0)   # 温度控制: 通过gating_temperature控制权重的锐度，温度越低权重越集中
+        self.gating_prior_beta = getattr(cfg, 'gating_prior_beta', 2.0)     # 先验强度: gating_prior_beta控制先验知识的影响程度
+        self.gating_temperature = getattr(cfg, 'gating_temperature', 1.0)   # 温度控制: 通过gating_temperature控制权重的锐度，温度越低权重越集中
         
         # 门控权重平滑参数（仅在推理时使用，训练时保持真实梯度）
         self.gating_smoothing_enabled = getattr(cfg, 'gating_smoothing_enabled', False)
@@ -628,7 +686,7 @@ class UnifiedObjectTransModule(torch.nn.Module):
                 # 决定用于计算的初始物体位置
                 if segment_idx == 0:
                     # 第一个接触段使用真值位置
-                    initial_obj_pos = gt_obj_pos[0]  # [3]
+                    initial_obj_pos = gt_obj_pos[start_frame]  # [3]
                 else:
                     # 后续接触段使用前一个接触段的最后预测位置
                     initial_obj_pos = current_obj_position  # [3]
@@ -843,10 +901,11 @@ class UnifiedObjectTransModule(torch.nn.Module):
         self,
         hands_pos_feat: torch.Tensor,
         pred_hand_contact_prob: torch.Tensor,
-        obj_trans_0: torch.Tensor,  # [bs, 3]
+        obj_rot: torch.Tensor,
+        obj_trans: torch.Tensor,
         compressed_initial_state: torch.Tensor,
-        obj_imu: torch.Tensor = None, # [bs, seq, 1*imu_dim]
-        human_imu: torch.Tensor = None, # [bs, seq, num_human_imus*imu_dim]
+        obj_imu: torch.Tensor = None,
+        human_imu: torch.Tensor = None,
         obj_vel_input: torch.Tensor = None,
         gt_hands_pos: torch.Tensor = None,
         use_gt_hands_for_obj: bool = False
@@ -858,25 +917,29 @@ class UnifiedObjectTransModule(torch.nn.Module):
         if use_gt_hands_for_obj and gt_hands_pos is not None:
             hand_positions = gt_hands_pos  # [bs, seq, 2, 3]
         else:
-            # print("warning: use pred hands pos for obj")
+            print("warning: use pred hands pos for obj")
             hand_positions = hands_pos_feat.reshape(bs, seq, 2, 3)
         lhand_position = hand_positions[:, :, 0, :]
         rhand_position = hand_positions[:, :, 1, :]
 
         # hand_positions_watch = hand_positions.detach().cpu().numpy()
 
-        # 从obj_imu中提取obj_rot（后6维是6D旋转表示）
-        obj_rot = obj_imu[:, :, 3:9]  # [bs, seq, 6]
-
         # 旋转矩阵与差分
         obj_rot_delta = self._rot6d_delta(obj_rot)
         obj_rotm = rotation_6d_to_matrix(obj_rot.reshape(-1, 6)).reshape(bs, seq, 3, 3)
 
         # 物体IMU拆分
+        if obj_imu is None:
+            obj_imu = torch.zeros(bs, seq, 9, device=device, dtype=hands_pos_feat.dtype)
+        else:
+            obj_imu = obj_imu.reshape(bs, seq, -1)
         obj_imu_acc = obj_imu[:, :, :3]
 
         # 人体IMU -> 取左右手
-        human_imu_reshaped = human_imu.reshape(bs, seq, self.num_human_imus, self.imu_dim)
+        if human_imu is None:
+            human_imu_reshaped = torch.zeros(bs, seq, self.num_human_imus, self.imu_dim, device=device, dtype=hands_pos_feat.dtype)
+        else:
+            human_imu_reshaped = human_imu.reshape(bs, seq, self.num_human_imus, self.imu_dim)
         from configs.global_config import IMU_JOINT_NAMES
         l_idx = IMU_JOINT_NAMES.index('left_hand')
         r_idx = IMU_JOINT_NAMES.index('right_hand')
@@ -945,7 +1008,7 @@ class UnifiedObjectTransModule(torch.nn.Module):
         dt = 1.0 / FRAME_RATE
         fused_pos = torch.zeros(bs, seq, 3, device=device, dtype=hands_pos_feat.dtype)
         for t in range(seq):
-            prev_pos = fused_pos[:, t - 1, :] if t > 0 else obj_trans_0
+            prev_pos = fused_pos[:, t - 1, :] if t > 0 else obj_trans[:, 0, :]
             pos_imu_integrated = prev_pos + vel_used[:, t, :] * dt
             fused_pos[:, t, :] = (
                 weights[:, t, 0:1] * l_pos_fk[:, t, :] +
@@ -962,7 +1025,7 @@ class UnifiedObjectTransModule(torch.nn.Module):
             acc_from_pos[:, 2:] = (fused_pos[:, 2:] - 2 * fused_pos[:, 1:-1] + fused_pos[:, :-2]) * (FRAME_RATE ** 2) / acc_scale
 
         # 首帧初始化参考
-        obj_pos_0 = obj_trans_0
+        obj_pos_0 = obj_trans[:, 0, :]
         obj_R_0 = obj_rotm[:, 0, :, :]
         l_hand_0 = lhand_position[:, 0, :]
         r_hand_0 = rhand_position[:, 0, :]
@@ -1237,7 +1300,7 @@ class TransPoseNet(torch.nn.Module):
     def format_input(self, data_dict):
         """格式化输入数据"""
         human_imu = data_dict["human_imu"]
-        obj_imu = data_dict.get("obj_imu")
+        obj_imu = data_dict.get("obj_imu", None)
         motion = data_dict["motion"]
         root_pos = data_dict["root_pos"]
         obj_rot = data_dict.get("obj_rot", None)
@@ -1321,13 +1384,10 @@ class TransPoseNet(torch.nn.Module):
         
         # 模块2: 人体姿态 + 足部接触 + 人体平移
         if self.human_pose_module is not None:
-            # 获取根关节位置真值
-            root_pos_gt = data_dict.get("root_pos", None)
             human_pose_outputs = self.human_pose_module(
-                human_imu_data,
-                velocity_contact_outputs["pred_leaf_vel_flat"],
-                compressed_initial_state,
-                root_pos_gt=root_pos_gt
+                human_imu_data, 
+                velocity_contact_outputs["pred_leaf_vel_flat"], 
+                compressed_initial_state
             )
             results.update(human_pose_outputs)
         else:
@@ -1336,7 +1396,9 @@ class TransPoseNet(torch.nn.Module):
                 "pred_leaf_pos": torch.zeros(batch_size, seq_len, joint_set.n_leaf, 3, device=device),
                 "pred_full_pos": torch.zeros(batch_size, seq_len, joint_set.n_full, 3, device=device),
                 "motion": torch.zeros(batch_size, seq_len, self.num_joints * self.joint_dim, device=device),
+                "tran_b2_vel": torch.zeros(batch_size, seq_len, 3, device=device),
                 "contact_probability": torch.zeros(batch_size, seq_len, 2, device=device),
+                "root_vel": torch.zeros(batch_size, seq_len, 3, device=device),
                 "root_pos": torch.zeros(batch_size, seq_len, 3, device=device),
                 "pred_hand_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
                 "hands_pos_feat": torch.zeros(batch_size, seq_len, 6, device=device)
@@ -1372,10 +1434,11 @@ class TransPoseNet(torch.nn.Module):
             object_trans_outputs = self.object_trans_module(
                 hands_pos_feat=human_pose_outputs["hands_pos_feat"],
                 pred_hand_contact_prob=pred_hand_contact_prob_input,
-                obj_trans_0=obj_trans[:, 0, :],
+                obj_rot=obj_rot,
+                obj_trans=obj_trans,
                 compressed_initial_state=compressed_initial_state,
-                obj_imu=obj_imu_data,
-                human_imu=human_imu_data,
+                obj_imu=data_dict.get("obj_imu", None),
+                human_imu=data_dict.get("human_imu", None),
                 obj_vel_input=obj_vel_input,
                 gt_hands_pos=data_dict.get("gt_hands_pos", None),
                 use_gt_hands_for_obj=use_gt_hands_for_obj

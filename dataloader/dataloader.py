@@ -203,7 +203,7 @@ def compute_obj_direction_supervision(position_global_norm, obj_trans_norm, obj_
     return result
 
 class IMUDataset(Dataset):
-    def __init__(self, data_dir, window_size=60, normalize=True, debug=False, min_obj_contact_frames=10):
+    def __init__(self, data_dir, window_size=60, normalize=True, debug=False, min_obj_contact_frames=10, full_sequence=False):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
         Args:
@@ -225,6 +225,7 @@ class IMUDataset(Dataset):
         self.normalize = normalize
         self.debug = debug
         self.min_obj_contact_frames = min_obj_contact_frames
+        self.full_sequence = full_sequence
 
         # 查找所有目录中的序列文件
         self.sequence_files = []
@@ -245,7 +246,10 @@ class IMUDataset(Dataset):
         # 执行加载、共享和序列信息收集
         self._load_share_and_collect_info()
         print(f"预加载并收集信息完成，共找到{len(self.sequence_info)}个有效序列")
-        print(f"过滤条件：序列长度 >= {self.window_size + 1}，物体接触帧数 >= {self.min_obj_contact_frames}")
+        if self.full_sequence:
+            print(f"过滤条件：整段模式启用，序列长度 >= 1，物体接触帧数 >= {self.min_obj_contact_frames}")
+        else:
+            print(f"过滤条件：序列长度 >= {self.window_size + 1}，物体接触帧数 >= {self.min_obj_contact_frames}")
 
         # 检查BPS文件夹 - 对于多个数据目录，检查第一个目录的BPS文件夹
         self.bps_dir = os.path.join(os.path.dirname(self.data_dirs[0]), "bps_features")
@@ -281,11 +285,16 @@ class IMUDataset(Dataset):
                 motion = seq_data["rotation_local_full_gt_list"]
                 seq_len = motion.shape[0]
 
-                # 检查序列长度是否足够创建至少一个窗口 (从索引1开始，长度为window_size)
-                # 需要 seq_len >= window_size + 1 (因为最大 start_idx 是 seq_len - window_size)
-                if seq_len < self.window_size + 1:
-                    # print(f"调试：跳过文件 {file_path}，序列长度 {seq_len} 不足以创建大小为 {self.window_size} 的窗口。")
-                    continue
+                # 检查序列长度是否足够
+                if self.full_sequence:
+                    # 整段模式：仅需至少1帧即可
+                    if seq_len < 1:
+                        continue
+                else:
+                    # 窗口模式：需要能采样到一个窗口（从索引1开始）
+                    if seq_len < self.window_size + 1:
+                        # print(f"调试：跳过文件 {file_path}，序列长度 {seq_len} 不足以创建大小为 {self.window_size} 的窗口。")
+                        continue
 
                 # 检查物体接触帧数是否足够
                 if "obj_contact" in seq_data and seq_data["obj_contact"] is not None:
@@ -362,16 +371,22 @@ class IMUDataset(Dataset):
              return 
 
 
-        # 2. 随机生成 start_idx
-        # 有效 start_idx 范围：[1, seq_len - window_size] (包含两端)
-        max_start_idx = seq_len - self.window_size
-        if max_start_idx < 1:
-            # 这种情况理论上在 __init__ 中被过滤掉了，但为了安全起见
-            print(f"错误：序列 {seq_name} (长度 {seq_len}) 过短，无法采样窗口大小 {self.window_size}")
-            return 
-        start_idx = torch.randint(1, max_start_idx + 1, (1,)).item()
-        # start_idx = 1
-        end_idx = start_idx + self.window_size # 切片时使用 end_idx
+        # 2. 选择切片范围
+        if self.full_sequence:
+            # 整段模式：不裁剪，直接使用全长度
+            start_idx = 0
+            end_idx = seq_len
+        else:
+            # 随机生成 start_idx（窗口模式）
+            # 有效 start_idx 范围：[1, seq_len - window_size] (包含两端)
+            max_start_idx = seq_len - self.window_size
+            if max_start_idx < 1:
+                # 这种情况理论上在 __init__ 中被过滤掉了，但为了安全起见
+                print(f"错误：序列 {seq_name} (长度 {seq_len}) 过短，无法采样窗口大小 {self.window_size}")
+                return 
+            start_idx = torch.randint(1, max_start_idx + 1, (1,)).item()
+            # start_idx = 1
+            end_idx = start_idx + self.window_size # 切片时使用 end_idx
 
         # 3. 从预加载数据中获取序列数据
         try:
@@ -404,7 +419,8 @@ class IMUDataset(Dataset):
             # --- 结束动态计算 ---
 
             # 将旋转矩阵转换为6D旋转表示
-            human_imu_ori_flat = human_imu_ori.reshape(self.window_size, -1, 3, 3)
+            cur_len = motion.shape[0]
+            human_imu_ori_flat = human_imu_ori.reshape(cur_len, -1, 3, 3)
             human_imu_ori_6d = transforms.matrix_to_rotation_6d(human_imu_ori_flat)
             human_imu = torch.cat([human_imu_acc, human_imu_ori_6d], dim=-1)  # [T, num_imus, 9]
 
@@ -534,7 +550,7 @@ class IMUDataset(Dataset):
             
             # 归一化叶子节点速度：使用root_start_rot_invert左乘
             # root_start_rot_invert: [3, 3], leaf_vel_global: [seq, n_leaf, 3]
-            leaf_vel = torch.einsum('ij,tnj->tni', root_start_rot_invert, leaf_vel_global)  # [seq, n_leaf, 3]
+            leaf_vel = leaf_vel_global @ root_global_rot_start    # [seq, n_leaf, 3]
             # --- 结束计算速度 ---
 
             # --- 计算虚拟关节数据 ---
@@ -542,18 +558,16 @@ class IMUDataset(Dataset):
             # 首先需要对全局位置和旋转进行归一化
 
             # 对关节位置进行归一化：转换到初始根坐标系
-            root_start_rot_invert = root_global_rot_start.swapaxes(-2,-1)  # [3, 3]
             # 先减去根位置，再旋转
             position_centered = position_global_full - root_global_pos_start.unsqueeze(0).unsqueeze(0)  # [seq, J, 3]
-            position_global_norm = torch.einsum('ij,tkl->tki', root_start_rot_invert, position_centered)  # [seq, J, 3]
+            position_global_norm = position_centered @ root_global_rot_start   # [seq, J, 3]
             
             # 对关节旋转进行归一化
-            rotation_global_norm = torch.einsum('ij,tkjl->tkil', root_start_rot_invert, 
-                                                rotation_global_full)  # [seq, J, 3, 3]
+            rotation_global_norm = root_start_rot_invert @ rotation_global_full  # [seq, J, 3, 3]
 
             # 计算物体坐标系下的方向向量（用于监督学习）
-            lhand_obj_direction = torch.zeros(seq_len, 3)
-            rhand_obj_direction = torch.zeros(seq_len, 3)
+            lhand_obj_direction = torch.zeros(cur_len, 3)
+            rhand_obj_direction = torch.zeros(cur_len, 3)
             
             if has_object:
                 try:
@@ -574,8 +588,8 @@ class IMUDataset(Dataset):
                     import traceback
                     traceback.print_exc()
                     # 使用默认值（零向量）
-                    lhand_obj_direction = torch.zeros(seq_len, 3)
-                    rhand_obj_direction = torch.zeros(seq_len, 3)
+                    lhand_obj_direction = torch.zeros(cur_len, 3)
+                    rhand_obj_direction = torch.zeros(cur_len, 3)
             # --- 结束虚拟关节计算 ---
 
             # 构建结果字典

@@ -439,6 +439,10 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
         # 姿态损失
         loss_dict['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         
+        # 根节点位置和速度损失
+        loss_dict['root_pos'] = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+        loss_dict['root_vel'] = torch.nn.functional.l1_loss(pred_dict["root_vel"], root_vel)
+        
         # 关节位置损失
         loss_dict['leaf_pos'] = torch.nn.functional.l1_loss(pred_dict["pred_leaf_pos"], gt_leaf_pos)
 
@@ -448,6 +452,8 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
         weights_full[:, :, [19, 20], :] = 4.0   # 手部loss增强
         loss_dict['full_pos'] = (l1_diff_full * weights_full).mean()
         
+        # 足部接触损失
+        loss_dict['foot_contact'] = torch.nn.functional.binary_cross_entropy(pred_dict["contact_probability"], foot_contact_gt)
     
     if 'object_trans' in active_modules and use_object_data:
         # 主输出：融合后的物体位置
@@ -463,8 +469,13 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
             contact_mask_l = torch.ones(bs, seq, device=device)
             contact_mask_r = torch.ones(bs, seq, device=device)
         else:
-            contact_mask_l = hand_contact_gt[:, :, 0].detach()
-            contact_mask_r = hand_contact_gt[:, :, 1].detach()
+            pred_hand_contact_prob = pred_dict.get('pred_hand_contact_prob', None)
+            if pred_hand_contact_prob is not None:
+                contact_mask_l = pred_hand_contact_prob[:, :, 0].detach()
+                contact_mask_r = pred_hand_contact_prob[:, :, 1].detach()
+            else:
+                contact_mask_l = torch.zeros(bs, seq, device=device)
+                contact_mask_r = torch.zeros(bs, seq, device=device)
         if "pred_lhand_obj_direction" in pred_dict and "lhand_obj_direction" in batch:
             lhand_dir_gt = batch["lhand_obj_direction"].to(device)
             if is_hoi:
@@ -599,6 +610,16 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
     for key in cfg.loss_weights:
         weights[key] = getattr(cfg.loss_weights, key)
     
+    # 根据数据集类型动态调整足部接触损失权重
+    dataset_types = stage_info.get('datasets', ['mixed'])
+    if 'amass' in dataset_types and 'omomo' not in dataset_types:
+        weights['foot_contact'] *= 0.7
+    elif 'omomo' in dataset_types and 'amass' not in dataset_types:
+        weights['foot_contact'] *= 1
+    elif 'mixed' in dataset_types:
+        # 混合数据：使用中等权重
+        weights['foot_contact'] *= 0.7
+    
     # 根据激活模块动态调整权重（不依赖阶段名称）
     active_modules = set(active_modules)
     only_vc = active_modules == {'velocity_contact'}
@@ -612,7 +633,7 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
                 weights[key] = 0.0
     elif only_hp:
         for key in list(weights.keys()):
-            if key not in ['rot', 'leaf_pos', 'full_pos']:
+            if key not in ['rot', 'root_pos', 'leaf_pos', 'full_pos', 'root_vel', 'foot_contact']:
                 weights[key] = 0.0
     elif only_ot:
         allowed_keys = ['obj_trans_fused', 'lhand_obj_direction', 'rhand_obj_direction', 'lhand_lb', 'rhand_lb', 'hoi_error_l', 'hoi_error_r', 'obj_trans_from_fk', 'obj_vel_cons', 'obj_acc_cons']
@@ -689,6 +710,20 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['hand_contact'] = torch.nn.functional.binary_cross_entropy(pred_dict["pred_hand_contact_prob"], hand_contact_gt)
         else:
             loss_components['hand_contact'] = torch.tensor(0.0, device=device)
+
+        # 计算加权损失
+        test_loss = torch.tensor(0.0, device=device)
+        active_components = 0
+        
+        for key, loss_value in loss_components.items():
+            if loss_value.item() != 0.0:
+                test_loss += weights[key] * loss_value
+                active_components += 1
+        
+        if active_components > 0:
+            test_loss = test_loss / active_components
+        
+        return test_loss, loss_components
         
     elif active_modules == {'human_pose'}:
         # human_pose阶段：只看rot和root_pos
@@ -696,6 +731,25 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         else:
             loss_components['rot'] = torch.tensor(0.0, device=device)
+            
+        if "root_pos" in pred_dict:
+            loss_components['root_pos'] = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+        else:
+            loss_components['root_pos'] = torch.tensor(0.0, device=device)
+            
+        # 计算加权损失
+        test_loss = torch.tensor(0.0, device=device)
+        active_components = 0
+        
+        for key, loss_value in loss_components.items():
+            if loss_value.item() != 0.0:
+                test_loss += weights[key] * loss_value
+                active_components += 1
+        
+        if active_components > 0:
+            test_loss = test_loss / active_components
+            
+        return test_loss, loss_components
         
     elif active_modules == {'object_trans'}:
         # object_trans阶段：以融合结果为主，兼容旧键
@@ -714,8 +768,13 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             contact_mask_l = torch.ones(bs, seq, device=device)
             contact_mask_r = torch.ones(bs, seq, device=device)
         else:
-            contact_mask_l = hand_contact_gt[:, :, 0].detach()
-            contact_mask_r = hand_contact_gt[:, :, 1].detach()
+            pred_hand_contact_prob = pred_dict.get('pred_hand_contact_prob', None)
+            if pred_hand_contact_prob is not None:
+                contact_mask_l = pred_hand_contact_prob[:, :, 0].detach()
+                contact_mask_r = pred_hand_contact_prob[:, :, 1].detach()
+            else:
+                contact_mask_l = torch.zeros(bs, seq, device=device)
+                contact_mask_r = torch.zeros(bs, seq, device=device)
 
         if ('pred_lhand_lb' in pred_dict) and ('pred_rhand_lb' in pred_dict) and ('position_global_norm' in batch):
             pos_g = batch['position_global_norm'].to(device)
@@ -752,6 +811,10 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
         else:
             loss_components['hoi_error_l'] = torch.tensor(0.0, device=device)
             loss_components['hoi_error_r'] = torch.tensor(0.0, device=device)
+
+        # 以融合损失为主
+        test_loss = loss_components['obj_trans_fused']
+        return test_loss, loss_components
         
     elif active_modules == {'human_pose', 'object_trans'}:
         # joint_training阶段：看rot、root_pos和融合的物体位置
@@ -759,6 +822,11 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         else:
             loss_components['rot'] = torch.tensor(0.0, device=device)
+            
+        if "root_pos" in pred_dict:
+            loss_components['root_pos'] = torch.nn.functional.mse_loss(pred_dict["root_pos"], root_pos)
+        else:
+            loss_components['root_pos'] = torch.tensor(0.0, device=device)
             
         if "pred_obj_trans" in pred_dict:
             loss_components['obj_trans_fused'] = torch.nn.functional.mse_loss(pred_dict["pred_obj_trans"], obj_trans)
@@ -771,8 +839,13 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             contact_mask_l = torch.ones(bs, seq, device=device)
             contact_mask_r = torch.ones(bs, seq, device=device)
         else:
-            contact_mask_l = hand_contact_gt[:, :, 0].detach()
-            contact_mask_r = hand_contact_gt[:, :, 1].detach()
+            pred_hand_contact_prob = pred_dict.get('pred_hand_contact_prob', None)
+            if pred_hand_contact_prob is not None:
+                contact_mask_l = pred_hand_contact_prob[:, :, 0].detach()
+                contact_mask_r = pred_hand_contact_prob[:, :, 1].detach()
+            else:
+                contact_mask_l = torch.zeros(bs, seq, device=device)
+                contact_mask_r = torch.zeros(bs, seq, device=device)
 
         if ('pred_lhand_lb' in pred_dict) and ('pred_rhand_lb' in pred_dict) and ('position_global_norm' in batch):
             pos_g = batch['position_global_norm'].to(device)
@@ -810,19 +883,23 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['hoi_error_l'] = torch.tensor(0.0, device=device)
             loss_components['hoi_error_r'] = torch.tensor(0.0, device=device)
             
-    # 计算加权损失
-    test_loss = torch.tensor(0.0, device=device)
-    active_components = 0
-    
-    for key, loss_value in loss_components.items():
-        if loss_value.item() != 0.0:
-            test_loss += weights[key] * loss_value
-            active_components += 1
-    
-    if active_components > 0:
-        test_loss = test_loss / active_components
+        # 计算加权损失
+        test_loss = torch.tensor(0.0, device=device)
+        active_components = 0
         
-    return test_loss, loss_components
+        for key, loss_value in loss_components.items():
+            if loss_value.item() != 0.0:
+                test_loss += weights[key] * loss_value
+                active_components += 1
+        
+        if active_components > 0:
+            test_loss = test_loss / active_components
+            
+        return test_loss, loss_components
+        
+    else:
+        # 其他阶段：使用总损失
+        return None, {}
 
 def get_actual_model(model):
     """

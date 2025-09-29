@@ -14,38 +14,53 @@ def tensor2numpy(tensor):
     """
     return tensor.detach().cpu().numpy()
 
+def _aa_to_R(a: torch.Tensor) -> torch.Tensor:
+    """Axis-angle -> rotation matrix. a: [..., 3] -> [..., 3, 3]"""
+    orig_shape = a.shape
+    a = a.view(-1, 3)
+    angle = torch.norm(a, dim=1, keepdim=True)
+    # 避免除零
+    axis = torch.where(angle > 1e-8, a / angle, torch.tensor([1.0, 0.0, 0.0], device=a.device, dtype=a.dtype).expand_as(a))
+    x, y, z = axis[:, 0:1], axis[:, 1:2], axis[:, 2:3]
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    C = 1 - c
+    R = torch.stack([
+        c + x * x * C, x * y * C - z * s, x * z * C + y * s,
+        y * x * C + z * s, c + y * y * C, y * z * C - x * s,
+        z * x * C - y * s, z * y * C + x * s, c + z * z * C
+    ], dim=1).view(-1, 3, 3)
+    return R.view(*orig_shape[:-1], 3, 3)
 
-def rot6d2matrix(x):
-    """
-    将6D旋转表示转换为旋转矩阵
-    
-    Args:
-        x: 6D旋转表示 [batch_size, num_joints, 6]
-        
-    Returns:
-        旋转矩阵 [batch_size, num_joints, 3, 3]
-    """
-    x_shape = x.shape
-    x = x.reshape(-1, 6)
-    
-    # 将前三个和后三个元素分别作为旋转矩阵的两列
-    a1, a2 = x[:, :3], x[:, 3:]
-    
-    # 归一化第一列
-    b1 = F.normalize(a1, dim=1)
-    
-    # 计算第二列的正交分量
-    dot_prod = torch.sum(b1 * a2, dim=1, keepdim=True)
-    b2 = F.normalize(a2 - dot_prod * b1, dim=1)
-    
-    # 通过叉积计算第三列
-    b3 = torch.cross(b1, b2, dim=1)
-    
-    # 拼接三列形成旋转矩阵
-    rot_matrix = torch.stack([b1, b2, b3], dim=-1)
-    
-    return rot_matrix.reshape(x_shape[0], x_shape[1], 3, 3)
 
+def _R_to_aa(R: torch.Tensor) -> torch.Tensor:
+    """Rotation matrix -> axis-angle. R: [..., 3, 3] -> [..., 3]"""
+    orig_shape = R.shape
+    R = R.view(-1, 3, 3)
+    # 角度
+    trace = (R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]).clamp(-1.0, 3.0)
+    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.acos(cos_theta)
+    # 轴（避免小角度数值不稳）
+    eps = 1e-8
+    sin_theta = torch.sin(theta)
+    rx = (R[:, 2, 1] - R[:, 1, 2]) / (2.0 * torch.where(sin_theta.abs() < eps, torch.ones_like(sin_theta), sin_theta))
+    ry = (R[:, 0, 2] - R[:, 2, 0]) / (2.0 * torch.where(sin_theta.abs() < eps, torch.ones_like(sin_theta), sin_theta))
+    rz = (R[:, 1, 0] - R[:, 0, 1]) / (2.0 * torch.where(sin_theta.abs() < eps, torch.ones_like(sin_theta), sin_theta))
+    axis = torch.stack([rx, ry, rz], dim=1)
+    aa = axis * theta.unsqueeze(1)
+    small = theta.abs() < eps
+    if small.any():
+        aa[small] = 0.0
+    return aa.view(*orig_shape[:-2], 3)
+
+
+def _R_to_r6d(R: torch.Tensor) -> torch.Tensor:
+    """Rotation matrix -> 6D representation (first two columns). R: [...,3,3] -> [...,6]"""
+    orig_shape = R.shape
+    R = R.view(-1, 3, 3)
+    r6 = R[:, :, :2].transpose(1, 2).contiguous().view(-1, 6)
+    return r6.view(*orig_shape[:-2], 6)
 
 def calculate_mpjpe(rotmats, return_joints=False):
     """

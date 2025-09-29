@@ -84,6 +84,15 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             if gt_rhand_contact is not None: gt_rhand_contact = gt_rhand_contact.to(device)
             if gt_obj_contact is not None: gt_obj_contact = gt_obj_contact.to(device)
 
+            # 向输入的人体与物体IMU加入噪声（评估时的数据增强）
+            try:
+                noise_std = 0.1
+                gt_human_imu = gt_human_imu + torch.randn_like(gt_human_imu) * noise_std
+                if gt_obj_imu is not None:
+                    gt_obj_imu = gt_obj_imu + torch.randn_like(gt_obj_imu) * noise_std
+            except Exception:
+                pass
+
             bs, seq_len, motion_dim = gt_motion.shape
             if motion_dim != 132:
                  print(f"Warning: Batch {batch_idx}: Expected motion dimension 132 for SMPLH (22*6D), got {motion_dim}. Skipping batch.")
@@ -292,83 +301,6 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
             elif evaluate_objects and not has_object:
                 metrics['obj_trans_err_imu'].append(float('nan'))
 
-            # Object-Hand Relative Position Error - 融合方案 (在真值交互帧下)
-            def compute_hoi_error(pred_obj_trans, method_name):
-                """计算HOI误差的通用函数"""
-                if evaluate_objects and has_object and pred_obj_trans is not None:
-                    # 提取手腕关节位置 (SMPL joint indices: 20=left wrist, 21=right wrist)
-                    wrist_l_idx, wrist_r_idx = 20, 21
-                    
-                    # 预测的手腕位置
-                    pred_lhand_pos = pred_joints_all[:, :, wrist_l_idx, :]  # [bs, seq, 3]
-                    pred_rhand_pos = pred_joints_all[:, :, wrist_r_idx, :]  # [bs, seq, 3]
-                    
-                    # 真值的手腕位置
-                    gt_lhand_pos = gt_joints_all[:, :, wrist_l_idx, :]      # [bs, seq, 3]
-                    gt_rhand_pos = gt_joints_all[:, :, wrist_r_idx, :]      # [bs, seq, 3]
-                    
-                    relative_errors = []
-                    
-                    # 计算左手交互帧的相对位置误差
-                    if gt_lhand_contact is not None:
-                        lhand_contact_mask = gt_lhand_contact.bool()  # [bs, seq]
-                        if lhand_contact_mask.any():
-                            # 在交互帧中计算物体相对于左手的位置
-                            gt_obj_rel_lhand = gt_obj_trans - gt_lhand_pos        # [bs, seq, 3]
-                            pred_obj_rel_lhand = pred_obj_trans - pred_lhand_pos  # [bs, seq, 3]
-                            
-                            # 只在真值交互帧计算误差
-                            valid_frames = lhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_lhand)  # [bs, seq, 3]
-                            if valid_frames.any():
-                                gt_rel_valid = gt_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
-                                pred_rel_valid = pred_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
-                                lhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
-                                relative_errors.append(lhand_rel_error)
-                    
-                    # 计算右手交互帧的相对位置误差
-                    if gt_rhand_contact is not None:
-                        rhand_contact_mask = gt_rhand_contact.bool()  # [bs, seq]
-                        if rhand_contact_mask.any():
-                            # 在交互帧中计算物体相对于右手的位置
-                            gt_obj_rel_rhand = gt_obj_trans - gt_rhand_pos        # [bs, seq, 3]
-                            pred_obj_rel_rhand = pred_obj_trans - pred_rhand_pos  # [bs, seq, 3]
-                            
-                            # 只在真值交互帧计算误差
-                            valid_frames = rhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_rhand)  # [bs, seq, 3]
-                            if valid_frames.any():
-                                gt_rel_valid = gt_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
-                                pred_rel_valid = pred_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
-                                rhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
-                                relative_errors.append(rhand_rel_error)
-                    
-                    # 合并所有相对误差
-                    if relative_errors:
-                        all_relative_errors = torch.cat(relative_errors, dim=0)
-                        hoi_err = all_relative_errors.mean()
-                        return hoi_err.item() * 1000  # Convert to mm scale
-                    else:
-                        # 没有交互帧
-                        return float('nan')
-                elif evaluate_objects and has_object:
-                    print(f"Warning: Batch {batch_idx}: Missing {method_name} object translation for HOI error calculation.")
-                    return float('nan')
-                elif evaluate_objects and not has_object:
-                    return float('nan')
-                else:
-                    return float('nan')
-
-            # 计算融合方案的HOI误差
-            hoi_err_fusion = compute_hoi_error(pred_obj_trans_fusion, "fusion")
-            metrics['hoi_err_fusion'].append(hoi_err_fusion)
-
-            # 计算FK方案的HOI误差
-            hoi_err_fk = compute_hoi_error(pred_obj_trans_fk, "FK")
-            metrics['hoi_err_fk'].append(hoi_err_fk)
-
-            # 计算IMU方案的HOI误差
-            hoi_err_imu = compute_hoi_error(pred_obj_trans_imu, "IMU")
-            metrics['hoi_err_imu'].append(hoi_err_imu)
-
             # Contact Prediction Evaluation
             if pred_hand_contact_prob is not None:
                 # Convert probabilities to binary predictions (threshold = 0.5)
@@ -417,6 +349,98 @@ def evaluate_model(model, smpl_model, data_loader, device, evaluate_objects=True
                 metrics['contact_f1_rhand'].append(float('nan'))
                 metrics['contact_f1_obj'].append(float('nan'))
 
+            # Object-Hand/Root Relative Position Error：
+            # 在真值交互帧下计算手-物体相对位置误差；
+            # 在非交互帧下计算根-物体相对向量误差
+            def compute_hoi_error(pred_obj_trans, method_name):
+                """计算HOI误差的通用函数"""
+                if evaluate_objects and has_object and pred_obj_trans is not None:
+                    # 提取手腕关节位置 (SMPL joint indices: 20=left wrist, 21=right wrist)
+                    wrist_l_idx, wrist_r_idx = 20, 21
+                    root_idx = 0
+                    
+                    # 预测的手腕位置
+                    pred_lhand_pos = pred_joints_all[:, :, wrist_l_idx, :]  # [bs, seq, 3]
+                    pred_rhand_pos = pred_joints_all[:, :, wrist_r_idx, :]  # [bs, seq, 3]
+                    pred_root_pos_all = pred_joints_all[:, :, root_idx, :]
+                    
+                    # 真值的手腕位置
+                    gt_lhand_pos = gt_joints_all[:, :, wrist_l_idx, :]      # [bs, seq, 3]
+                    gt_rhand_pos = gt_joints_all[:, :, wrist_r_idx, :]      # [bs, seq, 3]
+                    gt_root_pos_all = gt_joints_all[:, :, root_idx, :]
+                    
+                    relative_errors = []
+                    
+                    # 计算左手交互帧的相对位置误差
+                    if gt_lhand_contact is not None:
+                        lhand_contact_mask = gt_lhand_contact.bool()  # [bs, seq]
+                        if lhand_contact_mask.any():
+                            # 在交互帧中计算物体相对于左手的位置
+                            gt_obj_rel_lhand = gt_obj_trans - gt_lhand_pos        # [bs, seq, 3]
+                            pred_obj_rel_lhand = pred_obj_trans - pred_lhand_pos  # [bs, seq, 3]
+                            
+                            # 只在真值交互帧计算误差
+                            valid_frames = lhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_lhand)  # [bs, seq, 3]
+                            if valid_frames.any():
+                                gt_rel_valid = gt_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                pred_rel_valid = pred_obj_rel_lhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                lhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
+                                relative_errors.append(lhand_rel_error)
+                    
+                    # 计算右手交互帧的相对位置误差
+                    if gt_rhand_contact is not None:
+                        rhand_contact_mask = gt_rhand_contact.bool()  # [bs, seq]
+                        if rhand_contact_mask.any():
+                            # 在交互帧中计算物体相对于右手的位置
+                            gt_obj_rel_rhand = gt_obj_trans - gt_rhand_pos        # [bs, seq, 3]
+                            pred_obj_rel_rhand = pred_obj_trans - pred_rhand_pos  # [bs, seq, 3]
+                            
+                            # 只在真值交互帧计算误差
+                            valid_frames = rhand_contact_mask.unsqueeze(-1).expand_as(gt_obj_rel_rhand)  # [bs, seq, 3]
+                            if valid_frames.any():
+                                gt_rel_valid = gt_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                pred_rel_valid = pred_obj_rel_rhand[valid_frames].view(-1, 3)  # 重塑为 [N, 3]
+                                rhand_rel_error = torch.linalg.norm(pred_rel_valid - gt_rel_valid, dim=-1)  # [N]
+                                relative_errors.append(rhand_rel_error)
+                    
+                    # 计算非交互帧的根-物体相对向量误差（当左右手都未接触）
+                    if gt_lhand_contact is not None and gt_rhand_contact is not None:
+                        non_interaction_mask = (~gt_lhand_contact.bool()) & (~gt_rhand_contact.bool())  # [bs, seq]
+                        if non_interaction_mask.any():
+                            gt_vec_root_obj = gt_obj_trans - gt_root_pos_all          # [bs, seq, 3]
+                            pred_vec_root_obj = pred_obj_trans - pred_root_pos_all    # [bs, seq, 3]
+                            valid_frames = non_interaction_mask.unsqueeze(-1).expand_as(gt_vec_root_obj)
+                            gt_vec_valid = gt_vec_root_obj[valid_frames].view(-1, 3)
+                            pred_vec_valid = pred_vec_root_obj[valid_frames].view(-1, 3)
+                            non_inter_err = torch.linalg.norm(pred_vec_valid - gt_vec_valid, dim=-1)  # [N]
+                            relative_errors.append(non_inter_err)
+                    # 合并所有相对误差
+                    if relative_errors:
+                        all_relative_errors = torch.cat(relative_errors, dim=0)
+                        hoi_err = all_relative_errors.mean()
+                        return hoi_err.item() * 1000  # Convert to mm scale
+                    else:
+                        # 没有交互帧
+                        return float('nan')
+                elif evaluate_objects and has_object:
+                    print(f"Warning: Batch {batch_idx}: Missing {method_name} object translation for HOI error calculation.")
+                    return float('nan')
+                elif evaluate_objects and not has_object:
+                    return float('nan')
+                else:
+                    return float('nan')
+
+            # 计算融合方案的HOI误差
+            hoi_err_fusion = compute_hoi_error(pred_obj_trans_fusion, "fusion")
+            metrics['hoi_err_fusion'].append(hoi_err_fusion)
+
+            # 计算FK方案的HOI误差
+            hoi_err_fk = compute_hoi_error(pred_obj_trans_fk, "FK")
+            metrics['hoi_err_fk'].append(hoi_err_fk)
+
+            # 计算IMU方案的HOI误差
+            hoi_err_imu = compute_hoi_error(pred_obj_trans_imu, "IMU")
+            metrics['hoi_err_imu'].append(hoi_err_imu)
 
             # Jitter (Mean acceleration magnitude of joints)
             if seq_len >= 3:
@@ -467,7 +491,6 @@ def main():
 
     # Override config values with command line arguments if provided
     if args.smpl_model_path: config.bm_path = args.smpl_model_path
-    if args.test_data_dir: config.test.data_path = args.test_data_dir
     if args.batch_size: config.test.batch_size = args.batch_size
     if args.num_workers: config.num_workers = args.num_workers
 
@@ -481,10 +504,18 @@ def main():
     smpl_model = load_smpl_model(smpl_model_path, device)
     model = load_model(config, device)
 
-    test_data_dir = config.datasets.omomo.get('test_path', None)
-    if test_data_dir is None or not os.path.exists(test_data_dir):
+    test_data_dir = None
+    try:
+        if 'datasets' in config and 'omomo' in config.datasets and 'test_path' in config.datasets.omomo:
+            test_data_dir = config.datasets.omomo.test_path
+    except Exception:
+        pass
+    if args.test_data_dir:
+        test_data_dir = args.test_data_dir
+    if test_data_dir is None and hasattr(config, 'test') and 'data_path' in config.test:
+        test_data_dir = config.test.data_path
+    if not test_data_dir or not os.path.exists(test_data_dir):
         print(f"Error: Test dataset path not found or invalid: {test_data_dir}")
-        print("Please provide the correct path in the config (test.data_path) or via --test_data_dir.")
         return
     print(f"Loading test dataset from: {test_data_dir}")
 
@@ -494,16 +525,19 @@ def main():
             data_dir=test_data_dir,
             window_size=test_window_size,
             normalize=config.test.get('normalize', True),
-            debug=config.get('debug', False)
+            debug=config.get('debug', False),
+            full_sequence=True
         )
 
     if len(test_dataset) == 0:
          print("Error: Test dataset is empty. Check data path and dataset parameters.")
          return
 
+    # 变长整段模式下，禁止批量堆叠，强制 batch_size=1
+    eval_batch_size = 1 if getattr(test_dataset, 'full_sequence', False) else config.test.get('batch_size', 32)
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config.test.get('batch_size', 32),
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=config.get('num_workers', 4),
         pin_memory=True,
@@ -511,7 +545,7 @@ def main():
     )
 
     print(f"\nDataset size: {len(test_dataset)}, Loader size: {len(test_loader)}")
-    print(f"Batch size: {config.test.get('batch_size', 32)}, Num workers: {config.get('num_workers', 4)}")
+    print(f"Batch size: {eval_batch_size}, Num workers: {config.get('num_workers', 4)}")
     print(f"Evaluating objects: {not args.no_eval_objects}")
 
     print("\nStarting model evaluation...")

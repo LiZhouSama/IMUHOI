@@ -59,11 +59,11 @@ staged_training:
   # 模块化训练配置
   modular_training:
     enabled: True  # 是否启用模块化训练
-    start_from_stage: "joint_training"  # 从哪个阶段开始训练，可选: "velocity_contact", "human_pose", "object_trans", "joint_training"
+    start_from_stage: "human_pose"  # 从哪个阶段开始训练，可选: "velocity_contact", "human_pose", "object_trans_hoi", "object_trans", "joint_training"
     pretrained_modules:  # 预训练模块路径
       velocity_contact: "outputs/TransPose/transpose_08200259/modules/velocity_contact_best.pt"
-      human_pose: "outputs/TransPose/transpose_09051657/modules/human_pose_best.pt"
-      object_trans: "outputs/TransPose/transpose_09051657/modules/object_trans_best.pt"
+      human_pose: "outputs/TransPose/transpose_09241736/modules/human_pose_best.pt"
+      object_trans: "outputs/TransPose/transpose_09241736/modules/object_trans_best.pt"
   
   # 正常训练阶段配置（每个阶段都有独立的超参数）
   stages:
@@ -103,24 +103,6 @@ staged_training:
       milestones: [80, 120, 160, 200, 240, 280]
       gamma: 0.2
 
-  # stages:
-  # - name: "velocity_contact"
-  #   epochs: [0, 10]  # epoch范围：0-49 (共50个epoch)
-  #   modules: ["velocity_contact"]  # 激活的模块
-  #   datasets: ["omomo"]  # 使用的数据集类型：amass、omomo、mixed
-  # - name: "human_pose_omomo"  
-  #   epochs: [11, 20]  # epoch范围：150-199 (共50个epoch) - 再用OMOMO微调
-  #   modules: ["human_pose"]  # 激活的模块
-  #   datasets: ["omomo"]  # 只使用OMOMO数据集
-  # - name: "object_trans"
-  #   epochs: [21, 30]  # epoch范围：200-249 (共50个epoch)
-  #   modules: ["object_trans"]  # 激活的模块
-  #   datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-  # - name: "joint_training"
-  #   epochs: [31, 40]  # epoch范围：250-399 (共150个epoch)
-  #   modules: ["human_pose", "object_trans"]  # 激活的模块
-  #   datasets: ["omomo"]  # 只使用OMOMO数据集（有物体）
-
   debug_stages:
   - name: "velocity_contact"
     epochs: 11  # 阶段时长（epoch 数）
@@ -158,38 +140,12 @@ datasets:
     test_path: "processed_hoi_data_0803/test"
     debug_path: "processed_hoi_data_0803/debug"
 
-# # 损失权重配置
-# loss_weights:
-#   rot: 10  # 姿态损失权重
-#   root_pos: 10  # 根节点位置损失权重
-#   obj_trans: 5  # 物体位置损失权重
-#   obj_relative_trans: 10  # 物体相对位置损失权重
-#   obj_rot: 1.0  # 物体旋转损失权重
-#   leaf_pos: 1.0  # 叶子节点位置损失权重
-#   full_pos: 1.0  # 全身关节位置损失权重
-#   root_vel: 10  # 根关节速度损失权重
-#   tran_b2: 0.001  # 根关节速度损失权重
-#   hand_contact: 1  # 手部接触损失权重
-#   contact_aware: 1.0  # 接触感知损失权重
-#   obj_vel: 1  # 物体速度损失权重
-#   leaf_vel: 10  # 叶子节点速度损失权重
-#   foot_contact: 1  # 足部接触损失权重
-#   lhand_obj_direction: 6  # 左手物体方向向量损失权重
-#   rhand_obj_direction: 6  # 右手物体方向向量损失权重
-#   obj_trans_from_fk: 8  # 根据姿态计算的物体位置损失权重
-#   obj_trans_fused: 10   # 融合后的主位置监督
-#   obj_fk_pos: 4         # FK分支位置监督
-#   obj_vel_cons: 4       # 速度一致性
-#   obj_acc_smooth: 0.1   # 加速度平滑
-#   lhand_lb: 2           # 左手骨长监督
-#   rhand_lb: 2           # 右手骨长监督
-
 loss_weights: 
   {
     'obj_vel': 1, 'leaf_vel': 1, 'hand_contact': 1,
-    'rot': 10, 'root_pos': 10, 'leaf_pos': 10, 'full_pos': 10, 'root_vel': 10, 'foot_contact': 1,
-    'obj_trans_from_fk': 2, 'obj_trans_fused': 10, 'lhand_obj_direction': 1, 'rhand_obj_direction': 1,
-    'obj_vel_cons': 1, 'obj_acc_cons': 4, 'lhand_lb': 0.2, 'rhand_lb': 0.2,
+    'rot': 10, 'leaf_pos': 10, 'full_pos': 10,
+    'lhand_obj_direction': 0.1, 'rhand_obj_direction': 0.1, 'lhand_lb': 0.1, 'rhand_lb': 0.1,
+    'obj_trans_fused': 1, 'hoi_error_r': 0.2, 'hoi_error_l': 0.2, 'obj_vel_cons': 1, 'obj_acc_cons': 0.01
   }
 
 # 训练窗口配置
@@ -208,20 +164,3 @@ test:
   normalize: True  # 是否归一化数据
   data_path: 
     "processed_data_0701/test"  # 测试数据路径1（传统模式使用）
-
-# 数据增强配置
-augmentation:
-  use_augmentation: True  # 是否使用数据增强
-  rotation_augmentation: True  # 是否使用旋转增强
-  noise_augmentation: True  # 是否使用噪声增强
-  noise_std: 0.01  # 噪声标准差 
-
-# 噪声参数配置
-noise_params:
-  init_rotation_noise_std: 0.1  # 初始旋转矩阵噪声标准差
-  bone_length_noise_std: 0.05   # 骨长噪声标准差 
-
-# 物体模块额外参数
-obj_trans_noise_std: 0.02
-gating_prior_beta: 2.0
-gating_temperature: 1.0
