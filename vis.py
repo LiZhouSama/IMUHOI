@@ -18,6 +18,7 @@ from easydict import EasyDict as edict
 
 from torch.utils.data import DataLoader
 from dataloader.dataloader import IMUDataset # 从 eval.py 引入
+from preprocess import apply_transformation_to_obj_geometry
 
 # 导入模型相关 - 根据需要选择正确的模型加载方式
 # from models.DiT_model import MotionDiffusion # 如果要用 DiT
@@ -28,13 +29,13 @@ from aitviewer.renderables.spheres import Spheres
 
 
 # --- 定义 Z-up 到 Y-up 的旋转矩阵 ---
-R_yup = torch.tensor([[1.0, 0.0, 0.0],
-                      [0.0, 0.0, 1.0],
-                      [0.0, -1.0, 0.0]], dtype=torch.float32)
-
 # R_yup = torch.tensor([[1.0, 0.0, 0.0],
-#                       [0.0, 1.0, 0.0],
-#                       [0.0, 0.0, 1.0]], dtype=torch.float32)
+#                       [0.0, 0.0, 1.0],
+#                       [0.0, -1.0, 0.0]], dtype=torch.float32)
+
+R_yup = torch.tensor([[1.0, 0.0, 0.0],
+                      [0.0, 1.0, 0.0],
+                      [0.0, 0.0, 1.0]], dtype=torch.float32)
 
 # === 辅助函数 (来自 eval.py 和 vis.py) ===
 
@@ -58,85 +59,7 @@ def load_smpl_model(smpl_model_path, device):
     ).to(device)
     return smpl_model
 
-def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu'):
-    """
-    应用变换到物体网格 (遵循 hand_foot_dataset.py 的逻辑: Rotate -> Scale -> Translate)
-
-    参数:
-        obj_mesh_path: 物体网格路径
-        obj_rot: 旋转矩阵 [T, 3, 3] (torch tensor on device)
-        obj_trans: 平移向量 [T, 3] (torch tensor on device)
-        scale: 缩放因子 [T] (torch tensor on device)
-
-    返回:
-        transformed_obj_verts: 变换后的顶点 [T, Nv, 3] (torch tensor on device)
-        obj_mesh_faces: 物体网格的面 [Nf, 3] (numpy array)
-    """
-    try:
-        mesh = trimesh.load_mesh(obj_mesh_path)
-        obj_mesh_verts_np = np.asarray(mesh.vertices) # Nv X 3
-        obj_mesh_faces = np.asarray(mesh.faces) # Nf X 3
-
-        # 确保输入在正确的设备上且为 float 类型
-        obj_mesh_verts = torch.from_numpy(obj_mesh_verts_np).float().to(device) # Nv X 3
-        seq_rot_mat = obj_rot.float().to(device) # T X 3 X 3
-        seq_trans = obj_trans.float().to(device) # T X 3
-        if scale is not None:
-            seq_scale = scale.float().to(device) # T
-        else:
-            seq_scale = None
-
-        T = seq_trans.shape[0]
-        ori_obj_verts = obj_mesh_verts[None].repeat(T, 1, 1) # T X Nv X 3
-
-        # --- 遵循参考代码的顺序：Rotate -> Scale -> Translate ---
-        
-        # 1. 旋转 (Rotate)
-        verts_rotated = torch.bmm(seq_rot_mat, ori_obj_verts.transpose(1, 2)) # T X 3 X Nv
-
-        # 2. 缩放 (Scale)
-        if seq_scale is not None:
-            scale_factor = seq_scale.unsqueeze(-1).unsqueeze(-1) # T X 1 X 1
-            verts_scaled = scale_factor * verts_rotated
-        else:
-            verts_scaled = verts_rotated # No scaling
-        # Result shape: T X 3 X Nv
-
-        # 3. 平移 (Translate)
-        trans_vector = seq_trans.unsqueeze(-1) # T X 3 X 1
-        verts_translated = verts_scaled + trans_vector # T X 3 X Nv
-
-        # 4. Transpose back to T X Nv X 3
-        transformed_obj_verts = verts_translated.transpose(1, 2)
-
-    except Exception as e:
-        print(f"应用变换到物体几何体失败 for {obj_mesh_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        # Return dummy data on the correct device
-        transformed_obj_verts = torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device)
-        obj_mesh_faces = np.zeros((1, 3), dtype=np.int64)
-
-    return transformed_obj_verts, obj_mesh_faces
-
-def merge_two_parts(verts_list, faces_list, device='cpu'):
-    """ 合并两个网格部分 """
-    verts_num = 0
-    merged_verts_list = []
-    merged_faces_list = []
-    for p_idx in range(len(verts_list)):
-        part_verts = verts_list[p_idx].to(device) # T X Nv X 3
-        part_faces = torch.from_numpy(faces_list[p_idx]).long().to(device) # Nf X 3
-
-        merged_verts_list.append(part_verts)
-        merged_faces_list.append(part_faces + verts_num)
-        verts_num += part_verts.shape[1]
-
-    merged_verts = torch.cat(merged_verts_list, dim=1)
-    merged_faces = torch.cat(merged_faces_list, dim=0).cpu().numpy()
-    return merged_verts, merged_faces
-
-def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_bottom_trans=None, obj_bottom_rot=None, obj_geo_root='./dataset/captured_objects', device='cpu'):
+def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_geo_root='./dataset/captured_objects', device='cpu'):
     """ 加载物体几何体并应用变换 (OMOMO 方式) """
     if obj_name is None:
         print("Warning: Object name is None, cannot load geometry.")
@@ -147,34 +70,14 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_botto
     obj_trans = torch.as_tensor(obj_trans, dtype=torch.float32, device=device)
     if obj_scale is not None:
         obj_scale = torch.as_tensor(obj_scale, dtype=torch.float32, device=device)
-    if obj_bottom_rot is not None:
-        obj_bottom_rot = torch.as_tensor(obj_bottom_rot, dtype=torch.float32, device=device)
-    if obj_bottom_trans is not None:
-        obj_bottom_trans = torch.as_tensor(obj_bottom_trans, dtype=torch.float32, device=device)
 
 
     obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj")
-    two_parts = obj_name in ["vacuum", "mop"] and obj_bottom_trans is not None and obj_bottom_rot is not None
 
-    if two_parts:
-        top_obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified_top.obj")
-        bottom_obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified_bottom.obj")
-
-        if not os.path.exists(top_obj_mesh_path) or not os.path.exists(bottom_obj_mesh_path):
-             print(f"Warning: Cannot find two-part geometry files for object {obj_name}. Will try to load the complete file.")
-             two_parts = False
-             obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj") # Fallback
-        else:
-            top_obj_mesh_verts, top_obj_mesh_faces = apply_transformation_to_obj_geometry(top_obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
-            # Assume bottom uses the same scale, pass bottom transforms
-            bottom_obj_mesh_verts, bottom_obj_mesh_faces = apply_transformation_to_obj_geometry(bottom_obj_mesh_path, obj_bottom_rot, obj_bottom_trans, scale=obj_scale, device=device)
-            obj_mesh_verts, obj_mesh_faces = merge_two_parts([top_obj_mesh_verts, bottom_obj_mesh_verts], [top_obj_mesh_faces, bottom_obj_mesh_faces], device=device)
-
-    if not two_parts:
-        if not os.path.exists(obj_mesh_path):
-             print(f"Warning: Cannot find object geometry file: {obj_mesh_path}")
-             return torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
-        obj_mesh_verts, obj_mesh_faces = apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
+    if not os.path.exists(obj_mesh_path):
+            print(f"Warning: Cannot find object geometry file: {obj_mesh_path}")
+            return torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device), np.zeros((1, 3), dtype=np.int64)
+    obj_mesh_verts, obj_mesh_faces = apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device)
 
     return obj_mesh_verts, obj_mesh_faces
 
@@ -259,20 +162,18 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
     with torch.no_grad():
         bs = 0
         # --- 1. 准备数据 ---
-        gt_root_pos = batch["root_pos"].to(device)         # [bs, T, 3]
+        gt_trans = batch["trans"].to(device)         # [bs, T, 3]
         gt_motion = batch["motion"].to(device)           # [bs, T, 132]
         human_imu = batch["human_imu"].to(device)        # [bs, T, num_imus, 9/12]
         # head_global_rot_start = batch["head_global_trans_start"][..., :3, :3].to(device)  # [bs, 1, 3, 3]
         # head_global_pos_start = batch["head_global_trans_start"][..., :3, 3].to(device)  # [bs, 1, 3]
-        root_global_pos_start = batch["root_pos_start"].to(device)  # [bs, 3]
+        trans_start = batch["trans_start"].to(device)  # [bs, 3]
         root_global_rot_start = batch["root_rot_start"].to(device)  # [bs, 3, 3]
         obj_imu = batch.get("obj_imu", None)             # [bs, T, 1, 9/12] or None
         gt_obj_trans = batch.get("obj_trans", None)      # [bs, T, 3] or None
         gt_obj_rot_6d = batch.get("obj_rot", None)       # [bs, T, 6] or None
         obj_name = batch.get("obj_name", [None])[0]      # 物体名称 (取列表第一个)
         gt_obj_scale = batch.get("obj_scale", None)      # [bs, T] or [bs, T, 1]? Check dataloader
-        gt_obj_bottom_trans = batch.get("obj_bottom_trans", None) # [bs, T, 3] or None
-        gt_obj_bottom_rot = batch.get("obj_bottom_rot", None)     # [bs, T, 3, 3] or None
 
         # 获取用于可视化的接触标志 (由dataloader预处理)
         lhand_contact_viz_seq = batch.get("lhand_contact") [bs].to(device)
@@ -283,17 +184,13 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         if gt_obj_trans is not None: gt_obj_trans = gt_obj_trans.to(device)
         if gt_obj_rot_6d is not None: gt_obj_rot_6d = gt_obj_rot_6d.to(device)
         if gt_obj_scale is not None: gt_obj_scale = gt_obj_scale.to(device)
-        if gt_obj_bottom_trans is not None: gt_obj_bottom_trans = gt_obj_bottom_trans.to(device)
-        if gt_obj_bottom_rot is not None: gt_obj_bottom_rot = gt_obj_bottom_rot.to(device)
-
         # 仅处理批次中的第一个序列 (bs=0)
         T = gt_motion.shape[1]
-        gt_root_pos_seq = gt_root_pos[bs]           # [T, 3]
+        gt_trans_seq = gt_trans[bs]           # [T, 3]
         gt_motion_seq = gt_motion[bs]             # [T, 132]
         # head_global_rot_start = head_global_rot_start[bs]  # [1, 3, 3]
         # head_global_pos_start = head_global_pos_start[bs]  # [1, 3]
         root_global_rot_start = root_global_rot_start[bs]  # [3, 3]
-        root_global_pos_start = root_global_pos_start[bs]  # [3]
 
         # --- 2. 获取真值 SMPL ---
         gt_rot_matrices = transforms.rotation_6d_to_matrix(gt_motion_seq.reshape(T, 22, 6)) # [T, 22, 3, 3]
@@ -301,7 +198,6 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         gt_pose_body_mat = gt_rot_matrices[:, 1:].reshape(T * 21, 3, 3)    # [T*21, 3, 3]
         # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat_norm) # [T, 3]
         gt_pose_body_axis = transforms.matrix_to_axis_angle(gt_pose_body_mat).reshape(T, -1) # [T, 63]
-
         # Denormalization
         # gt_root_orient_mat = head_global_rot_start @ gt_root_orient_mat_norm
         # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(T, 3)
@@ -309,14 +205,19 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
         gt_root_orient_mat = root_global_rot_start @ gt_root_orient_mat_norm
         gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat).reshape(T, 3)
-        gt_root_pos_seq = (root_global_rot_start @ gt_root_pos_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+        gt_trans_seq = (root_global_rot_start @ gt_trans_seq.unsqueeze(-1)).squeeze(-1) + trans_start
         # gt_root_orient_axis = transforms.matrix_to_axis_angle(gt_root_orient_mat_norm)
 
         gt_smplh_input = {
             'root_orient': gt_root_orient_axis,
             'pose_body': gt_pose_body_axis,
-            'trans': gt_root_pos_seq
+            'trans': gt_trans_seq
         }
+        # gt_smplh_input = {
+        #     'root_orient': gt_root_orient_axis,
+        #     'pose_body': torch.zeros_like(gt_pose_body_axis),
+        #     'trans': torch.zeros_like(gt_trans_seq)
+        # }
         body_pose_gt = smpl_model(**gt_smplh_input)
         verts_gt_seq = body_pose_gt.v                          # [T, Nv, 3]
         faces_gt_np = smpl_model.f.cpu().numpy() if isinstance(smpl_model.f, torch.Tensor) else smpl_model.f
@@ -325,7 +226,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_motion_seq = None
         pred_obj_rot_6d_seq = None
         pred_obj_trans_seq = None # 现在模型会预测物体平移
-        pred_root_pos_seq = None
+        pred_trans_seq = None
         pred_lhand_contact_labels_seq = None
         pred_rhand_contact_labels_seq = None
         pred_obj_contact_labels_seq = None
@@ -338,7 +239,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             model_input = {
                     "human_imu": human_imu,
                     "motion": gt_motion,             # 新增
-                    "root_pos": gt_root_pos,           # 新增
+                    "root_pos": gt_trans,           # 新增
                 }
             
             has_object_data_for_model = obj_imu is not None
@@ -359,17 +260,17 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     model_input["gt_hands_pos"] = gt_hands_pos
                 except Exception:
                     # 如果提取失败，创建零值
-                    model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_root_pos.dtype)
+                    model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_trans.dtype)
             else:
                 # 如果没有position_global_norm，创建零值
-                model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_root_pos.dtype)
+                model_input["gt_hands_pos"] = torch.zeros((1, T, 2, 3), device=device, dtype=gt_trans.dtype)
 
             try:
                 pred_dict = model(model_input)
                 pred_motion = pred_dict.get("motion") # [bs, T, 132]
                 pred_obj_rot = pred_dict.get("obj_rot") # [bs, T, 6] (TransPose 输出 6D)
                 pred_obj_trans = pred_dict.get("pred_obj_trans") # 默认使用融合后的物体位置
-                pred_root_pos = pred_dict.get("root_pos") # [bs, T, 3]
+                pred_trans = pred_dict.get("root_pos") # [bs, T, 3]
                 pred_obj_vel_batch = pred_dict.get("pred_obj_vel", None)  # [bs, T, 3]
 
                 # --- Get predicted contact probabilities ---
@@ -403,10 +304,10 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 else:
                     print("Warning: Model did not output 'motion'")
 
-                if pred_root_pos is not None:
-                    pred_root_pos_seq = pred_root_pos[bs] # [T, 3]
+                if pred_trans is not None:
+                    pred_trans_seq = pred_trans[bs] # [T, 3]
                 else:
-                    print("Warning: Model did not output 'root_pos'")
+                    print("Warning: Model did not output 'trans'")
 
                 if pred_obj_rot is not None:
                     pred_obj_rot_6d_seq = pred_obj_rot[bs] # [T, 6]
@@ -444,13 +345,13 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
             pred_root_orient_mat = root_global_rot_start @ pred_root_orient_mat_norm
             pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat).reshape(T, 3)
-            pred_root_pos_seq = (root_global_rot_start @ pred_root_pos_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+            pred_trans_seq = (root_global_rot_start @ pred_trans_seq.unsqueeze(-1)).squeeze(-1) + trans_start
             # pred_root_orient_axis = transforms.matrix_to_axis_angle(pred_root_orient_mat_norm)
 
             pred_smplh_input = {
                 'root_orient': pred_root_orient_axis,
                 'pose_body': pred_pose_body_axis,
-                'trans': pred_root_pos_seq
+                'trans': pred_trans_seq
             }
             body_pose_pred = smpl_model(**pred_smplh_input)
             verts_pred_seq = body_pose_pred.v # [T, Nv, 3]
@@ -466,21 +367,18 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             gt_obj_rot_6d_seq = gt_obj_rot_6d[bs]   # [T, 6]
             gt_obj_rot_mat_seq = transforms.rotation_6d_to_matrix(gt_obj_rot_6d_seq) # [T, 3, 3]
             gt_obj_scale_seq = gt_obj_scale[bs] if gt_obj_scale is not None else None # [T] or [T, 1]?
-            # Handle bottom parts if they exist
-            gt_obj_bottom_trans_seq = gt_obj_bottom_trans[bs] if gt_obj_bottom_trans is not None else None
-            gt_obj_bottom_rot_seq = gt_obj_bottom_rot[bs] if gt_obj_bottom_rot is not None else None
 
             # Denormalization
             # gt_obj_rot_mat_seq = head_global_rot_start @ gt_obj_rot_mat_seq
             # gt_obj_trans_seq = (head_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + head_global_pos_start
             
             gt_obj_rot_mat_seq = root_global_rot_start @ gt_obj_rot_mat_seq
-            gt_obj_trans_seq = (root_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+            gt_obj_trans_seq = (root_global_rot_start @ gt_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + trans_start
             # gt_obj_rot_mat_seq = gt_obj_rot_mat_seq
 
             # 获取真值物体
             gt_obj_verts_seq, obj_faces_np = load_object_geometry(
-                obj_name, gt_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq, device=device
+                obj_name, gt_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq, obj_geo_root=obj_geo_root, device=device
             )
 
             # 在渲染预测物体之前，若开启 use_fk，则优先用按需FK覆盖 pred_obj_trans_seq
@@ -510,7 +408,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             if not vis_gt_only:
                 if pred_obj_trans_seq is not None:
                     # 对预测的物体平移进行反归一化
-                    pred_obj_trans_seq_denorm = (root_global_rot_start @ pred_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+                    pred_obj_trans_seq_denorm = (root_global_rot_start @ pred_obj_trans_seq.unsqueeze(-1)).squeeze(-1) + trans_start
                     
                     # 使用真值旋转 + 预测平移
                     pred_obj_verts_seq, _ = load_object_geometry(
@@ -518,6 +416,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         gt_obj_rot_mat_seq, # 使用真值旋转
                         pred_obj_trans_seq_denorm, # 使用预测平移
                         gt_obj_scale_seq, 
+                        obj_geo_root=obj_geo_root,
                         device=device
                     )
                 else:
@@ -528,6 +427,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         gt_obj_rot_mat_seq, # 使用真值旋转
                         gt_obj_trans_seq,   # 使用真值平移
                         gt_obj_scale_seq, 
+                        obj_geo_root=obj_geo_root,
                         device=device
                     )
 
@@ -540,13 +440,14 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         init_pos = gt_obj_trans[bs, 0, :]  # [3]
                         pred_obj_trans_imu_seq = disp_imu + init_pos.unsqueeze(0)  # [T, 3]
                         # 去规范化到世界系（与其他路径一致）
-                        pred_obj_trans_imu_denorm = (root_global_rot_start @ pred_obj_trans_imu_seq.unsqueeze(-1)).squeeze(-1) + root_global_pos_start
+                        pred_obj_trans_imu_denorm = (root_global_rot_start @ pred_obj_trans_imu_seq.unsqueeze(-1)).squeeze(-1) + trans_start
                         # 构建蓝色mesh（同真值旋转）
                         pred_obj_verts_seq_imu, _ = load_object_geometry(
                             obj_name,
                             gt_obj_rot_mat_seq,
                             pred_obj_trans_imu_denorm,
                             gt_obj_scale_seq,
+                            obj_geo_root=obj_geo_root,
                             device=device
                         )
                     except Exception as _e:
@@ -1323,7 +1224,7 @@ def main():
     parser.add_argument('--model_path', type=str, default=None, help='Path to the trained TransPose model checkpoint. Overrides config if provided.')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to the SMPLH model file. Overrides config if provided.')
     parser.add_argument('--test_data_dir', type=str, default=None, help='Path to the test dataset directory. Overrides config if provided.')
-    parser.add_argument('--obj_geo_root', type=str, default='./dataset/captured_objects', help='Path to the object geometry root directory.')
+    parser.add_argument('--obj_geo_root', type=str, default='./datasets/OMOMO/captured_objects', help='Path to the object geometry root directory.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for DataLoader (should be 1 for sequential vis).')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers.')
     parser.add_argument('--no_objects', action='store_true', help='Do not load or visualize objects.')

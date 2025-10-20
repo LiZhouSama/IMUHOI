@@ -373,13 +373,13 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
     
     # 从batch中获取真值数据
     bs, seq = batch["human_imu"].shape[:2]
-    root_pos = batch["root_pos"].to(device)
+    trans = batch["trans"].to(device)
     motion = batch["motion"].to(device)
     root_vel = batch["root_vel"].to(device)
     
     # 获取速度真值
-    obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device)
-    leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device)
+    obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=trans.dtype)).to(device)
+    leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=trans.dtype)).to(device)
     
     # 获取接触真值
     lhand_contact_gt = batch.get("lhand_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device)
@@ -392,7 +392,7 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
     foot_contact_gt = torch.stack([lfoot_contact_gt, rfoot_contact_gt], dim=2)
     
     # 处理物体数据
-    obj_trans = batch.get("obj_trans", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device)
+    obj_trans = batch.get("obj_trans", torch.zeros((bs, seq, 3), device=device, dtype=trans.dtype)).to(device)
     
     # 初始化损失字典
     loss_dict = {}
@@ -421,7 +421,7 @@ def compute_stage_specific_loss(pred_dict, batch, stage_info, cfg, training_step
             gt_pose_6d_flat = motion.reshape(-1, actual_model.num_joints * actual_model.joint_dim)
             gt_pose_mat_flat = rotation_6d_to_matrix(gt_pose_6d_flat.reshape(-1, actual_model.num_joints, 6))
             gt_pose_axis_angle_flat = matrix_to_axis_angle(gt_pose_mat_flat).reshape(bs * seq, -1)
-            gt_trans_flat = root_pos.reshape(bs*seq, 3)
+            gt_trans_flat = trans.reshape(bs*seq, 3)
             
             # 访问human_pose_module中的body_model
             body_model_output_gt = actual_model.human_pose_module.body_model(
@@ -652,11 +652,11 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
     active_modules = set(stage_info['active_modules'])
     use_object_data = stage_info.get('use_object_data', False)
     bs, seq = batch["human_imu"].shape[:2]
-    root_pos = batch["root_pos"].to(device)
+    trans = batch["trans"].to(device)
     motion = batch["motion"].to(device)
     # 获取速度真值
-    obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device)
-    leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=root_pos.dtype)).to(device)
+    obj_vel = batch.get("obj_vel", torch.zeros((bs, seq, 3), device=device, dtype=trans.dtype)).to(device)
+    leaf_vel = batch.get("leaf_vel", torch.zeros((bs, seq, joint_set.n_leaf, 3), device=device, dtype=trans.dtype)).to(device)
     
     # 获取接触真值
     lhand_contact_gt = batch.get("lhand_contact", torch.zeros((bs, seq), dtype=torch.bool, device=device)).bool().to(device)
@@ -670,7 +670,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
         weights[key] = getattr(cfg.loss_weights, key)
     
     # 处理物体数据
-    obj_trans = batch.get("obj_trans", torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)).to(device)
+    obj_trans = batch.get("obj_trans", torch.zeros((bs, seq, 3), device=device, dtype=trans.dtype)).to(device)
     
     loss_components = {}
     
@@ -691,7 +691,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['hand_contact'] = torch.tensor(0.0, device=device)
         
     elif active_modules == {'human_pose'}:
-        # human_pose阶段：只看rot和root_pos
+        # human_pose阶段：只看rot
         if "motion" in pred_dict:
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         else:
@@ -754,7 +754,7 @@ def compute_stage_specific_test_loss(pred_dict, batch, stage_info, cfg, device):
             loss_components['hoi_error_r'] = torch.tensor(0.0, device=device)
         
     elif active_modules == {'human_pose', 'object_trans'}:
-        # joint_training阶段：看rot、root_pos和融合的物体位置
+        # joint_training阶段：看rot和融合的物体位置
         if "motion" in pred_dict:
             loss_components['rot'] = torch.nn.functional.mse_loss(pred_dict["motion"], motion)
         else:
@@ -931,7 +931,7 @@ def rebuild_dataloaders_if_needed(cfg, new_stage_info, train_loader, test_loader
 
 def build_model_input_dict(batch, current_stage_info, cfg, device, add_noise: bool = True):
     """构造模型前向所需 data_dict，统一处理可选项与噪声"""
-    root_pos = batch["root_pos"].to(device)
+    trans = batch["trans"].to(device)
     motion = batch["motion"].to(device)
     human_imu = batch["human_imu"].to(device)
     obj_imu = batch.get("obj_imu", None)
@@ -959,7 +959,7 @@ def build_model_input_dict(batch, current_stage_info, cfg, device, add_noise: bo
     if obj_trans is not None:
         obj_trans = obj_trans.to(device)
     else:
-        obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=root_pos.dtype)
+        obj_trans = torch.zeros((bs, seq, 3), device=device, dtype=trans.dtype)
 
     # 构造GT手部位置（用于HOI场景）
     gt_hands_pos = None
@@ -982,7 +982,7 @@ def build_model_input_dict(batch, current_stage_info, cfg, device, add_noise: bo
         "human_imu": human_imu,
         "obj_imu": obj_imu,
         "motion": motion,
-        "root_pos": root_pos,
+        "trans": trans,
         "obj_rot": obj_rot,
         "obj_trans": obj_trans,
         "use_object_data": current_stage_info['use_object_data'],

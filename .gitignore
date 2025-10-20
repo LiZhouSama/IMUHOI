@@ -106,7 +106,13 @@ dmypy.json
 *.iml
 
 # 项目特定忽略
-Ref Codes/
+Ref Codes/behave-dataset
+Ref Codes/export
+Ref Codes/MobilePoser
+Ref Codes/omomo
+Ref Codes/omomo_origin_code
+Ref Codes/SAGE
+Ref Codes/trash
 checkpoints/
 logs/
 *.pt
@@ -117,6 +123,7 @@ evaluation_results/
 wandb/
 
 # 特大文件
+*.temp
 *.p
 *.pkl
 *.ckpt

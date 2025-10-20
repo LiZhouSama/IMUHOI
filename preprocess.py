@@ -71,22 +71,22 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
             return lhand_contact, rhand_contact, obj_contact
         
         # 2. 加载物体网格进行距离筛选
-        obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}.obj")
+        obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}_cleaned_simplified.obj")
         if not os.path.exists(obj_mesh_path):
-            obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}_cleaned_simplified.obj")
+            obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}_simplified_transformed.obj")
+        if not os.path.exists(obj_mesh_path):
+            ply_candidates = sorted(glob.glob(os.path.join(obj_mesh_dir, "*.ply")))
+            if ply_candidates:
+                obj_mesh_path = ply_candidates[0]
+        if not os.path.exists(obj_mesh_path):
+            obj_mesh_path = os.path.join(obj_mesh_dir, f"{object_name}.obj")
         
         if not os.path.exists(obj_mesh_path):
             print(f"警告: 未找到物体网格文件: {obj_mesh_path}")
             return lhand_contact, rhand_contact, obj_contact
         
-        # 加载和变换物体网格
-        mesh = trimesh.load_mesh(obj_mesh_path)
-        obj_mesh_verts = torch.tensor(mesh.vertices, device=device).float()
-        if obj_mesh_verts.dim() > 2:
-            obj_mesh_verts = obj_mesh_verts.reshape(-1, 3)
-        
-        transformed_verts = apply_transformation_to_obj_geometry(
-            obj_mesh_verts, obj_rot, obj_trans, scale=obj_scale, device=device
+        transformed_verts, _ = apply_transformation_to_obj_geometry(
+            obj_mesh_path, obj_rot, obj_trans, scale=obj_scale, device=device
         )  # [T, N_v, 3]
         
         # 提取手部关节位置
@@ -312,12 +312,12 @@ def compute_object_geo_bps(obj_verts, basis_points, device):
     
     return bps_features
 
-def apply_transformation_to_obj_geometry(obj_mesh_verts, obj_rot, obj_trans, scale=None, device='cpu'):
+def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu'):
     """
     应用变换到物体顶点 (遵循 hand_foot_dataset.py 的逻辑: Rotate -> Scale -> Translate)
 
     参数:
-        obj_mesh_verts: 物体顶点 [Nv, 3] (torch tensor on device)
+        obj_mesh_path: 物体网格路径
         obj_rot: 旋转矩阵 [T, 3, 3] (torch tensor on device)
         obj_trans: 平移向量 [T, 3] (torch tensor on device)
         scale: 缩放因子 [T] (torch tensor on device)
@@ -327,8 +327,13 @@ def apply_transformation_to_obj_geometry(obj_mesh_verts, obj_rot, obj_trans, sca
         transformed_obj_verts: 变换后的顶点 [T, Nv, 3] (torch tensor on device)
     """
     try:
-        # 确保输入在正确的设备上且为 float 类型
-        obj_mesh_verts = obj_mesh_verts.float().to(device) # Nv X 3
+        mesh = trimesh.load_mesh(obj_mesh_path)
+        obj_mesh_verts_np = np.asarray(mesh.vertices) # Nv X 3
+        centroid = obj_mesh_verts_np.mean(axis=0)
+        obj_mesh_verts_np = obj_mesh_verts_np - centroid  # 适配BEHAVE TODO:不确定对其他数据集是否有效
+        obj_mesh_faces = np.asarray(mesh.faces) # Nf X 3
+
+        obj_mesh_verts = torch.from_numpy(obj_mesh_verts_np).float().to(device) # Nv X 3
         seq_rot_mat = obj_rot.float().to(device) # T X 3 X 3
         seq_trans = obj_trans.float().to(device) # T X 3
         if scale is not None:
@@ -371,7 +376,7 @@ def apply_transformation_to_obj_geometry(obj_mesh_verts, obj_rot, obj_trans, sca
         # 返回设备上的虚拟数据
         transformed_obj_verts = torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device)
 
-    return transformed_obj_verts
+    return transformed_obj_verts, obj_mesh_faces
 
 def compute_foot_contact_labels(position_global_full_gt_world, foot_velocity_threshold=0.008):
     """
@@ -421,25 +426,58 @@ def compute_foot_contact_labels(position_global_full_gt_world, foot_velocity_thr
 
 def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=None, bps_points=None, obj_mesh_dir=None):
     """处理单个序列并保存为pt文件"""
-    
+    smpl_init_input = {
+        "root_orient": torch.zeros_like(torch.from_numpy(seq_data['root_orient'].reshape(-1, 3)).to(device).float()),
+        "pose_body": torch.zeros_like(torch.from_numpy(seq_data['pose_body'].reshape(-1, 63)).to(device).float()),
+        "trans": torch.zeros_like(torch.from_numpy(seq_data['trans'].reshape(-1, 3)).to(device).float())
+    }
+    Jtr_0 = np.asarray(bm(**smpl_init_input).Jtr[:, 0, :].cpu(), dtype=np.float32)
+
     # 提取序列数据
-    seq_name = seq_data['seq_name']
-    bdata_poses = np.concatenate([seq_data['root_orient'].reshape(-1, 3), 
-                                 seq_data['pose_body'].reshape(-1, 63)], axis=1)
-    bdata_trans = seq_data['trans']
-    subject_gender = seq_data['gender']
-    
-    # 确保为字符串类型
-    if not isinstance(seq_name, str):
-        seq_name = str(seq_name)
-    if not isinstance(subject_gender, str):
-        subject_gender = str(subject_gender)
+    seq_name_raw = seq_data['seq_name']
+    subject_gender_raw = seq_data['gender']
+
+    seq_name = str(seq_name_raw)
+    subject_gender = str(subject_gender_raw)
+
+    seq_key_str = str(seq_key)
+    dataset_name_str = str(seq_data.get('dataset', ''))
+
+    root_orient_np = np.asarray(seq_data['root_orient'], dtype=np.float32).reshape(-1, 3)
+    pose_body_np = np.asarray(seq_data['pose_body'], dtype=np.float32).reshape(-1, 63)
+    trans_np = np.asarray(seq_data['trans'], dtype=np.float32).reshape(-1, 3)
+
+    names_to_check = [seq_name.lower(), seq_key_str.lower(), dataset_name_str.lower()]
+
+    rot_x90_np = None
+    rot_x90_torch = None
+    rot_x90_np = np.array([[1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                            [0.0, -1.0, 0.0]], dtype=np.float32)
+    # rot_x90_np = np.array([[1.0, 0.0, 0.0],
+    #                         [0.0, 1.0, 0.0],
+    #                         [0.0, 0.0, 1.0]], dtype=np.float32)
+    rot_x90_torch = torch.from_numpy(rot_x90_np).float()
+
+    root_rot_mat = transforms.axis_angle_to_matrix(torch.from_numpy(root_orient_np).float())
+    rot_x90_repeat = rot_x90_torch.unsqueeze(0).repeat(root_rot_mat.shape[0], 1, 1)
+    root_rot_mat = torch.matmul(rot_x90_repeat, root_rot_mat)
+    root_orient_np = transforms.matrix_to_axis_angle(root_rot_mat).detach().cpu().numpy().astype(np.float32)
+
+    # trans_np = trans_np @ rot_x90_np.T
+    trans_np = (trans_np + Jtr_0) @ rot_x90_np.T - Jtr_0
+
+    bdata_poses = np.concatenate([root_orient_np, pose_body_np], axis=1)
     
     # 构建body参数字典
+    root_orient_torch = torch.from_numpy(root_orient_np).to(device).float()
+    pose_body_torch = torch.from_numpy(pose_body_np).to(device).float()
+    trans_torch = torch.from_numpy(trans_np).to(device).float()
+
     smpl_input = {
-        "root_orient": torch.tensor(seq_data['root_orient'], device=device).float(),
-        "pose_body": torch.tensor(seq_data['pose_body'], device=device).float(),
-        "trans": torch.tensor(seq_data['trans'], device=device).float()
+        "root_orient": root_orient_torch,
+        "pose_body": pose_body_torch,
+        "trans": trans_torch
     }
     
     # 使用SMPL模型获取全局姿态
@@ -495,33 +533,16 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         obj_scale = torch.tensor(seq_data['obj_scale'], device=device).float()
         
         # --- 更健壮地加载和处理 obj_trans --- 
-        raw_obj_trans = torch.tensor(seq_data['obj_trans'], device=device).float()
-        T_check = raw_obj_trans.shape[0]
-        if raw_obj_trans.shape == (T_check, 3):
-            obj_trans = raw_obj_trans
-        elif raw_obj_trans.shape == (T_check, 3, 1):
-            obj_trans = raw_obj_trans.squeeze(-1) # -> [T, 3]
-        elif raw_obj_trans.shape == (T_check, 1, 3):
-             obj_trans = raw_obj_trans.squeeze(1)  # -> [T, 3]
-        elif raw_obj_trans.numel() == T_check * 3:
-             print(f"警告: seq {seq_key} 的 obj_trans 形状为 {raw_obj_trans.shape}, 将尝试重塑为 ({T_check}, 3)")
-             try:
-                 obj_trans = raw_obj_trans.reshape(T_check, 3)
-             except Exception as e:
-                 raise ValueError(f"无法将 seq {seq_key} 的 obj_trans 形状 {raw_obj_trans.shape} 重塑为 ({T_check}, 3): {e}")
-        else:
-             # 之前导致错误的情况 (例如 [T, 185, X]) 会在这里触发
-             raise ValueError(f"seq {seq_key} 的 obj_trans 形状无法处理: {raw_obj_trans.shape}. 预期形状类似于 ({T_check}, 3), ({T_check}, 3, 1), 或 ({T_check}, 1, 3).")
-        # --- obj_trans 处理结束 ---
-
-        # 确保 obj_trans 现在是 [T, 3]
-        if obj_trans.shape != (T_check, 3):
-            raise ValueError(f"处理后 seq {seq_key} 的 obj_trans 形状为 {obj_trans.shape}, 预期为 ({T_check}, 3)")
-
         obj_rot = torch.tensor(seq_data['obj_rot'], device=device).float()
-        obj_com_pos = torch.tensor(seq_data['obj_com_pos'], device=device).float()
+        obj_trans = torch.tensor(seq_data['obj_com_pos'], device=device).float()
         T = obj_trans.shape[0] # 获取时间步长
 
+        if rot_x90_torch is not None:
+            rot_x90_device = rot_x90_torch.to(device)
+            rot_repeat = rot_x90_device.unsqueeze(0).repeat(T, 1, 1)
+            obj_rot = torch.matmul(rot_repeat, obj_rot)
+            obj_trans = torch.matmul(obj_trans, rot_x90_device.t())
+    
         # 提取物体名称
         object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
 
@@ -538,7 +559,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
             "obj_scale": obj_scale.cpu(),
             "obj_trans": obj_trans.cpu(),
             "obj_rot": obj_rot.cpu(),
-            "obj_com_pos": obj_com_pos.cpu(),
+            "obj_com_pos": obj_trans.cpu(),
             "lhand_contact": lhand_contact.cpu(), # 基于距离
             "rhand_contact": rhand_contact.cpu(), # 基于距离
             "obj_contact": obj_contact.cpu()      # 基于运动
@@ -551,6 +572,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         # "head_global_trans": head_global_trans.cpu(),
         "rotation_local_full_gt_list": rotation_local_full_gt_list.cpu(),
         "position_global_full_gt_world": position_global_full_gt_world.float(),
+        "trans": trans_torch.cpu(),
         "rotation_global": rotation_global_matrot_reshaped.cpu(),
         "lfoot_contact": lfoot_contact.cpu(),  # 左脚接触标签
         "rfoot_contact": rfoot_contact.cpu()   # 右脚接触标签
@@ -807,17 +829,17 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="处理人体动作数据集")
-    parser.add_argument("--data_path_train", type=str, default="dataset/train_diffusion_manip_seq_joints24.p",
+    parser.add_argument("--data_path_train", type=str, default="datasets/OMOMO/train_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--data_path_test", type=str, default="dataset/test_diffusion_manip_seq_joints24.p",
+    parser.add_argument("--data_path_test", type=str, default="datasets/OMOMO/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="processed_data_0703/train",
+    parser.add_argument("--save_dir_train", type=str, default="processed_data_1014/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="processed_data_0703/test",
+    parser.add_argument("--save_dir_test", type=str, default="processed_data_1014/test",
                         help="输出数据保存目录")
     parser.add_argument("--support_dir", type=str, default="body_models",
                         help="SMPL模型目录")
-    parser.add_argument("--obj_mesh_dir", type=str, default="dataset/captured_objects",
+    parser.add_argument("--obj_mesh_dir", type=str, default="datasets/OMOMO/captured_objects",
                         help="物体网格目录")
     parser.add_argument("--process_amass", action="store_true",
                         help="是否处理AMASS数据集")

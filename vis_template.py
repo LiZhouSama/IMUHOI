@@ -150,24 +150,6 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
 
     return transformed_obj_verts, obj_mesh_faces
 
-
-def merge_two_parts(verts_list, faces_list, device='cpu'):
-    """ 合并两个网格部分 """
-    verts_num = 0
-    merged_verts_list = []
-    merged_faces_list = []
-    for p_idx in range(len(verts_list)):
-        part_verts = verts_list[p_idx].to(device) # T X Nv X 3
-        part_faces = torch.from_numpy(faces_list[p_idx]).long().to(device) # Nf X 3
-
-        merged_verts_list.append(part_verts)
-        merged_faces_list.append(part_faces + verts_num)
-        verts_num += part_verts.shape[1]
-
-    merged_verts = torch.cat(merged_verts_list, dim=1)
-    merged_faces = torch.cat(merged_faces_list, dim=0).cpu().numpy()
-    return merged_verts, merged_faces
-
 def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_geo_root='./dataset/captured_objects', device='cpu'):
     """ 加载物体几何体并应用变换 (OMOMO 方式) """
     if obj_name is None:
@@ -180,8 +162,10 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_geo_r
     if obj_scale is not None:
         obj_scale = torch.as_tensor(obj_scale, dtype=torch.float32, device=device)
 
-
-    obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj")
+    if os.path.exists(obj_geo_root, f"{obj_name}/{obj_name}.obj"):
+        obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}/{obj_name}.obj")
+    elif os.path.exists(obj_geo_root, f"{obj_name}_cleaned_simplified.obj"):
+        obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj")
 
     if not os.path.exists(obj_mesh_path):
         print(f"Warning: Cannot find object geometry file: {obj_mesh_path}")

@@ -312,7 +312,6 @@ class HumanPoseModule(torch.nn.Module):
         # 注册buffer
         self.register_buffer('parents_tensor', self.body_model.kintree_table[0].long())
         self.register_buffer('imu_joints_rot', torch.tensor(IMU_JOINTS_ROT, dtype=torch.long))
-        self.register_buffer('gravity_velocity', torch.tensor([0.0, -0.018, 0], dtype=torch.float32))
         
         # 参数
         self.vel_scale = cfg.vel_scale if hasattr(cfg, 'vel_scale') else 1.66
@@ -360,7 +359,7 @@ class HumanPoseModule(torch.nn.Module):
         weight = (clamped_p - threshold_min) / (threshold_max - threshold_min)
         return weight.unsqueeze(1)
     
-    def forward(self, human_imu_data, pred_leaf_vel_flat, compressed_initial_state, root_pos_gt):
+    def forward(self, human_imu_data, pred_leaf_vel_flat, compressed_initial_state, trans_gt):
         """
         前向传播
 
@@ -368,7 +367,7 @@ class HumanPoseModule(torch.nn.Module):
             human_imu_data: [bs, seq, n_human_imu] 人体IMU数据
             pred_leaf_vel_flat: [bs, seq, n_leaf*3] 叶子节点速度
             compressed_initial_state: [bs, initial_state_dim] 压缩的初始状态
-            root_pos_gt: [bs, seq, 3] 根关节位置真值（可选，用于物体位置估计）
+            trans_gt: [bs, seq, 3] 平移真值（可选，用于物体位置估计）
 
         Returns:
             dict: 包含姿态、接触和平移预测的字典
@@ -421,7 +420,7 @@ class HumanPoseModule(torch.nn.Module):
         pred_pose_body_input = {
             'root_orient': pred_root_orient_axis_flat,
             'pose_body': pred_body_pose_axis_flat,
-            'trans': root_pos_gt.reshape(-1, 3)
+            'trans': trans_gt.reshape(-1, 3)
         }
         pred_smplh_out = self.body_model(**pred_pose_body_input)
         pred_joints_all = pred_smplh_out.Jtr.view(batch_size, seq_len, -1, 3)
@@ -435,7 +434,7 @@ class HumanPoseModule(torch.nn.Module):
             "pred_leaf_pos": pred_leaf_pos,
             "pred_full_pos": pred_full_pos,
             "motion": pred_motion,
-            "root_pos": root_pos_gt,
+            "trans": trans_gt,
             "pred_hand_pos": hand_positions,
             "hands_pos_feat": torch.cat([lhand_pos_global, rhand_pos_global], dim=2)
         }
@@ -1035,12 +1034,12 @@ class TransPoseNet(torch.nn.Module):
         
         # 初始状态输入维度
         n_motion_start = self.num_joints * self.joint_dim
-        n_root_pos_start = 3
+        n_trans_start = 3
         n_obj_rot_start = 6
         n_obj_trans_start = 3
         n_lhand_pos_start = 3  # 左手初始位置
         n_rhand_pos_start = 3  # 右手初始位置
-        n_initial_state = n_motion_start + n_root_pos_start + n_obj_rot_start + n_obj_trans_start + n_lhand_pos_start + n_rhand_pos_start
+        n_initial_state = n_motion_start + n_trans_start + n_obj_rot_start + n_obj_trans_start + n_lhand_pos_start + n_rhand_pos_start
         
         # 压缩初始状态MLP
         self.initial_state_dim = INITIAL_STATE_DIM
@@ -1239,7 +1238,7 @@ class TransPoseNet(torch.nn.Module):
         human_imu = data_dict["human_imu"]
         obj_imu = data_dict.get("obj_imu")
         motion = data_dict["motion"]
-        root_pos = data_dict["root_pos"]
+        trans = data_dict["trans"]
         obj_rot = data_dict.get("obj_rot", None)
         obj_trans = data_dict.get("obj_trans", None)
         hands_pos = data_dict.get("gt_hands_pos", None)
@@ -1253,7 +1252,7 @@ class TransPoseNet(torch.nn.Module):
         
         # 处理第一帧状态信息
         motion_start = motion[:, 0].reshape(batch_size, -1)
-        root_pos_start = root_pos[:, 0]
+        trans_start = trans[:, 0]
         obj_rot_start = obj_rot[:, 0]
         obj_trans_start = obj_trans[:, 0]
         lhand_pos_start = hands_pos[:, 0, 0, :]
@@ -1261,7 +1260,7 @@ class TransPoseNet(torch.nn.Module):
         
         initial_state_flat = torch.cat([
             motion_start,
-            root_pos_start,
+            trans_start,
             obj_rot_start,
             obj_trans_start,
             lhand_pos_start,
@@ -1321,13 +1320,13 @@ class TransPoseNet(torch.nn.Module):
         
         # 模块2: 人体姿态 + 足部接触 + 人体平移
         if self.human_pose_module is not None:
-            # 获取根关节位置真值
-            root_pos_gt = data_dict.get("root_pos", None)
+            # 获取平移真值
+            trans_gt = data_dict.get("trans", None)
             human_pose_outputs = self.human_pose_module(
                 human_imu_data,
                 velocity_contact_outputs["pred_leaf_vel_flat"],
                 compressed_initial_state,
-                root_pos_gt=root_pos_gt
+                trans_gt=trans_gt
             )
             results.update(human_pose_outputs)
         else:
@@ -1337,7 +1336,7 @@ class TransPoseNet(torch.nn.Module):
                 "pred_full_pos": torch.zeros(batch_size, seq_len, joint_set.n_full, 3, device=device),
                 "motion": torch.zeros(batch_size, seq_len, self.num_joints * self.joint_dim, device=device),
                 "contact_probability": torch.zeros(batch_size, seq_len, 2, device=device),
-                "root_pos": torch.zeros(batch_size, seq_len, 3, device=device),
+                "trans": torch.zeros(batch_size, seq_len, 3, device=device),
                 "pred_hand_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
                 "hands_pos_feat": torch.zeros(batch_size, seq_len, 6, device=device)
             }

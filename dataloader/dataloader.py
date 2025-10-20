@@ -401,7 +401,7 @@ class IMUDataset(Dataset):
             # 注意：不再需要 torch.load(file_path)
 
             # 提取并切片数据 (确保键存在)
-            root_pos = seq_data["position_global_full_gt_world"][start_idx:end_idx, 0, :]   # [seq, 3]
+            trans = seq_data["trans"][start_idx:end_idx, :]   # [seq, 3]
             motion = seq_data["rotation_local_full_gt_list"][start_idx:end_idx]
             # human_imu_acc = seq_data["imu_global_full_gt"]["accelerations"][start_idx:end_idx]
             # human_imu_ori = seq_data["imu_global_full_gt"]["orientations"][start_idx:end_idx]
@@ -436,6 +436,7 @@ class IMUDataset(Dataset):
                 obj_name = seq_data.get("obj_name", "unknown_object") # Use get for safety
                 # --- 加载原始 trans, rot, scale ---
                 obj_trans = seq_data["obj_trans"][start_idx:end_idx].squeeze(-1)  # [seq, 3] (保持未缩放)
+                # obj_com_pos = seq_data["obj_com_pos"][start_idx:end_idx]  # [seq, 3]
                 obj_rot = seq_data["obj_rot"][start_idx:end_idx]  # [seq, 3, 3]
                 obj_scale = seq_data["obj_scale"][start_idx:end_idx]  # [seq] (单独加载)
                 # --- 结束修改 ---
@@ -457,10 +458,11 @@ class IMUDataset(Dataset):
 
             # 对数据进行归一化（如果需要）
             norm_human_imu = human_imu.float()
-            norm_root_pos = root_pos.float()
+            norm_trans = trans.float()
             norm_motion = motion.float()
             norm_obj_imu = obj_imu.float()
             norm_obj_trans = obj_trans.float()
+            # norm_obj_com_pos = obj_com_pos.float()
             norm_obj_rot = transforms.matrix_to_rotation_6d(obj_rot).float()
 
             if self.normalize:  
@@ -493,19 +495,21 @@ class IMUDataset(Dataset):
                 # # norm_obj_imu = torch.cat((norm_obj_imu_acc, transforms.matrix_to_rotation_6d(norm_obj_imu_ori)), dim=-1)
 
                 # 对motion归一化(输出)
-                root_global_pos_start = root_pos[0]
+                trans_start = trans[0]
                 norm_motion = motion.clone()
                 root_rot = transforms.rotation_6d_to_matrix(norm_motion[:, :6]) # 每一帧
                 root_global_rot_start = root_rot[0]
                 root_start_rot_invert = root_global_rot_start.swapaxes(-2,-1)
                 norm_root_rot = root_start_rot_invert @ root_rot
                 norm_motion[:, :6] = transforms.matrix_to_rotation_6d(norm_root_rot)
-                norm_root_pos = root_start_rot_invert @ (root_pos - root_global_pos_start).unsqueeze(-1)    # 相当于初始位置为0
-                norm_root_pos = norm_root_pos.squeeze(-1)
+                norm_trans = root_start_rot_invert @ (trans - trans_start).unsqueeze(-1)
+                norm_trans = norm_trans.squeeze(-1)
                 if has_object:
                     # 对obj归一化(输出)
-                    norm_obj_trans = root_start_rot_invert @ (obj_trans - root_global_pos_start).unsqueeze(-1)
+                    norm_obj_trans = root_start_rot_invert @ (obj_trans - trans_start).unsqueeze(-1)
                     norm_obj_trans = norm_obj_trans.squeeze(-1)
+                    # norm_obj_com_pos = root_start_rot_invert @ (obj_com_pos - trans_start).unsqueeze(-1)
+                    # norm_obj_com_pos = norm_obj_com_pos.squeeze(-1)
                     norm_obj_rot = root_start_rot_invert @ obj_rot
                     norm_obj_rot = transforms.matrix_to_rotation_6d(norm_obj_rot)
 
@@ -519,18 +523,18 @@ class IMUDataset(Dataset):
 
             # --- 计算速度 ---
             # 1. 根关节速度
-            if norm_root_pos.shape[0] > 1:
-                root_vel = (norm_root_pos[1:] - norm_root_pos[:-1]) * FRAME_RATE  # 转换为米/秒
+            if norm_trans.shape[0] > 1:
+                root_vel = (norm_trans[1:] - norm_trans[:-1]) * FRAME_RATE  # 转换为米/秒
                 root_vel = torch.cat([torch.zeros_like(root_vel[:1]), root_vel], dim=0)
             else:
-                root_vel = torch.zeros_like(norm_root_pos)
+                root_vel = torch.zeros_like(norm_trans)
             
             # 2. 物体速度
             if has_object and norm_obj_trans.shape[0] > 1:
                 obj_vel = (norm_obj_trans[1:] - norm_obj_trans[:-1]) * FRAME_RATE  # 转换为米/秒
                 obj_vel = torch.cat([torch.zeros_like(obj_vel[:1]), obj_vel], dim=0)
             else:
-                obj_vel = torch.zeros(norm_root_pos.shape[0], 3)
+                obj_vel = torch.zeros(norm_trans.shape[0], 3)
                 print("obj_vel = 0 ----------------> dataloader")
                 
             # 3. 叶子节点速度 (从position_global_full计算)
@@ -559,7 +563,7 @@ class IMUDataset(Dataset):
 
             # 对关节位置进行归一化：转换到初始根坐标系
             # 先减去根位置，再旋转
-            position_centered = position_global_full - root_global_pos_start.unsqueeze(0).unsqueeze(0)  # [seq, J, 3]
+            position_centered = position_global_full - trans_start.unsqueeze(0).unsqueeze(0)  # [seq, J, 3]
             position_global_norm = position_centered @ root_global_rot_start   # [seq, J, 3]
             
             # 对关节旋转进行归一化
@@ -604,15 +608,17 @@ class IMUDataset(Dataset):
             obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
 
             result = {
-                "root_pos": norm_root_pos.float(),
+                "trans": norm_trans.float(), # [seq, 3], 不同于root_pos，专用于smpl前向
                 "motion": norm_motion.float(),  # [seq, 132]
-                "root_pos_start": root_global_pos_start.float(),  # [3]
+                "trans_start": trans_start.float(),  # [3]
                 "root_rot_start": root_global_rot_start.float(),  # [3, 3]
                 "human_imu": norm_human_imu.float(),  # [seq, num_imus, 9] - 现在是9D (3D加速度 + 6D旋转)
                 "obj_imu": norm_obj_imu.float() ,  # [seq, 1, 9] - 现在是9D (3D加速度 + 6D旋转)
                 "obj_trans": norm_obj_trans.float() ,  # [seq, 3] (未缩放)
+                # "obj_trans": norm_obj_com_pos.float() ,  # [seq, 3] (未缩放)
                 "obj_rot": norm_obj_rot.float() ,  # [seq, 6] - 归一化后的旋转
-                "obj_rot_original": transforms.matrix_to_rotation_6d(obj_rot).float(), # [seq, 6] - 原始旋转(用于测试)
+                # "obj_com_pos": norm_obj_com_pos.float() ,  # [seq, 3] - 归一化后的物体中心位置
+                # "obj_rot_original": transforms.matrix_to_rotation_6d(obj_rot).float(), # [seq, 6] - 原始旋转(用于测试)
                 "obj_scale": obj_scale.float() , # [seq] (单独返回)
                 "obj_name": obj_name,
                 "has_object": has_object,
