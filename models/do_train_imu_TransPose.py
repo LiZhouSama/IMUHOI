@@ -1126,24 +1126,6 @@ def do_train_imu_TransPose(cfg, train_loader, test_loader=None, trial=None, mode
     # 初始化学习率调度器（将在阶段切换时重新创建）
     scheduler = None
 
-    # 初始化ContactAwareLoss（如果启用）
-    use_contact_aware_loss = getattr(cfg, 'use_contact_aware_loss', False)
-    contact_loss_fn = None
-    if use_contact_aware_loss:
-        contact_loss_fn = ContactAwareLoss(
-            contact_distance=getattr(cfg, 'contact_distance', 0.1),
-            ramp_up_steps=getattr(cfg, 'contact_ramp_up_steps', 1000),
-            loss_weights=getattr(cfg, 'contact_loss_weights', {
-                'contact_distance': 1.0,
-                'contact_velocity': 0.5,
-                'approach_smoothness': 0.3,
-                'contact_consistency': 0.2
-            })
-        )
-        print(f'Initialized ContactAwareLoss with contact_distance={contact_loss_fn.contact_distance}')
-    else:
-        print('ContactAwareLoss is disabled')
-
     # 如果使用tensorboard，初始化
     writer = None
     if use_tensorboard:

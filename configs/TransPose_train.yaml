@@ -37,18 +37,6 @@ obj_imu_change_threshold: 0.1
 obj_contact_threshold: 0.3
 obj_rot_weight: 0.5
 
-# ContactAwareLoss相关参数
-use_contact_aware_loss: False  # 是否使用ContactAwareLoss
-contact_distance: 0.1  # 目标接触距离 10cm
-contact_ramp_up_steps: 10000  # 基础损失3000步后达到全权重
-
-# ContactAwareLoss内部权重
-contact_loss_weights:
-  contact_distance: 1.0      # 距离一致性权重
-  contact_velocity: 0.5      # 速度一致性权重
-  approach_smoothness: 0.3   # 接近平滑性权重
-  contact_consistency: 0.2   # 接触状态一致性权重
-
 # 手部接触相关参数
 hand_contact_distance: 0.1   # 10cm目标距离
 

@@ -1,17 +1,22 @@
 import os
 import pickle
 import numpy as np
+import torch
 
 
 def main():
-    file_path = "datasets/IMHD/IMHD Dataset/ground_truth/20230825/20230825_songzn_bat/bat_holdhandle_hit/gt_0_330_-1.pkl"
+    file_path = "processed_data_IMHD_split/train/20230825__20230825_songzn_bat__bat_holdhandle_hit_seg000.pt"
 
     if not os.path.isfile(file_path):
         print(f"文件不存在: {os.path.abspath(file_path)}")
         return
 
-    with open(file_path, 'rb') as f:
-        data = pickle.load(f)
+    # 使用torch.load读取.pt文件，设置weights_only=False以支持numpy数组
+    data = torch.load(file_path, map_location='cpu', weights_only=False)
+    
+    # 如果是tensor，转换为numpy以便查看
+    if isinstance(data, torch.Tensor):
+        data = data.numpy()
     
     keys = list(data.keys())
 

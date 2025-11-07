@@ -19,8 +19,8 @@ from pytorch3d.transforms import (
 # Rotation matrix that converts the original -Y-up coordinates to Y-up for aitviewer
 R_Y_UP = torch.tensor(
     [[1.0, 0.0, 0.0],
-     [0.0, -1.0, 0.0],
-     [0.0, 0.0, -1.0]],
+     [0.0, 1.0, 0.0],
+     [0.0, 0.0, 1.0]],
     dtype=torch.float32,
 )
 
@@ -163,7 +163,7 @@ def prepare_object_vertices(data: Dict, objects_root: str, device: torch.device)
     if scale_tensor is not None:
         rotated = rotated * scale_tensor
     transformed = rotated.transpose(1, 2) + obj_trans_t.unsqueeze(1)
-    print(obj_trans_t)
+    # print(obj_trans_t)
     return transformed, faces
 
 
@@ -394,7 +394,7 @@ class BehaveViewer(Viewer):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize BEHAVE ground-truth meshes.")
-    parser.add_argument("--data_path", type=str, default='processed_BEHAVE_data_1006', help="Path to a .pt file or a directory containing them.")
+    parser.add_argument("--data_path", type=str, default='process/processed_split_data_BEHAVE/train', help="Path to a .pt file or a directory containing them.")
     parser.add_argument("--objects_root", type=str, default='datasets/BEHAVE/objects', help="Directory that stores BEHAVE object meshes.")
     parser.add_argument("--support_dir", type=str, default="body_models", help="Directory with SMPL-H support files.")
     parser.add_argument("--device", type=str, default=None, help="Computation device (cuda or cpu).")

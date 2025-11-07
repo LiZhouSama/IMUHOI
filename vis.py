@@ -1223,7 +1223,7 @@ def main():
     parser.add_argument('--config', type=str, default='configs/TransPose_train.yaml', help='Path to the main configuration file (used for model, dataset params).')
     parser.add_argument('--model_path', type=str, default=None, help='Path to the trained TransPose model checkpoint. Overrides config if provided.')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to the SMPLH model file. Overrides config if provided.')
-    parser.add_argument('--test_data_dir', type=str, default=None, help='Path to the test dataset directory. Overrides config if provided.')
+    parser.add_argument('--test_data_dir', type=str, default='processed_data_1014/test', help='Path to the test dataset directory. Overrides config if provided.')
     parser.add_argument('--obj_geo_root', type=str, default='./datasets/OMOMO/captured_objects', help='Path to the object geometry root directory.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for DataLoader (should be 1 for sequential vis).')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers.')

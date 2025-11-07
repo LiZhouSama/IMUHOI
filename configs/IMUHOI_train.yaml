@@ -1,0 +1,162 @@
+﻿# TransPose模型训练配置文件
+
+# 基本配置
+model_name: "TransPose_IMU"
+tensorboard_project_name: "imu_transpose"  # TensorBoard项目名称
+model_type: "TransPose"  # 模型类型：使用TransPose
+device: "cuda:0"  # 主GPU设备
+gpus: [0]  # 使用的GPU编号列表，支持多卡训练
+           # 单卡训练: [0] 
+           # 双卡训练: [0, 1]
+save_dir: "outputs/IMUHOI"  # 模型保存路径
+use_tensorboard: True  # 是否使用tensorboard记录训练过程
+use_multi_gpu: True  # 是否启用多GPU训练（当gpus列表长度>1时自动启用）
+body_model_path: datasets/smpl_models/smplh/male/model.npz
+
+# 全局默认训练超参数（用作阶段超参数的兜底值）
+epoch: 850  # 训练轮数
+batch_size: 50  # 批大小（多GPU时会自动分配到各GPU）
+lr: 0.002  # 学习率（多GPU时会自动按GPU数量线性缩放）
+weight_decay: 0.0001  # 权重衰减
+milestones: []  # 学习率调整节点
+gamma: 0.2  # 学习率衰减系数
+seed: 42  # 随机种子
+num_workers: 12  # 数据加载线程数（多GPU时建议增加）
+hidden_dim_multiplier: 1  # 隐藏层维度乘数
+
+# 特征维度配置
+num_human_imus: 6  # 人体IMU数量
+imu_dim: 9  # 每个IMU的特征维度（加速度向量3维 + 6D旋转表示6维）
+num_joints: 22  # SMPL模型关节数量
+joint_dim: 6  # 使用6D旋转表示
+vel_scale: 3
+
+# 噪声配置
+imu_noise_std: 0.1  # 人体IMU噪声标准差
+obj_imu_noise_std: 0.1  # 物体IMU噪声标准差
+
+# 物体静止相关参数
+obj_imu_change_threshold: 0.1
+obj_contact_threshold: 0.3
+obj_rot_weight: 0.5
+
+# 手部接触相关参数
+hand_contact_distance: 0.1   # 10cm目标距离
+
+# 分阶段训练配置
+staged_training:
+  enabled: True  # 是否启用分阶段训练
+  # 模块化训练配置
+  modular_training:
+    enabled: True
+    start_from_stage: "velocity_contact"  # 可选: "velocity_contact", "human_pose", "object_trans", "joint_training"
+    pretrained_modules:
+      velocity_contact: "outputs/IMUHOI/transpose_10311104_BEHAVE/modules/velocity_contact_best.pt"
+      human_pose: "outputs/IMUHOI/transpose_10311104_BEHAVE/modules/human_pose_best.pt"
+      object_trans: "outputs/IMUHOI/transpose_10311104_BEHAVE/modules/object_trans_best.pt"
+
+  stages:
+    - name: "velocity_contact"
+      epochs: 300
+      modules: ["velocity_contact"]
+      datasets: ["omomo"]
+      batch_size: 100
+      milestones: [50, 100, 150]
+      gamma: 0.2
+    - name: "human_pose"
+      epochs: 300
+      modules: ["human_pose"]
+      # datasets: ["omomo", "imhd", "behave"]
+      datasets: ["omomo"]
+      batch_size: 60
+      milestones: [100, 200, 300]
+      gamma: 0.2
+    - name: "object_trans"
+      epochs: 300
+      modules: ["object_trans"]
+      datasets: ["omomo"]
+      batch_size: 60
+      milestones: [100, 200, 300]
+      gamma: 0.2
+    - name: "joint_training"
+      epochs: 100
+      modules: ["human_pose", "object_trans"]
+      datasets: ["omomo"]
+      batch_size: 50
+      milestones: [80, 120, 160, 200, 240, 280]
+      gamma: 0.2
+
+  debug_stages:
+    - name: "velocity_contact"
+      epochs: 11
+      modules: ["velocity_contact"]
+      datasets: ["omomo", "imhd", "behave"]
+    - name: "human_pose"
+      epochs: 10
+      modules: ["human_pose"]
+      datasets: ["omomo", "imhd", "behave"]
+    - name: "object_trans"
+      epochs: 10
+      modules: ["object_trans"]
+      datasets: ["omomo", "imhd", "behave"]
+    - name: "joint_training"
+      epochs: 10
+      modules: ["human_pose", "object_trans"]
+      datasets: ["omomo", "imhd", "behave"]
+# 数据集配置
+datasets:
+  amass:
+    train_path: "process/processed_amass_data_0703/train"
+    test_path: "process/processed_amass_data_0703/test"
+    debug_path: "process/processed_amass_data_0703/debug"  # AMASS调试数据路径
+  omomo:
+    train_path: "process/processed_split_data_OMOMO/train"
+    test_path: "process/processed_split_data_OMOMO/test"
+    debug_path: "process/processed_split_data_OMOMO/debug"  # OMOMO调试数据路径
+  # hoi:
+  #   train_path: "process/processed_hoi_data_0803/train"
+  #   test_path: "process/processed_hoi_data_0803/test"
+  #   debug_path: "process/processed_hoi_data_0803/debug"
+  imhd:
+    train_path: "process/processed_seg_data_IMHD/train"
+    test_path: "process/processed_seg_data_IMHD/test"
+    debug_path: "process/processed_data_IMHD/debug"  # IMHD调试数据路径
+  behave:
+    train_path: "process/processed_seg_data_BEHAVE/train"
+    test_path: "process/processed_seg_data_BEHAVE/test"
+    debug_path: "process/processed_data_BEHAVE/debug"  # BEHAVE调试数据路径
+
+loss_weights:
+  {
+    'obj_vel': 1.0,
+    'hand_vel': 1.0,
+    'hand_contact': 1.0,
+
+    'vel_root': 1.0,
+    'pose_reduced': 10.0,    
+    'root_vel_local': 1.0,
+    'root_vel': 1.0,
+    'root_trans': 1.0,
+    'hand_pos': 1.0,
+
+    'obj_trans': 0.1,
+    'lhand_obj_direction': 0.1,
+    'rhand_obj_direction': 0.1,
+    'lhand_lb': 0.1,
+    'rhand_lb': 0.1,
+    'hoi_error_l': 0.2,
+    'hoi_error_r': 0.2,
+    'obj_vel_cons': 0.1,
+    'obj_acc_cons': 0.01
+  }
+
+# 训练窗口配置
+train:
+  window: 120  # 训练时使用的时间窗口长度
+
+# 测试窗口配置
+test:
+  window: 120  # 测试时使用的时间窗口长度
+
+
+

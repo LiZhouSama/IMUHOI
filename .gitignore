@@ -106,13 +106,15 @@ dmypy.json
 *.iml
 
 # 项目特定忽略
-Ref Codes/behave-dataset
-Ref Codes/export
-Ref Codes/MobilePoser
-Ref Codes/omomo
-Ref Codes/omomo_origin_code
-Ref Codes/SAGE
-Ref Codes/trash
+RefCodes/trash
+RefCodes/SAGE
+RefCodes/MobilePoser
+RefCodes/omomo
+RefCodes/omomo_origin_code
+RefCodes/TransPose_raw
+RefCodes/behave-dataset
+RefCodes/export
+RefCodes/tip/fairmotion
 checkpoints/
 logs/
 *.pt
@@ -133,6 +135,8 @@ wandb/
 *.gz
 *.zip
 *.7z
+*.mp4
+*.json
 
 # 系统文件
 .DS_Store
